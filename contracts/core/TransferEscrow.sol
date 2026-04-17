@@ -12,10 +12,11 @@ import "./TransferWindow.sol";
 /**
  * @title TransferEscrow
  * @author Transferium Protocol
- * @notice Escrow contract for professional football player transfers.
+ * @notice Escrow contract for professional football player permanent transfers.
  *         Buying club deposits funds, league authority confirms, selling club withdraws.
  * @dev Security-first: pull payments, state machine, reentrancy guards, whitelisted tokens only.
  *      On deal completion, calls PlayerRegistry to update on-chain club ownership.
+ *      Requires ESCROW_ROLE on PlayerRegistry — must be granted post-deployment by admin.
  */
 contract TransferEscrow is AccessControl, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -42,30 +43,29 @@ contract TransferEscrow is AccessControl, Pausable, ReentrancyGuard {
     }
 
     struct Deal {
-        uint256 playerId;
-        address buyingClub;
-        address sellingClub;
-        address paymentToken;
-        uint256 transferFee;
-        uint256 sellOnBps;
-        address sellOnRecipient;
+        uint256   playerId;
+        address   buyingClub;
+        address   sellingClub;
+        address   paymentToken;
+        uint256   transferFee;
+        uint256   sellOnBps;
+        address   sellOnRecipient;
         DealState state;
-        uint256 createdAt;
-        uint256 approvedAt;
-        string  rejectionReason;
+        uint256   createdAt;
+        uint256   approvedAt;
+        string    rejectionReason;
     }
 
     uint256 private _dealIdCounter;
 
-    // I store the PlayerRegistry address — set once at construction, immutable
     IPlayerRegistry public immutable playerRegistry;
-    TransferWindow public immutable transferWindow;
+    TransferWindow  public immutable transferWindow;
 
-    mapping(uint256 => Deal) private _deals;
-    mapping(address => mapping(address => uint256)) private _claimable;
-    mapping(uint256 => uint256) private _activePlayerDeal;
-    mapping(address => bool) private _approvedTokens;
-    address[] private _approvedTokenList;
+    mapping(uint256 => Deal)                          private _deals;
+    mapping(address => mapping(address => uint256))   private _claimable;
+    mapping(uint256 => uint256)                       private _activePlayerDeal;
+    mapping(address => bool)                          private _approvedTokens;
+    address[]                                         private _approvedTokenList;
 
     // ─── Events ───────────────────────────────────────────────────────────────
     event DealCreated(uint256 indexed dealId, uint256 indexed playerId, address buyingClub, address sellingClub, uint256 transferFee);
@@ -94,13 +94,16 @@ contract TransferEscrow is AccessControl, Pausable, ReentrancyGuard {
     error NothingToClaim();
     error InvalidString();
     error TransferWindowClosed();
+    error PlayerNotListed();
+    error SellingClubMismatch();
+    error SellingClubNotRegistered();
 
     // ─── Constructor ──────────────────────────────────────────────────────────
     constructor(address _playerRegistry, address _transferWindow) {
         if (_playerRegistry == address(0)) revert InvalidAddress();
+        if (_transferWindow == address(0)) revert InvalidAddress();
 
         playerRegistry = IPlayerRegistry(_playerRegistry);
-        if (_transferWindow == address(0)) revert InvalidAddress();
         transferWindow = TransferWindow(_transferWindow);
 
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
@@ -119,23 +122,19 @@ contract TransferEscrow is AccessControl, Pausable, ReentrancyGuard {
         _;
     }
 
-    // ─── Token Whitelist Management ───────────────────────────────────────────
+    // ─── Token Whitelist ──────────────────────────────────────────────────────
 
     function approveToken(address token) external onlyRole(ADMIN_ROLE) {
         if (token == address(0)) revert InvalidAddress();
         if (_approvedTokens[token]) revert TokenAlreadyApproved();
-
         _approvedTokens[token] = true;
         _approvedTokenList.push(token);
-
         emit TokenApproved(token);
     }
 
     function revokeToken(address token) external onlyRole(ADMIN_ROLE) {
         if (!_approvedTokens[token]) revert TokenNotInList();
-
         _approvedTokens[token] = false;
-
         uint256 len = _approvedTokenList.length;
         for (uint256 i = 0; i < len; i++) {
             if (_approvedTokenList[i] == token) {
@@ -144,12 +143,16 @@ contract TransferEscrow is AccessControl, Pausable, ReentrancyGuard {
                 break;
             }
         }
-
         emit TokenRevoked(token);
     }
 
     // ─── Buying Club Functions ────────────────────────────────────────────────
 
+    /**
+     * @notice Buying club initiates a permanent transfer deal.
+     * @dev I verify the selling club holds CLUB_ROLE on PlayerRegistry to prevent
+     *      deals against clubs that have been deregistered post-listing.
+     */
     function createDeal(
         uint256 playerId,
         address sellingClub,
@@ -172,10 +175,13 @@ contract TransferEscrow is AccessControl, Pausable, ReentrancyGuard {
         if (_activePlayerDeal[playerId] != 0) revert DealAlreadyActive();
         if (!transferWindow.isWindowOpen()) revert TransferWindowClosed();
 
-        // I verify the player exists and is listed before creating the deal
+        // I verify selling club still holds CLUB_ROLE — protects against deregistered clubs
+        if (!hasRole(CLUB_ROLE, sellingClub)) revert SellingClubNotRegistered();
+
+        // I verify player is listed and belongs to the stated selling club
         IPlayerRegistry.Player memory player = playerRegistry.getPlayer(playerId);
-        require(player.isListed, "Player not listed for transfer");
-        require(player.currentClub == sellingClub, "Selling club mismatch");
+        if (!player.isListed) revert PlayerNotListed();
+        if (player.currentClub != sellingClub) revert SellingClubMismatch();
 
         _dealIdCounter++;
         dealId = _dealIdCounter;
@@ -213,7 +219,6 @@ contract TransferEscrow is AccessControl, Pausable, ReentrancyGuard {
 
         deal.state = DealState.CANCELLED;
         _activePlayerDeal[deal.playerId] = 0;
-
         _claimable[msg.sender][deal.paymentToken] += deal.transferFee;
 
         emit DealCancelled(dealId);
@@ -252,7 +257,6 @@ contract TransferEscrow is AccessControl, Pausable, ReentrancyGuard {
         deal.state           = DealState.REJECTED;
         deal.rejectionReason = reason;
         _activePlayerDeal[deal.playerId] = 0;
-
         _claimable[deal.buyingClub][deal.paymentToken] += deal.transferFee;
 
         emit DealRejected(dealId, msg.sender, reason);
@@ -261,9 +265,11 @@ contract TransferEscrow is AccessControl, Pausable, ReentrancyGuard {
     // ─── Selling Club Functions ───────────────────────────────────────────────
 
     /**
-     * @notice Selling club claims funds after dispute window.
-     * @dev On success, calls PlayerRegistry to update on-chain club ownership.
-     *      I update state before external call to prevent reentrancy.
+     * @notice Selling club claims funds after 48-hour dispute window.
+     * @dev I follow checks-effects-interactions strictly:
+     *      1. Validate state
+     *      2. Update all state and claimable balances
+     *      3. Call external registry last
      */
     function claimFunds(uint256 dealId)
         external
@@ -276,22 +282,21 @@ contract TransferEscrow is AccessControl, Pausable, ReentrancyGuard {
         if (deal.state != DealState.APPROVED) revert DealNotApproved();
         if (block.timestamp < deal.approvedAt + DISPUTE_WINDOW) revert DisputeWindowActive();
 
-        // I update state before any external calls — checks-effects-interactions
+        // effects — all state settled before any external call
         deal.state = DealState.COMPLETED;
         _activePlayerDeal[deal.playerId] = 0;
 
-        uint256 sellOnAmount = 0;
         uint256 sellerAmount = deal.transferFee;
 
         if (deal.sellOnBps > 0 && deal.sellOnRecipient != address(0)) {
-            sellOnAmount = (deal.transferFee * deal.sellOnBps) / BPS_DENOMINATOR;
+            uint256 sellOnAmount = (deal.transferFee * deal.sellOnBps) / BPS_DENOMINATOR;
             sellerAmount = deal.transferFee - sellOnAmount;
             _claimable[deal.sellOnRecipient][deal.paymentToken] += sellOnAmount;
         }
 
         _claimable[msg.sender][deal.paymentToken] += sellerAmount;
 
-        // I call PlayerRegistry last — state is already settled before this external call
+        // interaction — external call after all state is settled
         playerRegistry.transferClubOwnership(deal.playerId, deal.buyingClub);
 
         emit DealCompleted(dealId, deal.buyingClub);
@@ -308,7 +313,6 @@ contract TransferEscrow is AccessControl, Pausable, ReentrancyGuard {
         if (amount == 0) revert NothingToClaim();
 
         _claimable[msg.sender][token] = 0;
-
         IERC20(token).safeTransfer(msg.sender, amount);
 
         emit FundsClaimed(msg.sender, token, amount);

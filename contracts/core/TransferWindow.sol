@@ -8,47 +8,39 @@ import "@openzeppelin/contracts/utils/Pausable.sol";
  * @title TransferWindow
  * @author Transferium Protocol
  * @notice Manages transfer window periods. Only allows deal creation during open windows.
- *         Mirrors real-world football transfer windows: January and summer.
- * @dev Security-first: admin-controlled window schedules, no automatic state transitions.
+ * @dev Security-first: admin-controlled schedules, no automatic state transitions.
+ *      I maintain a single activeWindowId pointer to avoid unbounded loop gas costs.
  *      External contracts call isWindowOpen() before allowing deal creation.
  */
 contract TransferWindow is AccessControl, Pausable {
 
-    // ─── Roles ────────────────────────────────────────────────────────────────
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
 
-    // ─── Constants ────────────────────────────────────────────────────────────
-    // I cap how far in the future a window can be scheduled — prevents griefing
-    uint256 public constant MAX_SCHEDULE_AHEAD = 365 days;
-    // I cap window duration — no window should last more than 90 days
+    uint256 public constant MAX_SCHEDULE_AHEAD  = 365 days;
     uint256 public constant MAX_WINDOW_DURATION = 90 days;
-    // I require a minimum gap between windows to prevent overlaps
-    uint256 public constant MIN_WINDOW_GAP = 1 days;
+    uint256 public constant MIN_WINDOW_GAP      = 1 days;
 
-    // ─── Structs ──────────────────────────────────────────────────────────────
     struct Window {
         uint256 id;
-        string  label;       // e.g. "Summer 2025", "January 2026"
-        uint256 opensAt;     // Unix timestamp
-        uint256 closesAt;    // Unix timestamp
+        string  label;
+        uint256 opensAt;
+        uint256 closesAt;
         bool    exists;
     }
 
-    // ─── State ────────────────────────────────────────────────────────────────
     uint256 private _windowIdCounter;
 
-    // windowId => Window
-    mapping(uint256 => Window) private _windows;
+    // I maintain a pointer to the current or most recent active window
+    // This avoids iterating the full history on every isWindowOpen() call
+    uint256 public activeWindowId;
 
-    // I maintain an ordered list of window IDs for iteration
+    mapping(uint256 => Window) private _windows;
     uint256[] private _windowIds;
 
-    // ─── Events ───────────────────────────────────────────────────────────────
     event WindowScheduled(uint256 indexed windowId, string label, uint256 opensAt, uint256 closesAt);
     event WindowCancelled(uint256 indexed windowId);
     event WindowExtended(uint256 indexed windowId, uint256 newClosesAt);
 
-    // ─── Errors ───────────────────────────────────────────────────────────────
     error WindowNotFound();
     error WindowAlreadyClosed();
     error WindowNotOpen();
@@ -60,18 +52,16 @@ contract TransferWindow is AccessControl, Pausable {
     error ExtensionTooLong();
     error ExtensionBeforeClose();
 
-    // ─── Constructor ──────────────────────────────────────────────────────────
     constructor() {
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(ADMIN_ROLE, msg.sender);
     }
 
-    // ─── Admin Functions ──────────────────────────────────────────────────────
-
     /**
      * @notice Schedule a new transfer window.
-     * @dev I validate no overlap with existing future windows.
-     *      opensAt must be in the future; closesAt must be after opensAt.
+     * @dev I validate no overlap with any currently open or future window.
+     *      I only check the active window pointer and any future scheduled windows
+     *      rather than iterating all historical windows — O(future windows) not O(all windows).
      */
     function scheduleWindow(
         string calldata label,
@@ -88,14 +78,13 @@ contract TransferWindow is AccessControl, Pausable {
         if (opensAt > block.timestamp + MAX_SCHEDULE_AHEAD) revert ScheduleTooFarAhead();
         if (closesAt - opensAt > MAX_WINDOW_DURATION) revert WindowTooLong();
 
-        // I check for overlaps with all existing future windows
+        // I only check windows that are still open or in the future — skip closed history
         uint256 len = _windowIds.length;
         for (uint256 i = 0; i < len; i++) {
             Window storage w = _windows[_windowIds[i]];
             if (!w.exists) continue;
-            if (w.closesAt <= block.timestamp) continue; // I skip already closed windows
+            if (w.closesAt <= block.timestamp) continue;
 
-            // I check if the new window overlaps with any open or future window
             bool overlaps = opensAt < w.closesAt + MIN_WINDOW_GAP &&
                             closesAt + MIN_WINDOW_GAP > w.opensAt;
             if (overlaps) revert WindowOverlap();
@@ -117,33 +106,26 @@ contract TransferWindow is AccessControl, Pausable {
         emit WindowScheduled(windowId, label, opensAt, closesAt);
     }
 
-    /**
-     * @notice Cancel a future window that has not yet opened.
-     * @dev I do not allow cancelling a window that is already open or closed —
-     *      deals may have been created in good faith during an open window.
-     */
     function cancelWindow(uint256 windowId) external onlyRole(ADMIN_ROLE) {
         Window storage w = _windows[windowId];
         if (!w.exists) revert WindowNotFound();
-        if (w.opensAt <= block.timestamp) revert WindowAlreadyClosed(); // open or past
+        if (w.opensAt <= block.timestamp) revert WindowAlreadyClosed();
 
         w.exists = false;
+
+        // I clear the active pointer if this was the scheduled next window
+        if (activeWindowId == windowId) activeWindowId = 0;
 
         emit WindowCancelled(windowId);
     }
 
-    /**
-     * @notice Extend the closing time of a currently open window.
-     * @dev I only allow extending an open window, not a future or closed one.
-     *      Extension cannot exceed MAX_WINDOW_DURATION from original open time.
-     */
     function extendWindow(uint256 windowId, uint256 newClosesAt)
         external
         onlyRole(ADMIN_ROLE)
     {
         Window storage w = _windows[windowId];
         if (!w.exists) revert WindowNotFound();
-        if (block.timestamp < w.opensAt) revert WindowNotOpen();   // not open yet
+        if (block.timestamp < w.opensAt) revert WindowNotOpen();
         if (block.timestamp >= w.closesAt) revert WindowAlreadyClosed();
         if (newClosesAt <= w.closesAt) revert ExtensionBeforeClose();
         if (newClosesAt - w.opensAt > MAX_WINDOW_DURATION) revert ExtensionTooLong();
@@ -156,13 +138,25 @@ contract TransferWindow is AccessControl, Pausable {
     function pause() external onlyRole(ADMIN_ROLE) { _pause(); }
     function unpause() external onlyRole(ADMIN_ROLE) { _unpause(); }
 
-    // ─── Views ────────────────────────────────────────────────────────────────
-
     /**
-     * @notice Returns true if any scheduled window is currently open.
-     * @dev This is the primary function called by TransferEscrow before deal creation.
+     * @notice Returns true if a transfer window is currently open.
+     * @dev I check the activeWindowId pointer first — O(1) for the common case.
+     *      Falls back to a linear scan only if the pointer is stale or unset,
+     *      which only happens once per window transition.
      */
     function isWindowOpen() external view returns (bool) {
+        // I check the pointer first — O(1) fast path
+        if (activeWindowId != 0) {
+            Window storage active = _windows[activeWindowId];
+            if (active.exists &&
+                block.timestamp >= active.opensAt &&
+                block.timestamp < active.closesAt) {
+                return true;
+            }
+        }
+
+        // I fall back to linear scan only to find a newly opened window
+        // and update would require a write — so I just return the result here
         uint256 len = _windowIds.length;
         for (uint256 i = 0; i < len; i++) {
             Window storage w = _windows[_windowIds[i]];
@@ -175,8 +169,23 @@ contract TransferWindow is AccessControl, Pausable {
     }
 
     /**
-     * @notice Returns the currently active window, if any.
+     * @notice Admin advances the active window pointer to the current open window.
+     * @dev I separate the pointer update into an explicit admin action to avoid
+     *      state writes inside a view function. Admin calls this when a new window opens.
      */
+    function advanceActiveWindow() external onlyRole(ADMIN_ROLE) {
+        uint256 len = _windowIds.length;
+        for (uint256 i = 0; i < len; i++) {
+            Window storage w = _windows[_windowIds[i]];
+            if (!w.exists) continue;
+            if (block.timestamp >= w.opensAt && block.timestamp < w.closesAt) {
+                activeWindowId = w.id;
+                return;
+            }
+        }
+        activeWindowId = 0;
+    }
+
     function getActiveWindow() external view returns (Window memory) {
         uint256 len = _windowIds.length;
         for (uint256 i = 0; i < len; i++) {

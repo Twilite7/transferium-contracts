@@ -10,22 +10,25 @@ import "../interfaces/IPlayerRegistry.sol";
  * @title PlayerRegistry
  * @author Transferium Protocol
  * @notice Manages player registration and transfer listings for professional football clubs.
- * @dev Security-first: role-based access control, pausability, and input validation on all state changes.
- *      Club ownership updates are triggered by the authorised TransferEscrow contract only.
+ * @dev Security-first: role-based access control, pausability, input validation on all state changes.
+ *      ESCROW_ROLE must be granted post-deployment to both TransferEscrow and LoanEscrow.
+ *      Club ownership updates are triggered exclusively by authorised escrow contracts.
  */
 contract PlayerRegistry is IPlayerRegistry, AccessControl, Pausable, ReentrancyGuard {
 
     // ─── Roles ────────────────────────────────────────────────────────────────
-    bytes32 public constant ADMIN_ROLE      = keccak256("ADMIN_ROLE");
-    bytes32 public constant CLUB_ROLE       = keccak256("CLUB_ROLE");
-    bytes32 public constant REGISTRAR_ROLE  = keccak256("REGISTRAR_ROLE");
-    // I grant this role exclusively to the TransferEscrow contract address
-    bytes32 public constant ESCROW_ROLE     = keccak256("ESCROW_ROLE");
+    bytes32 public constant ADMIN_ROLE     = keccak256("ADMIN_ROLE");
+    bytes32 public constant CLUB_ROLE      = keccak256("CLUB_ROLE");
+    bytes32 public constant REGISTRAR_ROLE = keccak256("REGISTRAR_ROLE");
+    // I grant ESCROW_ROLE post-deployment to both TransferEscrow and LoanEscrow
+    bytes32 public constant ESCROW_ROLE    = keccak256("ESCROW_ROLE");
 
     // ─── Constants ────────────────────────────────────────────────────────────
     uint256 public constant MAX_FEE        = 10_000 ether;
     uint256 public constant MAX_PRICE      = 500_000_000 ether;
     uint256 public constant MAX_STRING_LEN = 64;
+    // I cap single withdrawal to limit damage from compromised admin key
+    uint256 public constant MAX_WITHDRAW   = 1_000 ether;
 
     // ─── State ────────────────────────────────────────────────────────────────
     uint256 private _playerIdCounter;
@@ -33,16 +36,9 @@ contract PlayerRegistry is IPlayerRegistry, AccessControl, Pausable, ReentrancyG
     uint256 public registrationFee;
     uint256 public listingFee;
 
-    // playerId => Player
     mapping(uint256 => Player) private _players;
-
-    // club address => list of player IDs they own
     mapping(address => uint256[]) private _clubPlayers;
-
-    // I track index of each player in their club's array for efficient removal
     mapping(uint256 => uint256) private _playerIndexInClub;
-
-    // I use a hash of name + club to prevent duplicate registrations
     mapping(bytes32 => bool) private _playerExists;
 
     // ─── Events ───────────────────────────────────────────────────────────────
@@ -65,6 +61,8 @@ contract PlayerRegistry is IPlayerRegistry, AccessControl, Pausable, ReentrancyG
     error InsufficientPayment();
     error ContractExpired();
     error WithdrawFailed();
+    error WithdrawAmountTooLarge();
+    error InsufficientBalance();
 
     // ─── Constructor ──────────────────────────────────────────────────────────
     constructor(uint256 _registrationFee, uint256 _listingFee) {
@@ -77,6 +75,8 @@ contract PlayerRegistry is IPlayerRegistry, AccessControl, Pausable, ReentrancyG
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(ADMIN_ROLE, msg.sender);
         _grantRole(REGISTRAR_ROLE, msg.sender);
+        // I deliberately do NOT grant ESCROW_ROLE here —
+        // it must be granted explicitly to TransferEscrow and LoanEscrow after deployment
     }
 
     // ─── Modifiers ────────────────────────────────────────────────────────────
@@ -97,9 +97,6 @@ contract PlayerRegistry is IPlayerRegistry, AccessControl, Pausable, ReentrancyG
 
     // ─── Club Functions ───────────────────────────────────────────────────────
 
-    /**
-     * @notice Register a new player. Caller must have CLUB_ROLE.
-     */
     function registerPlayer(
         string calldata name,
         string calldata position,
@@ -138,7 +135,6 @@ contract PlayerRegistry is IPlayerRegistry, AccessControl, Pausable, ReentrancyG
             registeredAt:   block.timestamp
         });
 
-        // I record the player's index in the club array before pushing
         _playerIndexInClub[playerId] = _clubPlayers[msg.sender].length;
         _clubPlayers[msg.sender].push(playerId);
         _playerExists[playerHash] = true;
@@ -146,9 +142,6 @@ contract PlayerRegistry is IPlayerRegistry, AccessControl, Pausable, ReentrancyG
         emit PlayerRegistered(playerId, name, msg.sender);
     }
 
-    /**
-     * @notice List a verified player for transfer.
-     */
     function listPlayer(uint256 playerId, uint256 askingPrice)
         external
         payable
@@ -172,9 +165,6 @@ contract PlayerRegistry is IPlayerRegistry, AccessControl, Pausable, ReentrancyG
         emit PlayerListed(playerId, askingPrice);
     }
 
-    /**
-     * @notice Delist a player from the transfer market.
-     */
     function delistPlayer(uint256 playerId)
         external
         whenNotPaused
@@ -194,9 +184,6 @@ contract PlayerRegistry is IPlayerRegistry, AccessControl, Pausable, ReentrancyG
 
     // ─── Registrar Functions ──────────────────────────────────────────────────
 
-    /**
-     * @notice Verify a player's eligibility. Only REGISTRAR_ROLE.
-     */
     function verifyPlayer(uint256 playerId)
         external
         whenNotPaused
@@ -214,9 +201,9 @@ contract PlayerRegistry is IPlayerRegistry, AccessControl, Pausable, ReentrancyG
     // ─── Escrow Functions ─────────────────────────────────────────────────────
 
     /**
-     * @notice Transfer club ownership of a player after a completed deal.
-     * @dev Only callable by the TransferEscrow contract (ESCROW_ROLE).
-     *      I update the club arrays, clear listing state, and emit the event.
+     * @notice Transfer club ownership of a player after a completed deal or loan event.
+     * @dev Only callable by contracts holding ESCROW_ROLE (TransferEscrow and LoanEscrow).
+     *      ESCROW_ROLE must be granted to both contracts post-deployment by admin.
      */
     function transferClubOwnership(uint256 playerId, address newClub)
         external
@@ -234,8 +221,8 @@ contract PlayerRegistry is IPlayerRegistry, AccessControl, Pausable, ReentrancyG
         if (oldClub == newClub) revert InvalidAddress();
 
         // I remove player from old club's array via swap-and-pop
-        uint256 index   = _playerIndexInClub[playerId];
-        uint256 lastId  = _clubPlayers[oldClub][_clubPlayers[oldClub].length - 1];
+        uint256 index  = _playerIndexInClub[playerId];
+        uint256 lastId = _clubPlayers[oldClub][_clubPlayers[oldClub].length - 1];
         _clubPlayers[oldClub][index] = lastId;
         _playerIndexInClub[lastId]   = index;
         _clubPlayers[oldClub].pop();
@@ -244,7 +231,7 @@ contract PlayerRegistry is IPlayerRegistry, AccessControl, Pausable, ReentrancyG
         _playerIndexInClub[playerId] = _clubPlayers[newClub].length;
         _clubPlayers[newClub].push(playerId);
 
-        // I clear listing state — player is no longer for sale after transfer
+        // I clear listing state — player is not for sale after any ownership change
         player.currentClub = newClub;
         player.isListed    = false;
         player.askingPrice = 0;
@@ -266,12 +253,25 @@ contract PlayerRegistry is IPlayerRegistry, AccessControl, Pausable, ReentrancyG
         listingFee = newFee;
     }
 
-    function withdrawFees(address payable to) external nonReentrant onlyRole(ADMIN_ROLE) {
+    /**
+     * @notice Withdraw accumulated fees up to MAX_WITHDRAW per call.
+     * @dev I cap single withdrawals to limit damage from a compromised admin key.
+     *      Multiple calls are required to drain the full balance — this adds friction
+     *      for an attacker while remaining workable for legitimate operations.
+     */
+    function withdrawFees(address payable to, uint256 amount)
+        external
+        nonReentrant
+        onlyRole(ADMIN_ROLE)
+    {
         if (to == address(0)) revert InvalidAddress();
-        uint256 balance = address(this).balance;
-        (bool success, ) = to.call{value: balance}("");
+        if (amount == 0 || amount > MAX_WITHDRAW) revert WithdrawAmountTooLarge();
+        if (amount > address(this).balance) revert InsufficientBalance();
+
+        (bool success, ) = to.call{value: amount}("");
         if (!success) revert WithdrawFailed();
-        emit FeesWithdrawn(to, balance);
+
+        emit FeesWithdrawn(to, amount);
     }
 
     function pause() external onlyRole(ADMIN_ROLE) { _pause(); }
