@@ -205,7 +205,7 @@ contract LoanEscrow is AccessControl, Pausable, ReentrancyGuard {
         if (!transferWindow.isWindowOpen()) revert TransferWindowClosed();
 
         // I verify parent club still holds CLUB_ROLE
-        if (!hasRole(CLUB_ROLE, parentClub)) revert ParentClubNotRegistered();
+        if (!playerRegistry.hasClubRole(parentClub)) revert ParentClubNotRegistered();
 
         // I verify player is listed and belongs to the stated parent club
         IPlayerRegistry.Player memory player = playerRegistry.getPlayer(playerId);

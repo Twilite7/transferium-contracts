@@ -298,6 +298,10 @@ contract PlayerRegistry is IPlayerRegistry, AccessControl, Pausable, ReentrancyG
         return _clubPlayers[club];
     }
 
+    function hasClubRole(address account) external view override returns (bool) {
+        return hasRole(CLUB_ROLE, account);
+    }
+
     function totalPlayers() external view override returns (uint256) {
         return _playerIdCounter;
     }

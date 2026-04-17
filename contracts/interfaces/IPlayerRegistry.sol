@@ -41,4 +41,5 @@ interface IPlayerRegistry {
      * @dev Only callable by the authorised escrow contract address.
      */
     function transferClubOwnership(uint256 playerId, address newClub) external;
+    function hasClubRole(address account) external view returns (bool);
 }

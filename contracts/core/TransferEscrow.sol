@@ -176,7 +176,7 @@ contract TransferEscrow is AccessControl, Pausable, ReentrancyGuard {
         if (!transferWindow.isWindowOpen()) revert TransferWindowClosed();
 
         // I verify selling club still holds CLUB_ROLE — protects against deregistered clubs
-        if (!hasRole(CLUB_ROLE, sellingClub)) revert SellingClubNotRegistered();
+        if (!playerRegistry.hasClubRole(sellingClub)) revert SellingClubNotRegistered();
 
         // I verify player is listed and belongs to the stated selling club
         IPlayerRegistry.Player memory player = playerRegistry.getPlayer(playerId);
