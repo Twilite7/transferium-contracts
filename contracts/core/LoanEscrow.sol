@@ -210,7 +210,7 @@ contract LoanEscrow is AccessControl, Pausable, ReentrancyGuard {
         // I verify player is listed and belongs to the stated parent club
         IPlayerRegistry.Player memory player = playerRegistry.getPlayer(playerId);
         if (!player.isListed) revert PlayerNotListed();
-        if (player.currentClub != parentClub) revert ParentClubMismatch();
+        if (playerRegistry.currentClub(playerId) != parentClub) revert ParentClubMismatch();
 
         _loanIdCounter++;
         loanId = _loanIdCounter;
@@ -284,7 +284,7 @@ contract LoanEscrow is AccessControl, Pausable, ReentrancyGuard {
         loan.approvedAt = block.timestamp;
 
         // interaction — external call last
-        playerRegistry.transferClubOwnership(loan.playerId, loan.borrowingClub);
+        playerRegistry.escrowTransfer(loan.playerId, loan.parentClub, loan.borrowingClub);
 
         emit LoanApproved(loanId, msg.sender);
     }
@@ -371,7 +371,7 @@ contract LoanEscrow is AccessControl, Pausable, ReentrancyGuard {
         _activePlayerLoan[loan.playerId] = 0;
 
         // interaction
-        playerRegistry.transferClubOwnership(loan.playerId, loan.parentClub);
+        playerRegistry.escrowTransfer(loan.playerId, loan.borrowingClub, loan.parentClub);
 
         emit LoanRecalled(loanId);
     }
@@ -405,7 +405,7 @@ contract LoanEscrow is AccessControl, Pausable, ReentrancyGuard {
         _activePlayerLoan[loan.playerId] = 0;
 
         // interaction
-        playerRegistry.transferClubOwnership(loan.playerId, loan.parentClub);
+        playerRegistry.escrowTransfer(loan.playerId, loan.borrowingClub, loan.parentClub);
 
         emit LoanExpired(loanId);
     }
