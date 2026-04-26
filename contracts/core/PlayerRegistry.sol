@@ -47,6 +47,7 @@ contract PlayerRegistry is IPlayerRegistry, ERC721, AccessControl, Pausable, Ree
     mapping(address => uint256[])       private _clubPlayers;
     mapping(uint256 => uint256)         private _playerIndexInClub;
     mapping(bytes32 => bool)            private _playerExists;
+    mapping(bytes32 => bool)            private _usedDocumentHashes;
 
     // ─── Events ───────────────────────────────────────────────────────────────
     event RegistrationFeeUpdated(uint256 oldFee, uint256 newFee);
@@ -283,6 +284,10 @@ contract PlayerRegistry is IPlayerRegistry, ERC721, AccessControl, Pausable, Ree
         if (registrationContractHash == bytes32(0)) revert InvalidAddress();
         if (identityDocumentHash == bytes32(0)) revert InvalidAddress();
         if (fifaTMSHash == bytes32(0)) revert InvalidAddress();
+        if (_usedDocumentHashes[registrationContractHash]) revert InvalidAddress();
+        if (_usedDocumentHashes[identityDocumentHash])     revert InvalidAddress();
+        if (_usedDocumentHashes[fifaTMSHash])              revert InvalidAddress();
+        if (workPermitHash != bytes32(0) && _usedDocumentHashes[workPermitHash]) revert InvalidAddress();
 
         _legalDocs[playerId] = LegalDocuments({
             registrationContractHash: registrationContractHash,
@@ -291,6 +296,10 @@ contract PlayerRegistry is IPlayerRegistry, ERC721, AccessControl, Pausable, Ree
             workPermitHash:           workPermitHash,
             documentsVerified:        false
         });
+        _usedDocumentHashes[registrationContractHash] = true;
+        _usedDocumentHashes[identityDocumentHash]     = true;
+        _usedDocumentHashes[fifaTMSHash]              = true;
+        if (workPermitHash != bytes32(0)) _usedDocumentHashes[workPermitHash] = true;
 
         emit LegalDocumentsSubmitted(playerId);
     }
@@ -316,10 +325,12 @@ contract PlayerRegistry is IPlayerRegistry, ERC721, AccessControl, Pausable, Ree
         playerExists(playerId)
     {
         if (documentHash == bytes32(0)) revert InvalidAddress();
+        if (_usedDocumentHashes[documentHash]) revert InvalidAddress();
         if (_players[playerId].medicalClearance) revert MedicalAlreadyCleared();
 
         _players[playerId].medicalClearance    = true;
         _players[playerId].medicalDocumentHash = documentHash;
+        _usedDocumentHashes[documentHash]      = true;
 
         emit MedicalClearanceSet(playerId, documentHash);
     }
