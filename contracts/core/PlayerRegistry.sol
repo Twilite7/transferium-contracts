@@ -48,6 +48,7 @@ contract PlayerRegistry is IPlayerRegistry, ERC721, AccessControl, Pausable, Ree
     mapping(uint256 => uint256)         private _playerIndexInClub;
     mapping(bytes32 => bool)            private _playerExists;
     mapping(bytes32 => bool)            private _usedDocumentHashes;
+    mapping(address => bool)            private _usedPlayerWallets;
 
     // ─── Events ───────────────────────────────────────────────────────────────
     event RegistrationFeeUpdated(uint256 oldFee, uint256 newFee);
@@ -367,8 +368,10 @@ contract PlayerRegistry is IPlayerRegistry, ERC721, AccessControl, Pausable, Ree
     {
         if (playerWallet == address(0)) revert InvalidAddress();
         if (_players[playerId].playerWallet != address(0)) revert InvalidAddress();
+        if (_usedPlayerWallets[playerWallet]) revert InvalidAddress();
 
         _players[playerId].playerWallet = playerWallet;
+        _usedPlayerWallets[playerWallet] = true;
 
         emit PlayerWalletSet(playerId, playerWallet);
     }
@@ -390,9 +393,12 @@ contract PlayerRegistry is IPlayerRegistry, ERC721, AccessControl, Pausable, Ree
         if (player.playerWallet == address(0)) revert PlayerWalletNotSet();
         if (player.playerWallet != msg.sender) revert NotPlayerWallet();
         if (newWallet == address(0)) revert InvalidAddress();
+        if (_usedPlayerWallets[newWallet]) revert InvalidAddress();
 
-        address oldWallet      = player.playerWallet;
-        player.playerWallet    = newWallet;
+        address oldWallet             = player.playerWallet;
+        _usedPlayerWallets[oldWallet] = false;
+        _usedPlayerWallets[newWallet] = true;
+        player.playerWallet           = newWallet;
 
         emit PlayerWalletUpdated(playerId, oldWallet, newWallet);
     }
