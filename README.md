@@ -1,57 +1,87 @@
-# Sample Hardhat 3 Beta Project (`mocha` and `ethers`)
+# Transferium Protocol — Smart Contracts
 
-This project showcases a Hardhat 3 Beta project using `mocha` for tests and the `ethers` library for Ethereum interactions.
+A decentralised football player transfer and loan protocol built on Arc Testnet. Transferium brings the legal and financial infrastructure of professional football transfers on-chain — player registration, identity verification, transfer escrow, loan agreements, and league governance.
 
-To learn more about the Hardhat 3 Beta, please visit the [Getting Started guide](https://hardhat.org/docs/getting-started#getting-started-with-hardhat-3). To share your feedback, join our [Hardhat 3 Beta](https://hardhat.org/hardhat3-beta-telegram-group) Telegram group or [open an issue](https://github.com/NomicFoundation/hardhat/issues/new) in our GitHub issue tracker.
+## Overview
 
-## Project Overview
+Transferium replaces the trust-based, opaque back-office of football transfers with transparent, auditable smart contracts. Clubs, players, agents, and league authorities interact directly on-chain — no intermediaries, no hidden fees, no disputed payments.
 
-This example project includes:
+## Deployed Contracts (Arc Testnet — Chain ID 5042002)
 
-- A simple Hardhat configuration file.
-- Foundry-compatible Solidity unit tests.
-- TypeScript integration tests using `mocha` and ethers.js
-- Examples demonstrating how to connect to different types of networks, including locally simulating OP mainnet.
+| Contract | Address |
+|---|---|
+| PlayerRegistry | `0xdDa83cf2ADECD861Cc6aa947E167E29906BB77Ef` |
+| TransferWindow | `0xcEDd544E087a670CcD4bBe0437F80BB6C8f837a4` |
+| TransferEscrow | `0xa92C0648d97455D11713487FE6a1B784f74cB94A` |
+| LoanEscrow | `0x2a0F089674ff1Eb1C035C19d61d4bfCc0360e9fC` |
 
-## Usage
+## Architecture
 
-### Running Tests
+### PlayerRegistry (ERC-721)
+Each registered player is minted as an NFT owned by their club. The registry enforces a full compliance pipeline before a player can be listed for transfer:
 
-To run all the tests in the project, execute the following command:
+- **Club registration** — only wallets with `CLUB_ROLE` can register players
+- **Identity verification** — registrar must verify the player on-chain
+- **Medical clearance** — registrar submits a hash of the medical report
+- **Legal documents** — registration contract, identity document, FIFA TMS reference, and work permit hashes must all be unique across the entire registry
+- **Player wallet** — a unique on-chain wallet is assigned to the player for receiving sell-on fees, performance bonuses, and salary guarantees
 
-```shell
+### TransferEscrow
+Handles permanent player transfers between clubs. Supports:
+- Transfer fee in EURC or USDC
+- Agent fee (percentage routed to agent wallet)
+- Sell-on clause (percentage of future sale routed to selling club)
+- Performance add-ons (milestone-based payments to player wallet)
+- Salary guarantee (locked in escrow, claimable by player wallet)
+- Dispute window before funds are released
+
+### LoanEscrow
+Handles temporary loan agreements. Supports:
+- Loan fee payments
+- Recall mechanisms with notice periods
+- Option to buy (converting a loan to a permanent transfer)
+- Automatic settlement on loan expiry
+
+### TransferWindow
+Controls when transfers can be listed and executed. The league authority schedules open and close dates. Transfers outside the window are rejected at the contract level.
+
+## Security Features
+
+- Document hash uniqueness enforced globally — no two players can share a medical or legal document hash
+- Player wallet uniqueness enforced globally — no two players can share the same wallet address
+- Role-based access control (OpenZeppelin) — CLUB_ROLE, REGISTRAR_ROLE, ESCROW_ROLE, LEAGUE_ROLE
+- Reentrancy protection on all state-changing functions
+- Pausable contracts for emergency stops
+- Transfer window enforcement at contract level
+
+## Tech Stack
+
+- Solidity 0.8.28
+- Hardhat
+- OpenZeppelin Contracts
+- Arc Testnet (Chain ID 5042002)
+- EURC and USDC whitelisted as payment tokens
+
+## Test Coverage
+
+33 tests passing across all four contracts covering the full transfer lifecycle, loan flows, dispute resolution, sell-on clauses, agent fees, performance add-ons, and salary guarantees.
+
+```bash
 npx hardhat test
 ```
 
-You can also selectively run the Solidity or `mocha` tests:
+## Deployment
 
-```shell
-npx hardhat test solidity
-npx hardhat test mocha
+```bash
+npx hardhat run scripts/deploy.ts --network arc
+npx hardhat run scripts/setup-test-roles.ts --network arc
+npx hardhat run scripts/open-test-window.ts --network arc
 ```
 
-### Make a deployment to Sepolia
+## Frontend
 
-This project includes an example Ignition module to deploy the contract. You can deploy this module to a locally simulated chain or to Sepolia.
+The Transferium frontend is available at [github.com/Twilite7/transferium-frontend](https://github.com/Twilite7/transferium-frontend)
 
-To run the deployment to a local chain:
+---
 
-```shell
-npx hardhat ignition deploy ignition/modules/Counter.ts
-```
-
-To run the deployment to Sepolia, you need an account with funds to send the transaction. The provided Hardhat configuration includes a Configuration Variable called `SEPOLIA_PRIVATE_KEY`, which you can use to set the private key of the account you want to use.
-
-You can set the `SEPOLIA_PRIVATE_KEY` variable using the `hardhat-keystore` plugin or by setting it as an environment variable.
-
-To set the `SEPOLIA_PRIVATE_KEY` config variable using `hardhat-keystore`:
-
-```shell
-npx hardhat keystore set SEPOLIA_PRIVATE_KEY
-```
-
-After setting the variable, you can run the deployment with the Sepolia network:
-
-```shell
-npx hardhat ignition deploy --network sepolia ignition/modules/Counter.ts
-```
+*Built on Arc Testnet. Security over speed. Always.*
