@@ -1,3 +1,5 @@
+> **Status:** Actively in development. Contracts are deployed and functional on Arc Testnet. Frontend is partially complete — Players and Transfers pages are working, Loans page is still being built. This README will be updated as the project progresses.
+
 # Transferium Protocol
 
 After building Zeno Estate — an RWA project on Arc — I started thinking about what else Arc's financial infrastructure could handle. Club-to-club football transfers involve escrow, legal documents, multi-party payments, installments, agent fees, sell-on clauses. It's one of the most complex financial transactions in sports and it's still done mostly off-chain with lawyers and wire transfers.
