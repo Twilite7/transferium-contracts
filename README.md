@@ -1,12 +1,16 @@
-# Transferium Protocol — Smart Contracts
+# Transferium Protocol
 
-A decentralised football player transfer and loan protocol built on Arc Testnet. Transferium brings the legal and financial infrastructure of professional football transfers on-chain — player registration, identity verification, transfer escrow, loan agreements, and league governance.
+After building Zeno Estate — an RWA project on Arc — I started thinking about what else Arc's financial infrastructure could handle. Club-to-club football transfers involve escrow, legal documents, multi-party payments, installments, agent fees, sell-on clauses. It's one of the most complex financial transactions in sports and it's still done mostly off-chain with lawyers and wire transfers.
 
-## Overview
+So I built Transferium. It's a proof of concept that Arc can handle something this complex. Right now it's scoped to football but the architecture is open to any sport where clubs transfer player registrations.
 
-Transferium replaces the trust-based, opaque back-office of football transfers with transparent, auditable smart contracts. Clubs, players, agents, and league authorities interact directly on-chain — no intermediaries, no hidden fees, no disputed payments.
+## What It Does
 
-## Deployed Contracts (Arc Testnet — Chain ID 5042002)
+Clubs register players as NFTs. Before a player can be listed for transfer, a league registrar must verify their identity, medical clearance, and legal documents on-chain. Every document hash is unique — you can't reuse a medical report across players. Every player gets their own wallet for receiving sell-on fees and performance bonuses directly, no club middleman.
+
+Transfers go through an escrow contract that handles the full deal structure — transfer fee, agent cut, sell-on clause, performance add-ons, salary guarantee. Loans have their own escrow with recall mechanics and option-to-buy. The transfer window is enforced at contract level — no transfers outside the window, period.
+
+## Deployed on Arc Testnet (Chain ID 5042002)
 
 | Contract | Address |
 |---|---|
@@ -15,62 +19,38 @@ Transferium replaces the trust-based, opaque back-office of football transfers w
 | TransferEscrow | `0xa92C0648d97455D11713487FE6a1B784f74cB94A` |
 | LoanEscrow | `0x2a0F089674ff1Eb1C035C19d61d4bfCc0360e9fC` |
 
-## Architecture
+Deployer: `0x13E569C96c7F884443d0c3Ac5019D020dE32bFb3`
 
-### PlayerRegistry (ERC-721)
-Each registered player is minted as an NFT owned by their club. The registry enforces a full compliance pipeline before a player can be listed for transfer:
+## Contracts
 
-- **Club registration** — only wallets with `CLUB_ROLE` can register players
-- **Identity verification** — registrar must verify the player on-chain
-- **Medical clearance** — registrar submits a hash of the medical report
-- **Legal documents** — registration contract, identity document, FIFA TMS reference, and work permit hashes must all be unique across the entire registry
-- **Player wallet** — a unique on-chain wallet is assigned to the player for receiving sell-on fees, performance bonuses, and salary guarantees
+**PlayerRegistry** — ERC-721. Each player is an NFT owned by their club. Handles registration, verification, medical clearance, legal docs, player wallet assignment, listing and delisting. Document hashes and player wallets are globally unique across the registry.
 
-### TransferEscrow
-Handles permanent player transfers between clubs. Supports:
-- Transfer fee in EURC or USDC
-- Agent fee (percentage routed to agent wallet)
-- Sell-on clause (percentage of future sale routed to selling club)
-- Performance add-ons (milestone-based payments to player wallet)
-- Salary guarantee (locked in escrow, claimable by player wallet)
-- Dispute window before funds are released
+**TransferEscrow** — Permanent transfers. Supports transfer fee, agent fee, sell-on clause, performance add-ons, salary guarantee, and a dispute window before funds release.
 
-### LoanEscrow
-Handles temporary loan agreements. Supports:
-- Loan fee payments
-- Recall mechanisms with notice periods
-- Option to buy (converting a loan to a permanent transfer)
-- Automatic settlement on loan expiry
+**LoanEscrow** — Loans. Handles loan fees, recall with notice period, option to buy, and automatic settlement on expiry.
 
-### TransferWindow
-Controls when transfers can be listed and executed. The league authority schedules open and close dates. Transfers outside the window are rejected at the contract level.
+**TransferWindow** — League authority schedules open and close dates. Transfers outside the window are rejected at contract level.
 
-## Security Features
+## Security
 
-- Document hash uniqueness enforced globally — no two players can share a medical or legal document hash
-- Player wallet uniqueness enforced globally — no two players can share the same wallet address
-- Role-based access control (OpenZeppelin) — CLUB_ROLE, REGISTRAR_ROLE, ESCROW_ROLE, LEAGUE_ROLE
+- Role-based access: CLUB_ROLE, REGISTRAR_ROLE, ESCROW_ROLE, LEAGUE_ROLE
+- Document hash uniqueness enforced globally
+- Player wallet uniqueness enforced globally  
 - Reentrancy protection on all state-changing functions
-- Pausable contracts for emergency stops
-- Transfer window enforcement at contract level
+- Pausable for emergencies
+- 33 tests passing
 
-## Tech Stack
+## Stack
 
-- Solidity 0.8.28
-- Hardhat
-- OpenZeppelin Contracts
-- Arc Testnet (Chain ID 5042002)
-- EURC and USDC whitelisted as payment tokens
+Solidity 0.8.28, Hardhat, OpenZeppelin, Arc Testnet, EURC + USDC
 
-## Test Coverage
-
-33 tests passing across all four contracts covering the full transfer lifecycle, loan flows, dispute resolution, sell-on clauses, agent fees, performance add-ons, and salary guarantees.
+## Run Tests
 
 ```bash
 npx hardhat test
 ```
 
-## Deployment
+## Deploy
 
 ```bash
 npx hardhat run scripts/deploy.ts --network arc
@@ -78,10 +58,8 @@ npx hardhat run scripts/setup-test-roles.ts --network arc
 npx hardhat run scripts/open-test-window.ts --network arc
 ```
 
-## Frontend
-
-The Transferium frontend is available at [github.com/Twilite7/transferium-frontend](https://github.com/Twilite7/transferium-frontend)
+Frontend: [github.com/Twilite7/transferium-frontend](https://github.com/Twilite7/transferium-frontend)
 
 ---
 
-*Built on Arc Testnet. Security over speed. Always.*
+Security over speed. Always.
