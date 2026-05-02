@@ -115,7 +115,7 @@ async function setupListedPlayer(
 
 async function openTransferWindow(ethers: any, transferWindow: any): Promise<void> {
   const now = await getChainTime(ethers);
-  await transferWindow.scheduleWindow("Summer 2026", now + 10, now + 30 * 24 * 3600);
+  await transferWindow.scheduleWindow("Summer 2026", now + 10, now + 30 * 24 * 3600, 0);
   await ethers.provider.send("evm_increaseTime", [11]);
   await ethers.provider.send("evm_mine", []);
   await transferWindow.advanceActiveWindow();
@@ -356,7 +356,7 @@ describe("Transferium Protocol v2", function () {
       const { ethers, transferWindow } = await deployAll();
       const now = await getChainTime(ethers);
       expect(await transferWindow.isWindowOpen()).to.be.false;
-      await transferWindow.scheduleWindow("Summer 2026", now + 10, now + 30 * 24 * 3600);
+      await transferWindow.scheduleWindow("Summer 2026", now + 10, now + 30 * 24 * 3600, 0);
       await ethers.provider.send("evm_increaseTime", [11]);
       await ethers.provider.send("evm_mine", []);
       expect(await transferWindow.isWindowOpen()).to.be.true;
@@ -365,29 +365,29 @@ describe("Transferium Protocol v2", function () {
     it("reverts scheduling overlapping windows", async function () {
       const { ethers, transferWindow } = await deployAll();
       const now = await getChainTime(ethers);
-      await transferWindow.scheduleWindow("Summer 2026", now + 100, now + 200);
+      await transferWindow.scheduleWindow("Summer 2026", now + 100, now + 200, 0);
       await expect(
-        transferWindow.scheduleWindow("Overlap", now + 150, now + 300)
+        transferWindow.scheduleWindow("Overlap", now + 150, now + 300, 0)
       ).to.be.revertedWithCustomError(transferWindow, "WindowOverlap");
     });
 
     it("reverts cancelling an already open window", async function () {
       const { ethers, transferWindow } = await deployAll();
       const now     = await getChainTime(ethers);
-      const tx      = await transferWindow.scheduleWindow("Summer 2026", now + 10, now + 30 * 24 * 3600);
+      const tx      = await transferWindow.scheduleWindow("Summer 2026", now + 10, now + 30 * 24 * 3600, 0);
       const receipt = await tx.wait();
       const event   = receipt.logs.map((log: any) => { try { return transferWindow.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "WindowScheduled");
       await ethers.provider.send("evm_increaseTime", [11]);
       await ethers.provider.send("evm_mine", []);
       await expect(transferWindow.cancelWindow(event.args.windowId))
-        .to.be.revertedWithCustomError(transferWindow, "WindowAlreadyClosed");
+        .to.be.revertedWithCustomError(transferWindow, "WindowAlreadyOpen");
     });
 
     it("extends an open window", async function () {
       const { ethers, transferWindow } = await deployAll();
       const now     = await getChainTime(ethers);
       const closeAt = now + 30 * 24 * 3600;
-      const tx      = await transferWindow.scheduleWindow("Summer 2026", now + 10, closeAt);
+      const tx      = await transferWindow.scheduleWindow("Summer 2026", now + 10, closeAt, 0);
       const receipt = await tx.wait();
       const event   = receipt.logs.map((log: any) => { try { return transferWindow.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "WindowScheduled");
       await ethers.provider.send("evm_increaseTime", [11]);
@@ -732,5 +732,133 @@ describe("Transferium Protocol v2", function () {
       await expect(loanEscrow.connect(other).settleLoanExpiry(event.args.loanId))
         .to.be.revertedWithCustomError(loanEscrow, "NotAuthorised");
     });
+
+    describe("TransferWindow — upgraded", function () {
+
+      it("schedules STANDARD window with correct type", async function () {
+        const { ethers, transferWindow } = await deployAll();
+        const now = await ethers.provider.getBlock("latest").then((b: any) => b.timestamp);
+        const tx = await transferWindow.scheduleWindow("Summer 2026", now + 10, now + 30 * 24 * 3600, 0);
+        const receipt = await tx.wait();
+        const event = receipt.logs.map((log: any) => { try { return transferWindow.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "WindowScheduled");
+        expect(event.args.windowType).to.equal(0); // STANDARD
+      });
+
+      it("schedules EXCEPTIONAL window within 10 day limit", async function () {
+        const { ethers, transferWindow } = await deployAll();
+        const now = await ethers.provider.getBlock("latest").then((b: any) => b.timestamp);
+        await expect(
+          transferWindow.scheduleWindow("Club World Cup", now + 10, now + 9 * 24 * 3600, 1)
+        ).to.eventually.be.fulfilled;
+      });
+
+      it("rejects EXCEPTIONAL window exceeding 10 days", async function () {
+        const { ethers, transferWindow } = await deployAll();
+        const now = await ethers.provider.getBlock("latest").then((b: any) => b.timestamp);
+        await expect(
+          transferWindow.scheduleWindow("Too Long", now + 10, now + 11 * 24 * 3600, 1)
+        ).to.be.revertedWithCustomError(transferWindow, "WindowTooLong");
+      });
+
+      it("schedules EMERGENCY window within 7 day limit", async function () {
+        const { ethers, transferWindow } = await deployAll();
+        const now = await ethers.provider.getBlock("latest").then((b: any) => b.timestamp);
+        await expect(
+          transferWindow.scheduleWindow("Emergency GK", now + 10, now + 6 * 24 * 3600, 2)
+        ).to.eventually.be.fulfilled;
+      });
+
+      it("rejects EMERGENCY window exceeding 7 days", async function () {
+        const { ethers, transferWindow } = await deployAll();
+        const now = await ethers.provider.getBlock("latest").then((b: any) => b.timestamp);
+        await expect(
+          transferWindow.scheduleWindow("Too Long", now + 10, now + 8 * 24 * 3600, 2)
+        ).to.be.revertedWithCustomError(transferWindow, "WindowTooLong");
+      });
+
+      it("suspends and resumes an open window", async function () {
+        const { ethers, transferWindow } = await deployAll();
+        const now = await ethers.provider.getBlock("latest").then((b: any) => b.timestamp);
+        const tx = await transferWindow.scheduleWindow("Summer 2026", now + 10, now + 30 * 24 * 3600, 0);
+        const receipt = await tx.wait();
+        const event = receipt.logs.map((log: any) => { try { return transferWindow.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "WindowScheduled");
+        const windowId = event.args.windowId;
+
+        await ethers.provider.send("evm_increaseTime", [15]);
+        await ethers.provider.send("evm_mine", []);
+
+        expect(await transferWindow.isWindowOpen()).to.be.true;
+
+        await transferWindow.suspendWindow(windowId);
+        expect(await transferWindow.isWindowOpen()).to.be.false;
+
+        await transferWindow.resumeWindow(windowId);
+        expect(await transferWindow.isWindowOpen()).to.be.true;
+      });
+
+      it("rejects suspending an already suspended window", async function () {
+        const { ethers, transferWindow } = await deployAll();
+        const now = await ethers.provider.getBlock("latest").then((b: any) => b.timestamp);
+        const tx = await transferWindow.scheduleWindow("Summer 2026", now + 10, now + 30 * 24 * 3600, 0);
+        const receipt = await tx.wait();
+        const event = receipt.logs.map((log: any) => { try { return transferWindow.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "WindowScheduled");
+        const windowId = event.args.windowId;
+
+        await ethers.provider.send("evm_increaseTime", [15]);
+        await ethers.provider.send("evm_mine", []);
+
+        await transferWindow.suspendWindow(windowId);
+        await expect(
+          transferWindow.suspendWindow(windowId)
+        ).to.be.revertedWithCustomError(transferWindow, "WindowAlreadySuspended");
+      });
+
+      it("isWindowOpenForType returns true for correct type only", async function () {
+        const { ethers, transferWindow } = await deployAll();
+        const now = await ethers.provider.getBlock("latest").then((b: any) => b.timestamp);
+        await transferWindow.scheduleWindow("Summer 2026", now + 10, now + 30 * 24 * 3600, 0);
+
+        await ethers.provider.send("evm_increaseTime", [15]);
+        await ethers.provider.send("evm_mine", []);
+
+        expect(await transferWindow.isWindowOpenForType(0)).to.be.true;  // STANDARD
+        expect(await transferWindow.isWindowOpenForType(1)).to.be.false; // EXCEPTIONAL
+        expect(await transferWindow.isWindowOpenForType(2)).to.be.false; // EMERGENCY
+      });
+
+      it("getCurrentWindowType returns correct type", async function () {
+        const { ethers, transferWindow } = await deployAll();
+        const now = await ethers.provider.getBlock("latest").then((b: any) => b.timestamp);
+        await transferWindow.scheduleWindow("Club World Cup", now + 10, now + 9 * 24 * 3600, 1);
+
+        await ethers.provider.send("evm_increaseTime", [15]);
+        await ethers.provider.send("evm_mine", []);
+
+        expect(await transferWindow.getCurrentWindowType()).to.equal(1); // EXCEPTIONAL
+      });
+
+      it("getCurrentWindowType reverts when no window open", async function () {
+        const { transferWindow } = await deployAll();
+        await expect(
+          transferWindow.getCurrentWindowType()
+        ).to.be.revertedWithCustomError(transferWindow, "NoActiveWindow");
+      });
+
+      it("suspended window not counted by isWindowOpenForType", async function () {
+        const { ethers, transferWindow } = await deployAll();
+        const now = await ethers.provider.getBlock("latest").then((b: any) => b.timestamp);
+        const tx = await transferWindow.scheduleWindow("Summer 2026", now + 10, now + 30 * 24 * 3600, 0);
+        const receipt = await tx.wait();
+        const event = receipt.logs.map((log: any) => { try { return transferWindow.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "WindowScheduled");
+        const windowId = event.args.windowId;
+
+        await ethers.provider.send("evm_increaseTime", [15]);
+        await ethers.provider.send("evm_mine", []);
+
+        await transferWindow.suspendWindow(windowId);
+        expect(await transferWindow.isWindowOpenForType(0)).to.be.false;
+      });
+    });
+
   });
 });
