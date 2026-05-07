@@ -29,7 +29,7 @@ async function main() {
   console.log("TransferWindow:  ", await window.getAddress());
 
   // 4. LoanEscrow (non-proxy)
-  const LEF      = await ethers.getContractFactory("LoanEscrow");
+  const LEF        = await ethers.getContractFactory("LoanEscrow");
   const loanEscrow = await LEF.deploy(
     await registry.getAddress(),
     await window.getAddress()
@@ -68,14 +68,48 @@ async function main() {
   const escrow = TEF.attach(await teProxy.getAddress());
   console.log("TransferEscrow proxy:", await teProxy.getAddress());
 
-  // 7. Wire roles
+  // 7. ReleaseEscrow (UUPS proxy)
+  // I deploy after TransferEscrow so we can pass its address into initialize
+  const REF         = await ethers.getContractFactory("ReleaseEscrow");
+  const releaseImpl = await REF.deploy();
+  await releaseImpl.waitForDeployment();
+  const releaseInit = releaseImpl.interface.encodeFunctionData("initialize", [
+    await registry.getAddress(),
+    await window.getAddress(),
+    await escrow.getAddress(),   // TransferEscrow — ReleaseEscrow checks it for active offers/deals
+    deployer.address,            // treasury
+    deployer.address,            // admin
+  ]);
+  const releaseProxy = await Proxy.deploy(await releaseImpl.getAddress(), releaseInit);
+  await releaseProxy.waitForDeployment();
+  const releaseEscrow = REF.attach(await releaseProxy.getAddress());
+  console.log("ReleaseEscrow proxy:", await releaseProxy.getAddress());
+
+  // 8. Wire roles
   const TRANSFER_ESCROW_ROLE = await dealEscrow.TRANSFER_ESCROW_ROLE();
   const ESCROW_ROLE          = await registry.ESCROW_ROLE();
+
+  // DealEscrow needs TRANSFER_ESCROW_ROLE to accept callbacks from TransferEscrow
   await dealEscrow.grantRole(TRANSFER_ESCROW_ROLE, await escrow.getAddress());
+
+  // All escrow contracts need ESCROW_ROLE to move player NFTs via escrowTransfer
   await registry.grantRole(ESCROW_ROLE, await escrow.getAddress());
   await registry.grantRole(ESCROW_ROLE, await dealEscrow.getAddress());
   await registry.grantRole(ESCROW_ROLE, await loanEscrow.getAddress());
+  await registry.grantRole(ESCROW_ROLE, await releaseEscrow.getAddress());
+
   console.log("Roles wired.");
+
+  // 9. Whitelist EURC and USDC on all escrow contracts that hold tokens
+  const EURC = "0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a";
+  const USDC = "0x3600000000000000000000000000000000000000";
+
+  for (const token of [EURC, USDC]) {
+    await dealEscrow.approveToken(token);
+    await loanEscrow.approveToken(token);
+    await releaseEscrow.approveToken(token);
+  }
+  console.log("EURC + USDC whitelisted on DealEscrow, LoanEscrow, ReleaseEscrow.");
 
   console.log("\n--- COPY THESE INTO YOUR FRONTEND ---");
   console.log(`FEELIB:           ${await feeLib.getAddress()}`);
@@ -84,6 +118,7 @@ async function main() {
   console.log(`LOAN_ESCROW:      ${await loanEscrow.getAddress()}`);
   console.log(`DEAL_ESCROW:      ${await dealProxy.getAddress()}`);
   console.log(`TRANSFER_ESCROW:  ${await teProxy.getAddress()}`);
+  console.log(`RELEASE_ESCROW:   ${await releaseProxy.getAddress()}`);
 }
 
 main().catch(e => { console.error(e); process.exit(1); });
