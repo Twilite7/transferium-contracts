@@ -18,6 +18,7 @@ import "../interfaces/IPlayerRegistry.sol";
  *      - Direct ERC-721 transfers blocked — only ESCROW_ROLE can move tokens
  *      - Medical clearance + legal document verification required before listing
  *      - Player wallet set by registrar, updatable by player themselves
+ *      - Portrait stored as IPFS CID — frontend prepends gateway, no URL lock-in
  *      - ESCROW_ROLE must be granted post-deployment to TransferEscrow and LoanEscrow
  */
 contract PlayerRegistry is IPlayerRegistry, ERC721, AccessControl, Pausable, ReentrancyGuard {
@@ -34,7 +35,7 @@ contract PlayerRegistry is IPlayerRegistry, ERC721, AccessControl, Pausable, Ree
     uint256 public constant MAX_PRICE      = 500_000_000 ether;
     uint256 public constant MAX_STRING_LEN = 64;
     uint256 public constant MAX_WITHDRAW   = 1_000 ether;
-    uint256 public constant MAX_SALARY     = 10_000_000 ether; // 10M EURC weekly salary cap
+    uint256 public constant MAX_SALARY     = 10_000_000 ether;
 
     // ─── State ────────────────────────────────────────────────────────────────
     uint256 private _playerIdCounter;
@@ -54,6 +55,9 @@ contract PlayerRegistry is IPlayerRegistry, ERC721, AccessControl, Pausable, Ree
     event RegistrationFeeUpdated(uint256 oldFee, uint256 newFee);
     event ListingFeeUpdated(uint256 oldFee, uint256 newFee);
     event FeesWithdrawn(address indexed to, uint256 amount);
+    // I emit the full CID so indexers can update off-chain metadata without
+    // reading storage separately
+    event PortraitUpdated(uint256 indexed playerId, string cid);
 
     // ─── Errors ───────────────────────────────────────────────────────────────
     error InvalidString();
@@ -81,6 +85,9 @@ contract PlayerRegistry is IPlayerRegistry, ERC721, AccessControl, Pausable, Ree
     error PlayerWalletNotSet();
     error NotPlayerWallet();
     error InvalidSalary();
+    // I declare NotAuthorised separately from NotPlayerClub so callers know
+    // whether the rejection is club-level or wallet-level
+    error NotAuthorised();
 
     // ─── Constructor ──────────────────────────────────────────────────────────
     constructor(uint256 _registrationFee, uint256 _listingFee)
@@ -100,7 +107,7 @@ contract PlayerRegistry is IPlayerRegistry, ERC721, AccessControl, Pausable, Ree
     // ─── ERC-721 Transfer Block ───────────────────────────────────────────────
 
     /**
-     * @notice I block all direct ERC-721 transfers.
+     * @notice Block all direct ERC-721 transfers.
      * @dev Only ESCROW_ROLE contracts can move player tokens via escrowTransfer().
      */
     function _update(address to, uint256 tokenId, address auth)
@@ -135,14 +142,16 @@ contract PlayerRegistry is IPlayerRegistry, ERC721, AccessControl, Pausable, Ree
 
     /**
      * @notice Register a new player and mint their NFT to the registering club.
-     * @dev weeklySalary is a transparency field — no actual payments happen here.
+     * @dev portraitCID is the IPFS CID of the player portrait image.
+     *      Pass empty string if not yet available — updateable later via setPortrait().
      */
     function registerPlayer(
         string calldata name,
         string calldata position,
         string calldata nationality,
         uint256 contractExpiry,
-        uint256 weeklySalary
+        uint256 weeklySalary,
+        string calldata portraitCID
     )
         external
         payable
@@ -178,7 +187,10 @@ contract PlayerRegistry is IPlayerRegistry, ERC721, AccessControl, Pausable, Ree
             medicalDocumentHash: bytes32(0),
             askingPrice:         0,
             releaseClause:       0,
-            registeredAt:        block.timestamp
+            registeredAt:        block.timestamp,
+            // I store only the CID — frontend prepends the gateway URL so
+            // switching gateways never requires a contract change
+            portraitCID:         portraitCID
         });
 
         _playerIndexInClub[playerId] = _clubPlayers[msg.sender].length;
@@ -188,6 +200,25 @@ contract PlayerRegistry is IPlayerRegistry, ERC721, AccessControl, Pausable, Ree
         _mint(msg.sender, playerId);
 
         emit PlayerRegistered(playerId, name, msg.sender);
+    }
+
+    /**
+     * @notice Update the IPFS portrait CID for a player.
+     * @dev The current owning club OR the player's own wallet can update.
+     *      Passing empty string clears the portrait.
+     */
+    function setPortrait(uint256 playerId, string calldata cid)
+        external
+        whenNotPaused
+        nonReentrant
+        playerExists(playerId)
+    {
+        address club   = ownerOf(playerId);
+        address wallet = _players[playerId].playerWallet;
+        // I allow either the club holding the NFT or the verified player wallet
+        if (msg.sender != club && msg.sender != wallet) revert NotAuthorised();
+        _players[playerId].portraitCID = cid;
+        emit PortraitUpdated(playerId, cid);
     }
 
     /**
@@ -356,7 +387,7 @@ contract PlayerRegistry is IPlayerRegistry, ERC721, AccessControl, Pausable, Ree
     }
 
     /**
-     * @notice Registrar sets the player's own wallet address after identity verification.
+     * @notice Registrar sets the player wallet address after identity verification.
      * @dev Once set, only the player themselves can update it via updatePlayerWallet().
      */
     function setPlayerWallet(uint256 playerId, address playerWallet)
@@ -381,7 +412,7 @@ contract PlayerRegistry is IPlayerRegistry, ERC721, AccessControl, Pausable, Ree
     /**
      * @notice Player updates their own wallet address.
      * @dev Only callable from the currently registered playerWallet.
-     *      This allows players to rotate wallets without club or registrar involvement.
+     *      Allows players to rotate wallets without club or registrar involvement.
      */
     function updatePlayerWallet(uint256 playerId, address newWallet)
         external
@@ -429,13 +460,14 @@ contract PlayerRegistry is IPlayerRegistry, ERC721, AccessControl, Pausable, Ree
         _clubPlayers[toClub].push(playerId);
 
         // I clear listing, medical clearance and legal docs — fresh start at new club
+        // I intentionally keep portraitCID — the player's face does not change clubs
         Player storage player        = _players[playerId];
         player.isListed              = false;
         player.askingPrice           = 0;
         player.medicalClearance      = false;
         player.medicalDocumentHash   = bytes32(0);
 
-        // I reset legal documents — new club must submit fresh docs
+        // I reset legal documents — new club must submit fresh docs for their jurisdiction
         _legalDocs[playerId] = LegalDocuments({
             registrationContractHash: bytes32(0),
             identityDocumentHash:     bytes32(0),
@@ -451,6 +483,11 @@ contract PlayerRegistry is IPlayerRegistry, ERC721, AccessControl, Pausable, Ree
 
     // ─── Token URI ────────────────────────────────────────────────────────────
 
+    /**
+     * @notice Returns ERC-721 metadata as a base64-encoded JSON data URI.
+     * @dev Image uses ipfs:// URI scheme — wallets and marketplaces resolve
+     *      this via their own gateway so there is no centralised URL dependency.
+     */
     function tokenURI(uint256 playerId)
         public
         view
@@ -461,8 +498,14 @@ contract PlayerRegistry is IPlayerRegistry, ERC721, AccessControl, Pausable, Ree
         Player memory p = _players[playerId];
         address club    = ownerOf(playerId);
 
+        // I build the image field only when a portrait CID has been set
+        string memory imageField = bytes(p.portraitCID).length > 0
+            ? string(abi.encodePacked('"image":"ipfs://', p.portraitCID, '",'))
+            : '"image":"",';
+
         string memory json = string(abi.encodePacked(
             '{"name":"', p.name, ' #', playerId.toString(), '",',
+            imageField,
             '"description":"Transferium Protocol - Professional Football Player Registration",',
             '"attributes":[',
                 '{"trait_type":"Position","value":"', p.position, '"},',

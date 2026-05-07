@@ -28,5 +28,8 @@
     "ts-node": "^10.9.2",
     "typescript": "~5.8.0"
   },
-  "type": "module"
+  "type": "module",
+  "dependencies": {
+    "@openzeppelin/contracts-upgradeable": "^5.6.1"
+  }
 }

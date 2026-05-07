@@ -431,17 +431,16 @@ contract LoanEscrow is AccessControl, Pausable, ReentrancyGuard {
         if (!loan.hasOptionToBuy) revert NoOptionToBuy();
         if (block.timestamp >= loan.loanExpiry) revert OptionExpired();
 
-        // I check allowance before any state changes for a clear revert message
-        uint256 allowance = IERC20(loan.paymentToken).allowance(msg.sender, address(this));
-        if (allowance < loan.optionPrice) revert InsufficientAllowance();
-
-        // effects
+        // effects — mark state as completed and clear active loan before token transfer
         loan.state = LoanState.COMPLETED;
         _activePlayerLoan[loan.playerId] = 0;
-        _claimable[loan.parentClub][loan.paymentToken] += loan.optionPrice;
 
-        // interaction — pull option price from borrowing club
+        // interaction — pull funds BEFORE crediting claimable so a revert here
+        // does not leave the parent club with a claimable balance backed by no tokens
         IERC20(loan.paymentToken).safeTransferFrom(msg.sender, address(this), loan.optionPrice);
+
+        // I credit parent club only after funds are confirmed received
+        _claimable[loan.parentClub][loan.paymentToken] += loan.optionPrice;
 
         // Note: player ownership is already at borrowingClub from approveLoan.
         // COMPLETED state means no expiry or recall can move it back — ownership
@@ -455,8 +454,8 @@ contract LoanEscrow is AccessControl, Pausable, ReentrancyGuard {
     function withdrawClaimable(address token)
         external
         nonReentrant
-        onlyApprovedToken(token)
     {
+        // I do not gate on approved tokens — revoked tokens must still be withdrawable
         uint256 amount = _claimable[msg.sender][token];
         if (amount == 0) revert NothingToClaim();
 

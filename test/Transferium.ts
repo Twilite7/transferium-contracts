@@ -12,47 +12,81 @@ async function deployAll() {
   const { ethers } = await network.connect();
   const [admin, registrar, clubA, clubB, clubC, other] = await ethers.getSigners();
 
+  // ─── Non-proxy contracts ──────────────────────────────────────────────────
   const MockToken = await ethers.getContractFactory("MockERC20");
   const token = await MockToken.deploy("Mock EURC", "mEURC", 6);
 
-  const PlayerRegistry = await ethers.getContractFactory("PlayerRegistry");
-  const registry = await PlayerRegistry.deploy(
+  const PlayerRegistryF = await ethers.getContractFactory("PlayerRegistry");
+  const registry = await PlayerRegistryF.deploy(
     ethers.parseEther("0.01"),
     ethers.parseEther("0.005")
   );
 
-  const TransferWindow = await ethers.getContractFactory("TransferWindow");
-  const transferWindow = await TransferWindow.deploy();
+  const TransferWindowF = await ethers.getContractFactory("TransferWindow");
+  const transferWindow = await TransferWindowF.deploy();
 
-  const TransferEscrow = await ethers.getContractFactory("TransferEscrow");
-  const escrow = await TransferEscrow.deploy(
+  const LoanEscrowF = await ethers.getContractFactory("LoanEscrow");
+  const loanEscrow = await LoanEscrowF.deploy(
     await registry.getAddress(),
     await transferWindow.getAddress()
   );
 
-  const LoanEscrow = await ethers.getContractFactory("LoanEscrow");
-  const loanEscrow = await LoanEscrow.deploy(
-    await registry.getAddress(),
-    await transferWindow.getAddress()
+  // ─── UUPS proxy contracts ──────────────────────────────────────────────────
+  const Proxy = await ethers.getContractFactory(
+    "TransferiumProxy"
   );
 
-  const CLUB_ROLE      = await registry.CLUB_ROLE();
-  const REGISTRAR_ROLE = await registry.REGISTRAR_ROLE();
-  const ESCROW_ROLE    = await registry.ESCROW_ROLE();
-  const LEAGUE_ROLE    = await escrow.LEAGUE_ROLE();
+  const FeeLibF    = await ethers.getContractFactory("FeeLib");
+  const feeLib     = await FeeLibF.deploy();
+  const feeLibAddr = await feeLib.getAddress();
+
+  const DealEscrowF = await ethers.getContractFactory("DealEscrow", {
+    libraries: { FeeLib: feeLibAddr }
+  });
+  const dealImpl = await DealEscrowF.deploy();
+  const dealInit = dealImpl.interface.encodeFunctionData("initialize", [
+    await registry.getAddress(),
+    await transferWindow.getAddress(),
+    admin.address,
+    admin.address,
+  ]);
+  const dealProxy  = await Proxy.deploy(await dealImpl.getAddress(), dealInit);
+  const dealEscrow = DealEscrowF.attach(await dealProxy.getAddress());
+
+  const TransferEscrowF = await ethers.getContractFactory("TransferEscrow");
+  const teImpl  = await TransferEscrowF.deploy();
+  const teInit  = teImpl.interface.encodeFunctionData("initialize", [
+    await registry.getAddress(),
+    await transferWindow.getAddress(),
+    await dealEscrow.getAddress(),
+    admin.address,
+    admin.address,
+  ]);
+  const teProxy = await Proxy.deploy(await teImpl.getAddress(), teInit);
+  const escrow  = TransferEscrowF.attach(await teProxy.getAddress());
+
+  // ─── Roles ────────────────────────────────────────────────────────────────
+  const CLUB_ROLE            = await registry.CLUB_ROLE();
+  const REGISTRAR_ROLE       = await registry.REGISTRAR_ROLE();
+  const ESCROW_ROLE          = await registry.ESCROW_ROLE();
+  const LEAGUE_ROLE          = await escrow.LEAGUE_ROLE();
+  const TRANSFER_ESCROW_ROLE = await dealEscrow.TRANSFER_ESCROW_ROLE();
 
   await registry.grantRole(CLUB_ROLE, clubA.address);
   await registry.grantRole(CLUB_ROLE, clubB.address);
   await registry.grantRole(REGISTRAR_ROLE, registrar.address);
   await registry.grantRole(ESCROW_ROLE, await escrow.getAddress());
+  await registry.grantRole(ESCROW_ROLE, await dealEscrow.getAddress());
   await registry.grantRole(ESCROW_ROLE, await loanEscrow.getAddress());
-
+  await dealEscrow.grantRole(TRANSFER_ESCROW_ROLE, await escrow.getAddress());
   await escrow.grantRole(CLUB_ROLE, clubA.address);
   await escrow.grantRole(CLUB_ROLE, clubB.address);
   await loanEscrow.grantRole(CLUB_ROLE, clubA.address);
   await loanEscrow.grantRole(CLUB_ROLE, clubB.address);
-
+  // I set protocol fee to 0 in tests — avoids adjusting every assertion for 0.5% deduction
+  await dealEscrow.connect(admin).setProtocolFee(0);
   await escrow.approveToken(await token.getAddress());
+  await dealEscrow.approveToken(await token.getAddress());
   await loanEscrow.approveToken(await token.getAddress());
 
   await token.mint(clubB.address, ethers.parseUnits("1000000000", 6));
@@ -61,7 +95,7 @@ async function deployAll() {
   return {
     ethers,
     admin, registrar, clubA, clubB, clubC, other,
-    token, registry, transferWindow, escrow, loanEscrow,
+    token, registry, transferWindow, escrow, dealEscrow, loanEscrow,
     CLUB_ROLE, REGISTRAR_ROLE, ESCROW_ROLE, LEAGUE_ROLE,
   };
 }
@@ -79,6 +113,7 @@ async function setupListedPlayer(
 
   const tx = await registry.connect(club).registerPlayer(
     "Kylian Mbappe", "ST", "French", expiry, weeklySalary,
+    "", // portraitCID — empty at registration in tests
     { value: ethers.parseEther("0.01") }
   );
   const receipt = await tx.wait();
@@ -176,7 +211,7 @@ describe("Transferium Protocol v2", function () {
 
       const tx = await registry.connect(clubA).registerPlayer(
         "Erling Haaland", "ST", "Norwegian", now + 365 * 24 * 3600, weeklySalary,
-        { value: ethers.parseEther("0.01") }
+        "", { value: ethers.parseEther("0.01") }
       );
       await expect(tx).to.emit(registry, "PlayerRegistered");
 
@@ -195,7 +230,7 @@ describe("Transferium Protocol v2", function () {
       const { ethers, registry, clubA } = await deployAll();
       const now = await getChainTime(ethers);
       await expect(
-        registry.connect(clubA).registerPlayer("Test", "ST", "English", now + 365 * 24 * 3600, 0, { value: 0 })
+        registry.connect(clubA).registerPlayer("Test", "ST", "English", now + 365 * 24 * 3600, 0, "", { value: 0 })
       ).to.be.revertedWithCustomError(registry, "InsufficientPayment");
     });
 
@@ -204,9 +239,9 @@ describe("Transferium Protocol v2", function () {
       const now    = await getChainTime(ethers);
       const expiry = now + 365 * 24 * 3600;
       const fee    = ethers.parseEther("0.01");
-      await registry.connect(clubA).registerPlayer("Erling Haaland", "ST", "Norwegian", expiry, 0, { value: fee });
+      await registry.connect(clubA).registerPlayer("Erling Haaland", "ST", "Norwegian", expiry, 0, "", { value: fee });
       await expect(
-        registry.connect(clubA).registerPlayer("Erling Haaland", "ST", "Norwegian", expiry, 0, { value: fee })
+        registry.connect(clubA).registerPlayer("Erling Haaland", "ST", "Norwegian", expiry, 0, "", { value: fee })
       ).to.be.revertedWithCustomError(registry, "PlayerAlreadyExists");
     });
 
@@ -214,14 +249,14 @@ describe("Transferium Protocol v2", function () {
       const { ethers, registry, other } = await deployAll();
       const now = await getChainTime(ethers);
       await expect(
-        registry.connect(other).registerPlayer("Test", "GK", "Nigerian", now + 365 * 24 * 3600, 0, { value: ethers.parseEther("0.01") })
+        registry.connect(other).registerPlayer("Test", "GK", "Nigerian", now + 365 * 24 * 3600, 0, "", { value: ethers.parseEther("0.01") })
       ).to.be.revertedWithCustomError(registry, "AccessControlUnauthorizedAccount");
     });
 
     it("verifies a player", async function () {
       const { ethers, registry, clubA, registrar } = await deployAll();
       const now = await getChainTime(ethers);
-      const tx      = await registry.connect(clubA).registerPlayer("Test", "CM", "English", now + 365 * 24 * 3600, 0, { value: ethers.parseEther("0.01") });
+      const tx      = await registry.connect(clubA).registerPlayer("Test", "CM", "English", now + 365 * 24 * 3600, 0, "", { value: ethers.parseEther("0.01") });
       const receipt = await tx.wait();
       const event   = receipt.logs.map((log: any) => { try { return registry.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "PlayerRegistered");
       await expect(registry.connect(registrar).verifyPlayer(event.args.playerId)).to.emit(registry, "PlayerVerified");
@@ -230,7 +265,7 @@ describe("Transferium Protocol v2", function () {
     it("reverts listing without medical clearance", async function () {
       const { ethers, registry, clubA, registrar } = await deployAll();
       const now = await getChainTime(ethers);
-      const tx      = await registry.connect(clubA).registerPlayer("Test", "CM", "English", now + 365 * 24 * 3600, 0, { value: ethers.parseEther("0.01") });
+      const tx      = await registry.connect(clubA).registerPlayer("Test", "CM", "English", now + 365 * 24 * 3600, 0, "", { value: ethers.parseEther("0.01") });
       const receipt = await tx.wait();
       const event   = receipt.logs.map((log: any) => { try { return registry.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "PlayerRegistered");
       const playerId = event.args.playerId;
@@ -243,7 +278,7 @@ describe("Transferium Protocol v2", function () {
     it("reverts listing without legal docs verified", async function () {
       const { ethers, registry, clubA, registrar } = await deployAll();
       const now = await getChainTime(ethers);
-      const tx      = await registry.connect(clubA).registerPlayer("Test", "CM", "English", now + 365 * 24 * 3600, 0, { value: ethers.parseEther("0.01") });
+      const tx      = await registry.connect(clubA).registerPlayer("Test", "CM", "English", now + 365 * 24 * 3600, 0, "", { value: ethers.parseEther("0.01") });
       const receipt = await tx.wait();
       const event   = receipt.logs.map((log: any) => { try { return registry.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "PlayerRegistered");
       const playerId = event.args.playerId;
@@ -265,7 +300,7 @@ describe("Transferium Protocol v2", function () {
     it("blocks direct ERC-721 transfer", async function () {
       const { ethers, registry, clubA, clubB } = await deployAll();
       const now = await getChainTime(ethers);
-      const tx      = await registry.connect(clubA).registerPlayer("Test", "GK", "Nigerian", now + 365 * 24 * 3600, 0, { value: ethers.parseEther("0.01") });
+      const tx      = await registry.connect(clubA).registerPlayer("Test", "GK", "Nigerian", now + 365 * 24 * 3600, 0, "", { value: ethers.parseEther("0.01") });
       const receipt = await tx.wait();
       const event   = receipt.logs.map((log: any) => { try { return registry.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "PlayerRegistered");
       await expect(
@@ -276,7 +311,7 @@ describe("Transferium Protocol v2", function () {
     it("registrar sets player wallet, player can update it", async function () {
       const { ethers, registry, clubA, clubB, registrar, other } = await deployAll();
       const now = await getChainTime(ethers);
-      const tx      = await registry.connect(clubA).registerPlayer("Test", "ST", "Brazilian", now + 365 * 24 * 3600, 0, { value: ethers.parseEther("0.01") });
+      const tx      = await registry.connect(clubA).registerPlayer("Test", "ST", "Brazilian", now + 365 * 24 * 3600, 0, "", { value: ethers.parseEther("0.01") });
       const receipt = await tx.wait();
       const event   = receipt.logs.map((log: any) => { try { return registry.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "PlayerRegistered");
       const playerId = event.args.playerId;
@@ -300,7 +335,7 @@ describe("Transferium Protocol v2", function () {
     it("reverts player wallet update from wrong address", async function () {
       const { ethers, registry, clubA, clubB, registrar, other } = await deployAll();
       const now = await getChainTime(ethers);
-      const tx      = await registry.connect(clubA).registerPlayer("Test", "ST", "Brazilian", now + 365 * 24 * 3600, 0, { value: ethers.parseEther("0.01") });
+      const tx      = await registry.connect(clubA).registerPlayer("Test", "ST", "Brazilian", now + 365 * 24 * 3600, 0, "", { value: ethers.parseEther("0.01") });
       const receipt = await tx.wait();
       const event   = receipt.logs.map((log: any) => { try { return registry.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "PlayerRegistered");
       const playerId = event.args.playerId;
@@ -317,7 +352,7 @@ describe("Transferium Protocol v2", function () {
       const { ethers, registry, clubA } = await deployAll();
       const now    = await getChainTime(ethers);
       const expiry = now + 365 * 24 * 3600;
-      const tx      = await registry.connect(clubA).registerPlayer("Test", "CM", "English", expiry, 0, { value: ethers.parseEther("0.01") });
+      const tx      = await registry.connect(clubA).registerPlayer("Test", "CM", "English", expiry, 0, "", { value: ethers.parseEther("0.01") });
       const receipt = await tx.wait();
       const event   = receipt.logs.map((log: any) => { try { return registry.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "PlayerRegistered");
       const playerId  = event.args.playerId;
@@ -331,7 +366,7 @@ describe("Transferium Protocol v2", function () {
     it("sets release clause", async function () {
       const { ethers, registry, clubA } = await deployAll();
       const now = await getChainTime(ethers);
-      const tx      = await registry.connect(clubA).registerPlayer("Test", "ST", "Brazilian", now + 365 * 24 * 3600, 0, { value: ethers.parseEther("0.01") });
+      const tx      = await registry.connect(clubA).registerPlayer("Test", "ST", "Brazilian", now + 365 * 24 * 3600, 0, "", { value: ethers.parseEther("0.01") });
       const receipt = await tx.wait();
       const event   = receipt.logs.map((log: any) => { try { return registry.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "PlayerRegistered");
       const playerId     = event.args.playerId;
@@ -397,236 +432,283 @@ describe("Transferium Protocol v2", function () {
     });
   });
 
+  // ─── v2 flow helpers ──────────────────────────────────────────────────────
+
+  async function doOffer(
+    ethers: any, escrow: any, club: any, playerId: bigint, token: any,
+    fee: bigint, extra: any = {}
+  ): Promise<bigint> {
+    const tx = await escrow.connect(club).createOffer(
+      playerId, await token.getAddress(), fee,
+      extra.sellOnBps ?? 0, extra.sellOnRecipient ?? ethers.ZeroAddress,
+      extra.sellerAgentBps ?? 0, extra.sellerAgent ?? ethers.ZeroAddress,
+      500, extra.addOns ?? []
+    );
+    const receipt = await tx.wait();
+    const ev = receipt.logs
+      .map((l: any) => { try { return escrow.interface.parseLog(l); } catch { return null; } })
+      .find((e: any) => e?.name === "OfferCreated");
+    return ev.args.offerId;
+  }
+
+  async function doAccept(
+    ethers: any, escrow: any, dealEscrow: any, sellingClub: any,
+    offerId: bigint, buyingClub: any, extra: any = {}
+  ): Promise<bigint> {
+    await escrow.connect(buyingClub).submitBid(
+      offerId,
+      extra.fee ?? BigInt(0),
+      extra.sellOnBps ?? 0, extra.sellOnRecipient ?? ethers.ZeroAddress,
+      extra.sellerAgentBps ?? 0, extra.sellerAgent ?? ethers.ZeroAddress,
+      extra.buyerAgentBps ?? 0, extra.buyerAgent ?? ethers.ZeroAddress,
+      extra.salaryGuaranteeMonths ?? 0
+    );
+    const tx = await escrow.connect(sellingClub).acceptBid(offerId, buyingClub.address);
+    const receipt = await tx.wait();
+    const ev = receipt.logs
+      .map((l: any) => { try { return dealEscrow.interface.parseLog(l); } catch { return null; } })
+      .find((e: any) => e?.name === "DealCreated");
+    return ev.args.dealId;
+  }
+
+  // Full flow: offer → bid → accept → consent → medical → hijack expiry → fund
+  // Returns dealId (in FUNDED state)
+  async function doFundedDeal(
+    ethers: any, escrow: any, dealEscrow: any, token: any,
+    registry: any, transferWindow: any, sellingClub: any, buyingClub: any,
+    playerWallet: any, playerId: bigint, fee: bigint, extra: any = {}
+  ): Promise<bigint> {
+    await openTransferWindow(ethers, transferWindow);
+    const offerId = await doOffer(ethers, escrow, sellingClub, playerId, token, fee, extra);
+    const dealId  = await doAccept(ethers, escrow, dealEscrow, sellingClub, offerId, buyingClub, { ...extra, fee });
+
+    // Player consents
+    await dealEscrow.connect(playerWallet).consentToTransfer(dealId);
+
+    // Buying club submits medical — PASSED (1)
+    const medHash = ethers.keccak256(ethers.toUtf8Bytes("medical-ok"));
+    await dealEscrow.connect(buyingClub).submitMedical(dealId, 1, medHash);
+
+    // Advance past hijack window → processExpiry → FUNDING_PENDING
+    await ethers.provider.send("evm_increaseTime", [48 * 3600 + 1]);
+    await ethers.provider.send("evm_mine", []);
+    await escrow.processExpiry(dealId);
+
+    // Fund deal
+    const salaryMonths = extra.salaryGuaranteeMonths ?? 0;
+    let salaryAmt = BigInt(0);
+    if (salaryMonths > 0) {
+      const p = await registry.getPlayer(playerId);
+      salaryAmt = p.weeklySalary * BigInt(4) * BigInt(salaryMonths);
+    }
+    const totalFund = fee + salaryAmt;
+    await token.connect(buyingClub).approve(await dealEscrow.getAddress(), totalFund);
+    await dealEscrow.connect(buyingClub).fundDeal(dealId);
+
+    return dealId;
+  }
+
   describe("TransferEscrow", function () {
 
-    it("reverts createDeal outside transfer window", async function () {
-      const { ethers, registry, escrow, token, clubA, clubB, registrar } = await deployAll();
+    it("reverts createOffer outside transfer window", async function () {
+      const { ethers, registry, transferWindow, escrow, token, clubA, clubB, registrar } = await deployAll();
       const playerId = await setupListedPlayer(ethers, registry, clubA, registrar);
       const fee = ethers.parseUnits("50000000", 6);
-      await token.connect(clubB).approve(await escrow.getAddress(), fee);
       await expect(
-        escrow.connect(clubB).createDeal(
-          playerId, clubA.address, await token.getAddress(), fee,
-          0, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress, []
+        escrow.connect(clubA).createOffer(
+          playerId, await token.getAddress(), fee,
+          0, ethers.ZeroAddress, 0, ethers.ZeroAddress, 500, []
         )
       ).to.be.revertedWithCustomError(escrow, "TransferWindowClosed");
     });
 
-    it("creates a deal during open window", async function () {
-      const { ethers, registry, transferWindow, escrow, token, clubA, clubB, registrar } = await deployAll();
+    it("creates an offer during open window", async function () {
+      const { ethers, registry, transferWindow, escrow, token, clubA, registrar } = await deployAll();
       const playerId = await setupListedPlayer(ethers, registry, clubA, registrar);
       await openTransferWindow(ethers, transferWindow);
       const fee = ethers.parseUnits("50000000", 6);
-      await token.connect(clubB).approve(await escrow.getAddress(), fee);
       await expect(
-        escrow.connect(clubB).createDeal(
-          playerId, clubA.address, await token.getAddress(), fee,
-          0, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress, []
+        escrow.connect(clubA).createOffer(
+          playerId, await token.getAddress(), fee,
+          0, ethers.ZeroAddress, 0, ethers.ZeroAddress, 500, []
         )
-      ).to.emit(escrow, "DealCreated");
+      ).to.emit(escrow, "OfferCreated");
     });
 
-    it("reverts createDeal with unregistered selling club", async function () {
-      const { ethers, registry, transferWindow, escrow, token, clubA, clubB, registrar, CLUB_ROLE } = await deployAll();
+    it("reverts createOffer without CLUB_ROLE", async function () {
+      const { ethers, registry, transferWindow, escrow, token, clubA, registrar, CLUB_ROLE } = await deployAll();
       const playerId = await setupListedPlayer(ethers, registry, clubA, registrar);
       await openTransferWindow(ethers, transferWindow);
-      await registry.revokeRole(CLUB_ROLE, clubA.address);
+      await escrow.revokeRole(CLUB_ROLE, clubA.address);
       const fee = ethers.parseUnits("50000000", 6);
-      await token.connect(clubB).approve(await escrow.getAddress(), fee);
       await expect(
-        escrow.connect(clubB).createDeal(
-          playerId, clubA.address, await token.getAddress(), fee,
-          0, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress, []
+        escrow.connect(clubA).createOffer(
+          playerId, await token.getAddress(), fee,
+          0, ethers.ZeroAddress, 0, ethers.ZeroAddress, 500, []
         )
-      ).to.be.revertedWithCustomError(escrow, "SellingClubNotRegistered");
+      ).to.be.revertedWithCustomError(escrow, "AccessControlUnauthorizedAccount");
     });
 
-    it("full deal flow: create → approve → claimFunds → NFT transferred", async function () {
-      const { ethers, registry, transferWindow, escrow, token, clubA, clubB, registrar } = await deployAll();
+    it("full deal flow: offer → bid → accept → consent → medical → fund → complete → NFT transferred", async function () {
+      const { ethers, registry, transferWindow, escrow, dealEscrow, token, clubA, clubB, other, registrar, admin } = await deployAll();
       const playerId = await setupListedPlayer(ethers, registry, clubA, registrar);
-      await openTransferWindow(ethers, transferWindow);
-
+      await registry.connect(registrar).setPlayerWallet(playerId, other.address);
       const fee = ethers.parseUnits("50000000", 6);
-      await token.connect(clubB).approve(await escrow.getAddress(), fee);
-      const tx = await escrow.connect(clubB).createDeal(
-        playerId, clubA.address, await token.getAddress(), fee,
-        0, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress, []
+
+      const dealId = await doFundedDeal(
+        ethers, escrow, dealEscrow, token, registry, transferWindow,
+        clubA, clubB, other, playerId, fee
       );
-      const receipt = await tx.wait();
-      const event   = receipt.logs.map((log: any) => { try { return escrow.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "DealCreated");
-      const dealId  = event.args.dealId;
 
-      await escrow.approveDeal(dealId);
-      await ethers.provider.send("evm_increaseTime", [48 * 3600 + 1]);
-      await ethers.provider.send("evm_mine", []);
+      // Admin (LEAGUE_ROLE) force-completes after funding
+      await expect(dealEscrow.connect(admin).forceComplete(dealId))
+        .to.emit(dealEscrow, "DealCompleted");
 
-      await expect(escrow.connect(clubA).claimFunds(dealId)).to.emit(escrow, "DealCompleted");
       expect(await registry.ownerOf(playerId)).to.equal(clubB.address);
       expect(await registry.currentClub(playerId)).to.equal(clubB.address);
-      await expect(escrow.connect(clubA).withdrawClaimable(await token.getAddress())).to.emit(escrow, "FundsClaimed");
+
+      // Selling club withdraws proceeds
+      await expect(dealEscrow.connect(clubA).withdrawClaimable(await token.getAddress()))
+        .to.emit(dealEscrow, "FundsClaimed");
     });
 
-    it("claimFunds reverts before dispute window expires", async function () {
-      const { ethers, registry, transferWindow, escrow, token, clubA, clubB, registrar } = await deployAll();
+    it("processExpiry reverts before dispute window expires", async function () {
+      const { ethers, registry, transferWindow, escrow, dealEscrow, token, clubA, clubB, other, registrar } = await deployAll();
       const playerId = await setupListedPlayer(ethers, registry, clubA, registrar);
-      await openTransferWindow(ethers, transferWindow);
+      await registry.connect(registrar).setPlayerWallet(playerId, other.address);
       const fee = ethers.parseUnits("50000000", 6);
-      await token.connect(clubB).approve(await escrow.getAddress(), fee);
-      const tx = await escrow.connect(clubB).createDeal(
-        playerId, clubA.address, await token.getAddress(), fee,
-        0, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress, []
+
+      const dealId = await doFundedDeal(
+        ethers, escrow, dealEscrow, token, registry, transferWindow,
+        clubA, clubB, other, playerId, fee
       );
-      const receipt = await tx.wait();
-      const event   = receipt.logs.map((log: any) => { try { return escrow.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "DealCreated");
-      await escrow.approveDeal(event.args.dealId);
-      await expect(escrow.connect(clubA).claimFunds(event.args.dealId))
-        .to.be.revertedWithCustomError(escrow, "DisputeWindowActive");
+
+      // Dispute window not expired yet — processExpiry should revert
+      await expect(escrow.processExpiry(dealId))
+        .to.be.revertedWithCustomError(escrow, "WrongDealState");
     });
 
-    it("rejected deal refunds buying club", async function () {
-      const { ethers, registry, transferWindow, escrow, token, clubA, clubB, registrar } = await deployAll();
+    it("player declines — deal cancelled", async function () {
+      const { ethers, registry, transferWindow, escrow, dealEscrow, token, clubA, clubB, other, registrar } = await deployAll();
       const playerId = await setupListedPlayer(ethers, registry, clubA, registrar);
+      await registry.connect(registrar).setPlayerWallet(playerId, other.address);
       await openTransferWindow(ethers, transferWindow);
       const fee = ethers.parseUnits("50000000", 6);
-      await token.connect(clubB).approve(await escrow.getAddress(), fee);
-      const tx = await escrow.connect(clubB).createDeal(
-        playerId, clubA.address, await token.getAddress(), fee,
-        0, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress, []
-      );
-      const receipt = await tx.wait();
-      const event   = receipt.logs.map((log: any) => { try { return escrow.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "DealCreated");
-      await escrow.rejectDeal(event.args.dealId, "Player ineligible");
-      await expect(escrow.connect(clubB).withdrawClaimable(await token.getAddress()))
-        .to.emit(escrow, "FundsClaimed");
+
+      const offerId = await doOffer(ethers, escrow, clubA, playerId, token, fee);
+      const dealId  = await doAccept(ethers, escrow, dealEscrow, clubA, offerId, clubB, { fee });
+
+      // Player declines at consent stage
+      await expect(dealEscrow.connect(other).declineTransfer(dealId))
+        .to.emit(dealEscrow, "PlayerDeclined");
+
+      // Deal is cancelled — player still belongs to selling club
+      expect(await registry.currentClub(playerId)).to.equal(clubA.address);
     });
 
     it("sell-on clause splits payment correctly", async function () {
-      const { ethers, registry, transferWindow, escrow, token, clubA, clubB, clubC, registrar } = await deployAll();
+      const { ethers, registry, transferWindow, escrow, dealEscrow, token, clubA, clubB, clubC, other, registrar, admin } = await deployAll();
       await escrow.grantRole(await escrow.CLUB_ROLE(), clubC.address);
       const playerId  = await setupListedPlayer(ethers, registry, clubA, registrar);
-      await openTransferWindow(ethers, transferWindow);
+      await registry.connect(registrar).setPlayerWallet(playerId, other.address);
       const fee       = ethers.parseUnits("50000000", 6);
       const sellOnBps = 500;
-      await token.connect(clubB).approve(await escrow.getAddress(), fee);
-      const tx = await escrow.connect(clubB).createDeal(
-        playerId, clubA.address, await token.getAddress(), fee,
-        0, sellOnBps, clubC.address, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress, []
+
+      const dealId = await doFundedDeal(
+        ethers, escrow, dealEscrow, token, registry, transferWindow,
+        clubA, clubB, other, playerId, fee,
+        { sellOnBps, sellOnRecipient: clubC.address }
       );
-      const receipt = await tx.wait();
-      const event   = receipt.logs.map((log: any) => { try { return escrow.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "DealCreated");
-      const dealId  = event.args.dealId;
-      await escrow.approveDeal(dealId);
-      await ethers.provider.send("evm_increaseTime", [48 * 3600 + 1]);
-      await ethers.provider.send("evm_mine", []);
-      await escrow.connect(clubA).claimFunds(dealId);
-      const sellOnAmount = fee * BigInt(sellOnBps) / BigInt(10000);
-      expect(await escrow.getClaimable(clubA.address, await token.getAddress())).to.equal(fee - sellOnAmount);
-      expect(await escrow.getClaimable(clubC.address, await token.getAddress())).to.equal(sellOnAmount);
+
+      await dealEscrow.connect(admin).forceComplete(dealId);
+
+      const sellOnAmt = fee * BigInt(sellOnBps) / BigInt(10000);
+      expect(await dealEscrow.getClaimable(clubA.address, await token.getAddress()))
+        .to.equal(fee - sellOnAmt);
+      expect(await dealEscrow.getClaimable(clubC.address, await token.getAddress()))
+        .to.equal(sellOnAmt);
     });
 
     it("agent fees split correctly", async function () {
-      const { ethers, registry, transferWindow, escrow, token, clubA, clubB, clubC, other, registrar } = await deployAll();
+      const { ethers, registry, transferWindow, escrow, dealEscrow, token, clubA, clubB, clubC, other, registrar, admin } = await deployAll();
       const playerId       = await setupListedPlayer(ethers, registry, clubA, registrar);
-      await openTransferWindow(ethers, transferWindow);
+      await registry.connect(registrar).setPlayerWallet(playerId, other.address);
       const fee            = ethers.parseUnits("50000000", 6);
       const sellerAgentBps = 300;
       const buyerAgentBps  = 200;
-      await token.connect(clubB).approve(await escrow.getAddress(), fee);
-      const tx = await escrow.connect(clubB).createDeal(
-        playerId, clubA.address, await token.getAddress(), fee,
-        0, 0, ethers.ZeroAddress, sellerAgentBps, clubC.address, buyerAgentBps, other.address, []
+
+      const dealId = await doFundedDeal(
+        ethers, escrow, dealEscrow, token, registry, transferWindow,
+        clubA, clubB, other, playerId, fee,
+        { sellerAgentBps, sellerAgent: clubC.address, buyerAgentBps, buyerAgent: other.address }
       );
-      const receipt = await tx.wait();
-      const event   = receipt.logs.map((log: any) => { try { return escrow.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "DealCreated");
-      const dealId  = event.args.dealId;
-      await escrow.approveDeal(dealId);
-      await ethers.provider.send("evm_increaseTime", [48 * 3600 + 1]);
-      await ethers.provider.send("evm_mine", []);
-      await escrow.connect(clubA).claimFunds(dealId);
+
+      await dealEscrow.connect(admin).forceComplete(dealId);
+
       const sellerAgentAmt = fee * BigInt(sellerAgentBps) / BigInt(10000);
       const buyerAgentAmt  = fee * BigInt(buyerAgentBps)  / BigInt(10000);
-      expect(await escrow.getClaimable(clubA.address,  await token.getAddress())).to.equal(fee - sellerAgentAmt - buyerAgentAmt);
-      expect(await escrow.getClaimable(clubC.address,  await token.getAddress())).to.equal(sellerAgentAmt);
-      expect(await escrow.getClaimable(other.address,  await token.getAddress())).to.equal(buyerAgentAmt);
+      expect(await dealEscrow.getClaimable(clubA.address, await token.getAddress()))
+        .to.equal(fee - sellerAgentAmt - buyerAgentAmt);
+      expect(await dealEscrow.getClaimable(clubC.address, await token.getAddress()))
+        .to.equal(sellerAgentAmt);
+      expect(await dealEscrow.getClaimable(other.address, await token.getAddress()))
+        .to.equal(buyerAgentAmt);
     });
 
     it("performance add-on routed to player wallet", async function () {
-      const { ethers, registry, transferWindow, escrow, token, clubA, clubB, other, registrar } = await deployAll();
+      const { ethers, registry, transferWindow, escrow, dealEscrow, token, clubA, clubB, other, registrar, admin } = await deployAll();
       const weeklySalary = ethers.parseUnits("50000", 6);
       const playerId     = await setupListedPlayer(ethers, registry, clubA, registrar, weeklySalary);
-
-      // I set player wallet
       await registry.connect(registrar).setPlayerWallet(playerId, other.address);
 
-      await openTransferWindow(ethers, transferWindow);
-
       const fee      = ethers.parseUnits("50000000", 6);
-      const addOnAmt = ethers.parseUnits("2000000", 6); // €2M goal bonus
-      await token.connect(clubB).approve(await escrow.getAddress(), fee);
+      const addOnAmt = ethers.parseUnits("2000000", 6);
+      const addOns   = [{ description: "15+ league goals", amount: addOnAmt, toPlayer: true, triggered: false }];
 
-      const tx = await escrow.connect(clubB).createDeal(
-        playerId, clubA.address, await token.getAddress(), fee,
-        0, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress,
-        [{ description: "15+ league goals", amount: addOnAmt, toPlayer: true, triggered: false }]
+      const dealId = await doFundedDeal(
+        ethers, escrow, dealEscrow, token, registry, transferWindow,
+        clubA, clubB, other, playerId, fee, { addOns }
       );
-      const receipt = await tx.wait();
-      const event   = receipt.logs.map((log: any) => { try { return escrow.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "DealCreated");
-      const dealId  = event.args.dealId;
 
-      await escrow.approveDeal(dealId);
-      await ethers.provider.send("evm_increaseTime", [48 * 3600 + 1]);
-      await ethers.provider.send("evm_mine", []);
-      await escrow.connect(clubA).claimFunds(dealId);
+      await dealEscrow.connect(admin).forceComplete(dealId);
 
-      // I approve and trigger the add-on
-      await token.connect(clubB).approve(await escrow.getAddress(), addOnAmt);
-      await expect(escrow.triggerAddOn(dealId, 0)).to.emit(escrow, "AddOnTriggered");
+      // Buying club deposits add-on funds and league triggers it
+      await token.connect(clubB).approve(await dealEscrow.getAddress(), addOnAmt);
+      await dealEscrow.connect(clubB).depositAddOnFunds(dealId, addOnAmt);
+      await expect(dealEscrow.connect(admin).triggerAddOn(dealId, 0))
+        .to.emit(dealEscrow, "AddOnTriggered");
 
-      // I verify add-on went to player wallet, not selling club
-      expect(await escrow.getClaimable(other.address, await token.getAddress())).to.equal(addOnAmt);
-      expect(await escrow.getClaimable(clubA.address, await token.getAddress())).to.equal(fee);
+      expect(await dealEscrow.getClaimable(other.address, await token.getAddress()))
+        .to.equal(addOnAmt);
+      expect(await dealEscrow.getClaimable(clubA.address, await token.getAddress()))
+        .to.equal(fee);
     });
 
     it("salary guarantee locked in escrow, player can claim", async function () {
-      const { ethers, registry, transferWindow, escrow, token, clubA, clubB, other, registrar } = await deployAll();
-      const weeklySalary = ethers.parseUnits("50000", 6); // €50k/week
+      const { ethers, registry, transferWindow, escrow, dealEscrow, token, clubA, clubB, other, registrar, admin } = await deployAll();
+      const weeklySalary = ethers.parseUnits("50000", 6);
       const playerId     = await setupListedPlayer(ethers, registry, clubA, registrar, weeklySalary);
-
-      // I set player wallet
       await registry.connect(registrar).setPlayerWallet(playerId, other.address);
-
-      await openTransferWindow(ethers, transferWindow);
 
       const fee                   = ethers.parseUnits("50000000", 6);
       const salaryGuaranteeMonths = 3;
-      // guarantee = €50k * 4 weeks * 3 months = €600k
-      const guaranteeAmount = weeklySalary * BigInt(4) * BigInt(salaryGuaranteeMonths);
-      const totalApprove    = fee + guaranteeAmount;
+      const guaranteeAmount       = weeklySalary * BigInt(4) * BigInt(salaryGuaranteeMonths);
 
-      await token.connect(clubB).approve(await escrow.getAddress(), totalApprove);
-
-      const tx = await escrow.connect(clubB).createDeal(
-        playerId, clubA.address, await token.getAddress(), fee,
-        salaryGuaranteeMonths, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress, []
+      const dealId = await doFundedDeal(
+        ethers, escrow, dealEscrow, token, registry, transferWindow,
+        clubA, clubB, other, playerId, fee, { salaryGuaranteeMonths }
       );
-      const receipt = await tx.wait();
-      const event   = receipt.logs.map((log: any) => { try { return escrow.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "DealCreated");
-      const dealId  = event.args.dealId;
 
-      // I verify guarantee amount stored in deal
-      const deal = await escrow.getDeal(dealId);
+      // Verify guarantee stored correctly
+      const deal = await dealEscrow.getDeal(dealId);
       expect(deal.salaryGuaranteeAmount).to.equal(guaranteeAmount);
 
-      await escrow.approveDeal(dealId);
-      await ethers.provider.send("evm_increaseTime", [48 * 3600 + 1]);
-      await ethers.provider.send("evm_mine", []);
-      await escrow.connect(clubA).claimFunds(dealId);
+      await dealEscrow.connect(admin).forceComplete(dealId);
 
-      // I claim salary guarantee from player wallet
-      await expect(escrow.connect(other).claimSalaryGuarantee(dealId))
-        .to.emit(escrow, "SalaryGuaranteeClaimed");
-
-      expect(await escrow.getClaimable(other.address, await token.getAddress()))
+      // Player wallet claims salary guarantee
+      await expect(dealEscrow.connect(other).claimSalaryGuarantee(dealId))
+        .to.emit(dealEscrow, "SalaryGuaranteeClaimed");
+      expect(await dealEscrow.getClaimable(other.address, await token.getAddress()))
         .to.equal(guaranteeAmount);
     });
   });

@@ -1,138 +1,251 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-import "@openzeppelin/contracts/access/AccessControl.sol";
-import "@openzeppelin/contracts/utils/Pausable.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "../interfaces/IPlayerRegistry.sol";
-import "./TransferWindow.sol";
+import "../interfaces/ITransferWindow.sol";
+import "../interfaces/IDealEscrow.sol";
+import "../types/TransferTypes.sol";
 
 /**
- * @title TransferEscrow
+ * @title TransferEscrow v2
  * @author Transferium Protocol
- * @notice Escrow for permanent professional football transfers.
- * @dev Supports: agent fees, sell-on clauses, performance add-ons (paid to player wallet),
- *      salary guarantee deposit, and admin-triggered add-on payments.
+ * @notice Marketplace for permanent football transfers — offers, bids, negotiation.
+ *
+ * @dev Separated from DealEscrow to stay within the 24KB EIP-170 limit.
+ *      TransferEscrow owns the marketplace phase (offers, bids, negotiation).
+ *      When a bid is accepted, it calls DealEscrow.initializeDeal() and hands off.
+ *      DealEscrow owns the full deal lifecycle from acceptance onwards.
+ *
+ * Security:
+ *      - No funds locked at this stage — only intent (bids carry no deposits)
+ *      - Transfer window enforced at offer creation
+ *      - UUPS upgrade protected by DEFAULT_ADMIN_ROLE
  */
-contract TransferEscrow is AccessControl, Pausable, ReentrancyGuard {
+contract TransferEscrow is
+    Initializable,
+    AccessControlUpgradeable,
+    PausableUpgradeable,
+    UUPSUpgradeable
+{
     using SafeERC20 for IERC20;
+    using TransferTypes for *;
+
+    // ─── Reentrancy Guard ─────────────────────────────────────────────────────
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED     = 2;
+    uint256 private _reentrancyStatus;
+
+    modifier nonReentrant() {
+        if (_reentrancyStatus == _ENTERED) revert ReentrantCall();
+        _reentrancyStatus = _ENTERED;
+        _;
+        _reentrancyStatus = _NOT_ENTERED;
+    }
 
     // ─── Roles ────────────────────────────────────────────────────────────────
+
     bytes32 public constant ADMIN_ROLE  = keccak256("ADMIN_ROLE");
     bytes32 public constant LEAGUE_ROLE = keccak256("LEAGUE_ROLE");
     bytes32 public constant CLUB_ROLE   = keccak256("CLUB_ROLE");
 
     // ─── Constants ────────────────────────────────────────────────────────────
-    uint256 public constant DISPUTE_WINDOW  = 48 hours;
-    uint256 public constant MAX_SELL_ON_BPS = 2000;
-    uint256 public constant MAX_AGENT_BPS   = 1000;
-    uint256 public constant BPS_DENOMINATOR = 10_000;
-    uint256 public constant MAX_PRICE       = 500_000_000 ether;
-    uint256 public constant MAX_ADDONS      = 10;
 
-    // ─── Deal State Machine ───────────────────────────────────────────────────
-    enum DealState { NONE, PENDING, APPROVED, COMPLETED, REJECTED, CANCELLED }
+    uint256 public constant MAX_SELL_ON_BPS          = 2000;
+    uint256 public constant MAX_AGENT_BPS            = 300;
+    uint256 public constant MAX_PROTOCOL_FEE_BPS     = 200;
+    uint256 public constant BPS_DENOMINATOR          = 10_000;
+    uint256 public constant MAX_PRICE                = 500_000_000 ether;
+    uint256 public constant MAX_ADDONS               = 10;
+    uint256 public constant MAX_NEGOTIATION_ROUNDS   = 3;
+    uint256 public constant MAX_ACTIVE_NEGOTIATIONS  = 5;
+    uint256 public constant MAX_TOTAL_BIDS_PER_OFFER = 20;
+    uint256 public constant MIN_CONSENT_WINDOW       = 1 hours;
+    uint256 public constant LEAGUE_DISPUTE_DEADLINE  = 7 days;
+    uint256 public constant HIJACK_FAIL_PENALTY_BPS  = 200;
+    uint256 public constant HIJACK_STALL_PENALTY_BPS    = 500;
+    // I cap salary guarantee months — a value like 10000 would produce an
+    // unfundable salaryGuaranteeAmount that locks the deal in FUNDING_PENDING permanently
+    uint256 public constant MAX_SALARY_GUARANTEE_MONTHS = 24;
 
-    // ─── Structs ──────────────────────────────────────────────────────────────
-    struct AddOn {
-        string  description;
-        uint256 amount;
-        bool    toPlayer;    // I route to playerWallet if true, selling club if false
-        bool    triggered;
+    // ─── Enums ────────────────────────────────────────────────────────────────
+
+    enum BidStatus {
+        NONE,
+        PENDING,
+        NEGOTIATING,
+        ACCEPTED,
+        REJECTED,
+        WITHDRAWN
     }
 
-    struct Deal {
+    // ─── Structs ──────────────────────────────────────────────────────────────
+
+    struct Offer {
         uint256   playerId;
-        address   buyingClub;
         address   sellingClub;
         address   paymentToken;
+        uint256   askingPrice;
+        uint256   sellOnBps;
+        address   sellOnRecipient;
+        uint256   sellerAgentBps;
+        address   sellerAgent;
+        uint256   minimumHijackIncrementBps;
+        uint256   createdAt;
+        uint256   activeNegotiations;
+        bool      exists;
+    }
+
+    struct Bid {
+        uint256   offerId;
+        address   buyingClub;
+        address   paymentToken;
         uint256   transferFee;
-        uint256   salaryGuaranteeMonths;  // months of salary deposited as guarantee
-        uint256   salaryGuaranteeAmount;  // actual EURC amount locked
-        bool      salaryGuaranteeClaimed; // I prevent double claims
         uint256   sellOnBps;
         address   sellOnRecipient;
         uint256   sellerAgentBps;
         address   sellerAgent;
         uint256   buyerAgentBps;
         address   buyerAgent;
-        DealState state;
-        uint256   createdAt;
-        uint256   approvedAt;
-        string    rejectionReason;
+        uint256   salaryGuaranteeMonths;
+        uint256   submittedAt;
+        uint256   updatedAt;
+        uint256   roundNumber;
+        bool      isCounterFromSeller;
+        BidStatus status;
     }
 
-    uint256 private _dealIdCounter;
+    struct TransferBan {
+        uint256 windowsRemaining;
+        bool    active;
+    }
 
-    IPlayerRegistry public immutable playerRegistry;
-    TransferWindow  public immutable transferWindow;
+    // ─── State Variables ──────────────────────────────────────────────────────
 
-    mapping(uint256 => Deal)                        private _deals;
-    mapping(uint256 => AddOn[])                     private _dealAddOns;
-    mapping(address => mapping(address => uint256)) private _claimable;
-    mapping(uint256 => uint256)                     private _activePlayerDeal;
-    mapping(address => bool)                        private _approvedTokens;
-    address[]                                       private _approvedTokenList;
+    uint256 private _offerIdCounter;
+
+    IPlayerRegistry public playerRegistry;
+    ITransferWindow public transferWindow;
+    IDealEscrow     public dealEscrow;
+
+    address public treasury;
+    uint256 public protocolFeeBps;
+    uint256 public consentWindow;
+
+    mapping(uint256 => Offer)                           private _offers;
+    mapping(uint256 => TransferTypes.AddOn[])           private _offerAddOns;
+    mapping(uint256 => mapping(address => Bid))         private _bids;
+    mapping(uint256 => address[])                       private _bidders;
+    mapping(uint256 => uint256)                         private _bidCount;
+    mapping(uint256 => uint256)                         private _playerOffer;
+    mapping(address => bool)                            private _approvedTokens;
+    address[]                                           private _approvedTokenList;
+    mapping(address => TransferBan)                     private _transferBans;
 
     // ─── Events ───────────────────────────────────────────────────────────────
-    event DealCreated(uint256 indexed dealId, uint256 indexed playerId, address buyingClub, address sellingClub, uint256 transferFee);
-    event DealApproved(uint256 indexed dealId, address indexed approver);
-    event DealRejected(uint256 indexed dealId, address indexed approver, string reason);
-    event DealCompleted(uint256 indexed dealId, address indexed newClub);
-    event DealCancelled(uint256 indexed dealId);
-    event AddOnTriggered(uint256 indexed dealId, uint256 indexed addOnIndex, uint256 amount, address recipient);
-    event SalaryGuaranteeClaimed(uint256 indexed dealId, address indexed playerWallet, uint256 amount);
-    event FundsClaimed(address indexed recipient, address indexed token, uint256 amount);
+
+    event OfferCreated(uint256 indexed offerId, uint256 indexed playerId, address indexed sellingClub, uint256 askingPrice);
+    event OfferUpdated(uint256 indexed offerId, uint256 newAskingPrice);
+    event OfferWithdrawn(uint256 indexed offerId);
+    event BidSubmitted(uint256 indexed offerId, address indexed buyingClub, uint256 transferFee, BidStatus status);
+    event BidUpdated(uint256 indexed offerId, address indexed buyingClub, uint256 newTransferFee);
+    event BidWithdrawn(uint256 indexed offerId, address indexed buyingClub);
+    event BidRejected(uint256 indexed offerId, address indexed buyingClub);
+    event BidActivated(uint256 indexed offerId, address indexed buyingClub);
+    event CounterOffer(uint256 indexed offerId, address indexed from, uint256 newFee, uint256 round);
+    event BidAccepted(uint256 indexed offerId, uint256 indexed dealId, address indexed buyingClub);
     event TokenApproved(address indexed token);
     event TokenRevoked(address indexed token);
+    event TransferBanIssued(address indexed club, uint256 windows);
+    event TransferBanLifted(address indexed club);
+    event BanWindowDecremented(address indexed club, uint256 windowsRemaining);
+    event ProtocolFeeUpdated(uint256 newBps);
+    event TreasuryUpdated(address indexed newTreasury);
+    event MutualCancelExpired(uint256 indexed dealId);
+    event DealCancelled(uint256 indexed dealId, uint8 reason);
 
     // ─── Errors ───────────────────────────────────────────────────────────────
+
     error InvalidAddress();
     error InvalidAmount();
     error InvalidBps();
-    error TotalFeesExceedTransfer();
     error TokenNotApproved();
     error TokenAlreadyApproved();
     error TokenNotInList();
-    error DealNotFound();
-    error DealNotPending();
-    error DealNotApproved();
-    error DealNotCompleted();
-    error DealAlreadyActive();
-    error DisputeWindowActive();
-    error NotBuyingClub();
-    error NotSellingClub();
-    error NothingToClaim();
-    error InvalidString();
     error TransferWindowClosed();
-    error PlayerNotListed();
-    error SellingClubMismatch();
-    error SellingClubNotRegistered();
+    error PlayerHasActiveOffer();
+    error PlayerHasActiveDeal();
+    error OfferNotFound();
+    error BidNotFound();
+    error WrongDealState();
+    error NotSellingClub();
+    error CannotBidOnOwnPlayer();
+    error MaxNegotiationsReached();
+    error MaxNegotiationRoundsReached();
+    error NotYourTurnToCounter();
+    error BidCanOnlyBeUpdatedWhenNegotiating();
+    error ClubTransferBanned();
+    error AlreadyHasActiveBid();
+    error BanAlreadyActive();
+    error NoBanToLift();
+    error NoBanToDecrement();
     error TooManyAddOns();
-    error AddOnAlreadyTriggered();
-    error AddOnNotFound();
-    error PlayerWalletNotSet();
-    error SalaryGuaranteeAlreadyClaimed();
-    error NoSalaryGuarantee();
+    error ProtocolFeeTooHigh();
+    error TimerTooShort();
+    error ReentrantCall();
+    error DealNotFound();
+    error HijackWindowClosed();
+    error CannotHijackOwnDeal();
+    error BidNotHighEnough(uint256 minimum, uint256 submitted);
+    error DealIsFrozen();
 
-    // ─── Constructor ──────────────────────────────────────────────────────────
-    constructor(address _playerRegistry, address _transferWindow) {
+    // ─── Initializer ──────────────────────────────────────────────────────────
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() { _disableInitializers(); }
+
+    function initialize(
+        address _playerRegistry,
+        address _transferWindow,
+        address _dealEscrow,
+        address _treasury,
+        address _admin
+    ) external initializer {
         if (_playerRegistry == address(0)) revert InvalidAddress();
-        if (_transferWindow == address(0)) revert InvalidAddress();
+        if (_transferWindow  == address(0)) revert InvalidAddress();
+        if (_dealEscrow      == address(0)) revert InvalidAddress();
+        if (_treasury        == address(0)) revert InvalidAddress();
+        if (_admin           == address(0)) revert InvalidAddress();
+
+        __AccessControl_init();
+        __Pausable_init();
+        _reentrancyStatus = _NOT_ENTERED;
 
         playerRegistry = IPlayerRegistry(_playerRegistry);
-        transferWindow = TransferWindow(_transferWindow);
+        transferWindow = ITransferWindow(_transferWindow);
+        dealEscrow     = IDealEscrow(_dealEscrow);
+        treasury       = _treasury;
 
-        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
-        _grantRole(ADMIN_ROLE, msg.sender);
-        _grantRole(LEAGUE_ROLE, msg.sender);
+        consentWindow  = 72 hours;
+        protocolFeeBps = 50;
+
+        _grantRole(DEFAULT_ADMIN_ROLE, _admin);
+        _grantRole(ADMIN_ROLE,         _admin);
+        _grantRole(LEAGUE_ROLE,        _admin);
     }
 
+    function _authorizeUpgrade(address)
+        internal override onlyRole(DEFAULT_ADMIN_ROLE) {}
+
     // ─── Modifiers ────────────────────────────────────────────────────────────
-    modifier dealExists(uint256 dealId) {
-        if (_deals[dealId].createdAt == 0) revert DealNotFound();
+
+    modifier offerExists(uint256 offerId) {
+        if (!_offers[offerId].exists) revert OfferNotFound();
         _;
     }
 
@@ -141,10 +254,15 @@ contract TransferEscrow is AccessControl, Pausable, ReentrancyGuard {
         _;
     }
 
-    // ─── Token Whitelist ──────────────────────────────────────────────────────
+    modifier notBanned() {
+        if (_transferBans[msg.sender].active) revert ClubTransferBanned();
+        _;
+    }
+
+    // ─── Admin ────────────────────────────────────────────────────────────────
 
     function approveToken(address token) external onlyRole(ADMIN_ROLE) {
-        if (token == address(0)) revert InvalidAddress();
+        if (token == address(0))    revert InvalidAddress();
         if (_approvedTokens[token]) revert TokenAlreadyApproved();
         _approvedTokens[token] = true;
         _approvedTokenList.push(token);
@@ -165,306 +283,681 @@ contract TransferEscrow is AccessControl, Pausable, ReentrancyGuard {
         emit TokenRevoked(token);
     }
 
-    // ─── Buying Club Functions ────────────────────────────────────────────────
+    function setProtocolFee(uint256 bps) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (bps > MAX_PROTOCOL_FEE_BPS) revert ProtocolFeeTooHigh();
+        protocolFeeBps = bps;
+        emit ProtocolFeeUpdated(bps);
+    }
+
+    function setTreasury(address _treasury) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (_treasury == address(0)) revert InvalidAddress();
+        treasury = _treasury;
+        emit TreasuryUpdated(_treasury);
+    }
+
+    function setConsentWindow(uint256 duration) external onlyRole(ADMIN_ROLE) {
+        if (duration < MIN_CONSENT_WINDOW) revert TimerTooShort();
+        consentWindow = duration;
+    }
+
+    function pause()   external onlyRole(ADMIN_ROLE) { _pause(); }
+    function unpause() external onlyRole(ADMIN_ROLE) { _unpause(); }
+
+    // ─── League: Ban Management ───────────────────────────────────────────────
+
+    function issueBan(address club, uint256 windows) external onlyRole(LEAGUE_ROLE) {
+        if (club == address(0))         revert InvalidAddress();
+        if (windows == 0)               revert InvalidAmount();
+        if (_transferBans[club].active) revert BanAlreadyActive();
+        _transferBans[club] = TransferBan({ windowsRemaining: windows, active: true });
+        emit TransferBanIssued(club, windows);
+    }
+
+    function liftBan(address club) external onlyRole(LEAGUE_ROLE) {
+        if (!_transferBans[club].active) revert NoBanToLift();
+        _transferBans[club].active = false;
+        emit TransferBanLifted(club);
+    }
 
     /**
-     * @notice Create a permanent transfer deal.
-     * @dev salaryGuaranteeMonths: number of months of salary locked as guarantee.
-     *      Set to 0 for no guarantee. The actual amount is computed from
-     *      weeklySalary * 4 * salaryGuaranteeMonths and pulled from buying club.
+     * @notice Decrement ban counters when a new window opens.
+     * @dev Caller responsible for passing unique addresses — duplicates
+     *      will decrement the same club twice in one call.
      */
-    function createDeal(
-        uint256   playerId,
-        address   sellingClub,
-        address   paymentToken,
-        uint256   transferFee,
-        uint256   salaryGuaranteeMonths,
-        uint256   sellOnBps,
-        address   sellOnRecipient,
-        uint256   sellerAgentBps,
-        address   sellerAgent,
-        uint256   buyerAgentBps,
-        address   buyerAgent,
-        AddOn[]   calldata addOns
+    function processNewWindow(address[] calldata bannedClubs)
+        external onlyRole(LEAGUE_ROLE)
+    {
+        uint256 len = bannedClubs.length;
+        // I reject duplicates before processing — a duplicate would decrement one club twice
+        for (uint256 i = 0; i < len; i++) {
+            for (uint256 j = i + 1; j < len; j++) {
+                if (bannedClubs[i] == bannedClubs[j]) revert InvalidAddress();
+            }
+        }
+        for (uint256 i = 0; i < len; i++) {
+            TransferBan storage ban = _transferBans[bannedClubs[i]];
+            if (!ban.active) revert NoBanToDecrement();
+            if (ban.windowsRemaining > 0) {
+                ban.windowsRemaining--;
+                emit BanWindowDecremented(bannedClubs[i], ban.windowsRemaining);
+            }
+            if (ban.windowsRemaining == 0) {
+                ban.active = false;
+                emit TransferBanLifted(bannedClubs[i]);
+            }
+        }
+    }
+
+    // ─── Selling Club Functions ───────────────────────────────────────────────
+
+    /**
+     * @notice Create a transfer offer for a player.
+     * @dev Window must be open. One active offer per player.
+     */
+    function createOffer(
+        uint256  playerId,
+        address  paymentToken,
+        uint256  askingPrice,
+        uint256  sellOnBps,
+        address  sellOnRecipient,
+        uint256  sellerAgentBps,
+        address  sellerAgent,
+        uint256  minimumHijackIncrementBps,
+        TransferTypes.AddOn[] calldata addOns
     )
         external
         whenNotPaused
         nonReentrant
         onlyRole(CLUB_ROLE)
         onlyApprovedToken(paymentToken)
-        returns (uint256 dealId)
+        returns (uint256 offerId)
     {
-        if (sellingClub == address(0) || sellingClub == msg.sender) revert InvalidAddress();
-        if (transferFee == 0 || transferFee > MAX_PRICE) revert InvalidAmount();
-        if (sellOnBps > MAX_SELL_ON_BPS) revert InvalidBps();
-        if (sellOnBps > 0 && sellOnRecipient == address(0)) revert InvalidAddress();
-        if (sellerAgentBps > MAX_AGENT_BPS) revert InvalidBps();
-        if (sellerAgentBps > 0 && sellerAgent == address(0)) revert InvalidAddress();
-        if (buyerAgentBps > MAX_AGENT_BPS) revert InvalidBps();
-        if (buyerAgentBps > 0 && buyerAgent == address(0)) revert InvalidAddress();
-        if (addOns.length > MAX_ADDONS) revert TooManyAddOns();
-        if ((sellOnBps + sellerAgentBps + buyerAgentBps) > 5000) revert TotalFeesExceedTransfer();
-        if (_activePlayerDeal[playerId] != 0) revert DealAlreadyActive();
-        if (!transferWindow.isWindowOpen()) revert TransferWindowClosed();
-        if (!playerRegistry.hasClubRole(sellingClub)) revert SellingClubNotRegistered();
+        if (!transferWindow.isWindowOpen())                   revert TransferWindowClosed();
+        if (_playerOffer[playerId] != 0)                      revert PlayerHasActiveOffer();
+        // I check DealEscrow for active deal — it owns _playerDeal after split
+        if (dealEscrow.getPlayerDeal(playerId) != 0)          revert PlayerHasActiveDeal();
+        if (playerRegistry.currentClub(playerId) != msg.sender) revert NotSellingClub();
 
-        IPlayerRegistry.Player memory player = playerRegistry.getPlayer(playerId);
-        if (!player.isListed) revert PlayerNotListed();
-        if (playerRegistry.currentClub(playerId) != sellingClub) revert SellingClubMismatch();
+        if (askingPrice == 0 || askingPrice > MAX_PRICE)       revert InvalidAmount();
+        if (sellOnBps > MAX_SELL_ON_BPS)                        revert InvalidBps();
+        if (sellOnBps > 0 && sellOnRecipient == address(0))     revert InvalidAddress();
+        if (sellerAgentBps > MAX_AGENT_BPS)                     revert InvalidBps();
+        if (sellerAgentBps > 0 && sellerAgent == address(0))    revert InvalidAddress();
+        if (minimumHijackIncrementBps == 0 ||
+            minimumHijackIncrementBps > BPS_DENOMINATOR)        revert InvalidBps();
+        if (addOns.length > MAX_ADDONS)                         revert TooManyAddOns();
 
-        // I compute salary guarantee amount from weekly salary
-        uint256 salaryGuaranteeAmount = 0;
-        if (salaryGuaranteeMonths > 0) {
-            salaryGuaranteeAmount = player.weeklySalary * 4 * salaryGuaranteeMonths;
+        for (uint256 i = 0; i < addOns.length; i++) {
+            if (bytes(addOns[i].description).length == 0 ||
+                bytes(addOns[i].description).length > 256) revert InvalidAmount();
+            if (addOns[i].amount == 0) revert InvalidAmount();
         }
 
-        _dealIdCounter++;
-        dealId = _dealIdCounter;
+        _offerIdCounter++;
+        offerId = _offerIdCounter;
 
-        _deals[dealId] = Deal({
-            playerId:                playerId,
-            buyingClub:              msg.sender,
-            sellingClub:             sellingClub,
-            paymentToken:            paymentToken,
-            transferFee:             transferFee,
-            salaryGuaranteeMonths:   salaryGuaranteeMonths,
-            salaryGuaranteeAmount:   salaryGuaranteeAmount,
-            salaryGuaranteeClaimed:  false,
-            sellOnBps:               sellOnBps,
-            sellOnRecipient:         sellOnRecipient,
-            sellerAgentBps:          sellerAgentBps,
-            sellerAgent:             sellerAgent,
-            buyerAgentBps:           buyerAgentBps,
-            buyerAgent:              buyerAgent,
-            state:                   DealState.PENDING,
-            createdAt:               block.timestamp,
-            approvedAt:              0,
-            rejectionReason:         ""
+        _offers[offerId] = Offer({
+            playerId:                  playerId,
+            sellingClub:               msg.sender,
+            paymentToken:              paymentToken,
+            askingPrice:               askingPrice,
+            sellOnBps:                 sellOnBps,
+            sellOnRecipient:           sellOnRecipient,
+            sellerAgentBps:            sellerAgentBps,
+            sellerAgent:               sellerAgent,
+            minimumHijackIncrementBps: minimumHijackIncrementBps,
+            createdAt:                 block.timestamp,
+            activeNegotiations:        0,
+            exists:                    true
         });
 
         for (uint256 i = 0; i < addOns.length; i++) {
-            _dealAddOns[dealId].push(AddOn({
-                description: addOns[i].description,
-                amount:      addOns[i].amount,
-                toPlayer:    addOns[i].toPlayer,
-                triggered:   false
-            }));
+            _offerAddOns[offerId].push(addOns[i]);
         }
 
-        _activePlayerDeal[playerId] = dealId;
-
-        // I pull transfer fee + salary guarantee from buying club
-        uint256 totalPull = transferFee + salaryGuaranteeAmount;
-        IERC20(paymentToken).safeTransferFrom(msg.sender, address(this), totalPull);
-
-        emit DealCreated(dealId, playerId, msg.sender, sellingClub, transferFee);
+        _playerOffer[playerId] = offerId;
+        emit OfferCreated(offerId, playerId, msg.sender, askingPrice);
     }
 
-    function cancelDeal(uint256 dealId)
-        external
-        whenNotPaused
-        nonReentrant
-        dealExists(dealId)
+    function updateOffer(
+        uint256 offerId,
+        uint256 newAskingPrice,
+        uint256 newSellOnBps,
+        address newSellOnRecipient,
+        uint256 newSellerAgentBps,
+        address newSellerAgent,
+        uint256 newMinimumHijackIncrementBps
+    )
+        external whenNotPaused nonReentrant offerExists(offerId)
     {
-        Deal storage deal = _deals[dealId];
-        if (deal.buyingClub != msg.sender) revert NotBuyingClub();
-        if (deal.state != DealState.PENDING) revert DealNotPending();
+        Offer storage offer = _offers[offerId];
+        if (offer.sellingClub != msg.sender) revert NotSellingClub();
+        if (offer.activeNegotiations > 0)    revert WrongDealState();
 
-        deal.state = DealState.CANCELLED;
-        _activePlayerDeal[deal.playerId] = 0;
+        if (newAskingPrice == 0 || newAskingPrice > MAX_PRICE)      revert InvalidAmount();
+        if (newSellOnBps > MAX_SELL_ON_BPS)                          revert InvalidBps();
+        if (newSellOnBps > 0 && newSellOnRecipient == address(0))    revert InvalidAddress();
+        if (newSellerAgentBps > MAX_AGENT_BPS)                       revert InvalidBps();
+        if (newSellerAgentBps > 0 && newSellerAgent == address(0))   revert InvalidAddress();
+        if (newMinimumHijackIncrementBps == 0 ||
+            newMinimumHijackIncrementBps > BPS_DENOMINATOR)          revert InvalidBps();
 
-        // I refund both transfer fee and salary guarantee
-        _claimable[msg.sender][deal.paymentToken] += deal.transferFee + deal.salaryGuaranteeAmount;
+        offer.askingPrice               = newAskingPrice;
+        offer.sellOnBps                 = newSellOnBps;
+        offer.sellOnRecipient           = newSellOnRecipient;
+        offer.sellerAgentBps            = newSellerAgentBps;
+        offer.sellerAgent               = newSellerAgent;
+        offer.minimumHijackIncrementBps = newMinimumHijackIncrementBps;
 
-        emit DealCancelled(dealId);
+        // I emit so PENDING bidders know terms changed and can withdraw if they disagree
+        emit OfferUpdated(offerId, newAskingPrice);
     }
 
-    // ─── League Authority Functions ───────────────────────────────────────────
-
-    function approveDeal(uint256 dealId)
-        external
-        whenNotPaused
-        nonReentrant
-        onlyRole(LEAGUE_ROLE)
-        dealExists(dealId)
+    function withdrawOffer(uint256 offerId)
+        external whenNotPaused nonReentrant offerExists(offerId)
     {
-        Deal storage deal = _deals[dealId];
-        if (deal.state != DealState.PENDING) revert DealNotPending();
-        deal.state      = DealState.APPROVED;
-        deal.approvedAt = block.timestamp;
-        emit DealApproved(dealId, msg.sender);
-    }
+        Offer storage offer = _offers[offerId];
+        if (offer.sellingClub != msg.sender) revert NotSellingClub();
+        if (offer.activeNegotiations > 0)    revert WrongDealState();
 
-    function rejectDeal(uint256 dealId, string calldata reason)
-        external
-        whenNotPaused
-        nonReentrant
-        onlyRole(LEAGUE_ROLE)
-        dealExists(dealId)
-    {
-        if (bytes(reason).length == 0 || bytes(reason).length > 256) revert InvalidString();
-        Deal storage deal = _deals[dealId];
-        if (deal.state != DealState.PENDING) revert DealNotPending();
-
-        deal.state           = DealState.REJECTED;
-        deal.rejectionReason = reason;
-        _activePlayerDeal[deal.playerId] = 0;
-
-        // I refund both transfer fee and salary guarantee on rejection
-        _claimable[deal.buyingClub][deal.paymentToken] += deal.transferFee + deal.salaryGuaranteeAmount;
-
-        emit DealRejected(dealId, msg.sender, reason);
+        offer.exists = false;
+        _playerOffer[offer.playerId] = 0;
+        emit OfferWithdrawn(offerId);
     }
 
     /**
-     * @notice Trigger a performance add-on payment after off-chain verification.
-     * @dev If toPlayer is true, payment goes to playerWallet. Otherwise to selling club.
-     *      Performance bonuses (goals, assists, etc.) always set toPlayer = true.
+     * @notice Accept a bid — creates the deal in DealEscrow and hands off.
+     * @dev Front-running note: selling club specifies buyingClub by address,
+     *      not by best price. Their choice is honoured regardless of other bids.
+     *      BID_ACCEPTED is irrevocable — DealEscrow owns the deal from here.
      */
-    function triggerAddOn(uint256 dealId, uint256 addOnIndex)
+    function acceptBid(uint256 offerId, address buyingClub)
+        external whenNotPaused nonReentrant offerExists(offerId)
+    {
+        Offer storage offer = _offers[offerId];
+        if (offer.sellingClub != msg.sender) revert NotSellingClub();
+
+        Bid storage bid = _bids[offerId][buyingClub];
+        if (bid.status != BidStatus.NEGOTIATING) revert BidNotFound();
+        // I block accept while a seller counter-offer is pending — buyer must call updateBid
+        // first to acknowledge the new terms before seller can lock them in via acceptBid
+        if (bid.isCounterFromSeller) revert NotYourTurnToCounter();
+
+        IPlayerRegistry.Player memory player = playerRegistry.getPlayer(offer.playerId);
+        uint256 salaryGuaranteeAmount = 0;
+        if (bid.salaryGuaranteeMonths > 0 && player.weeklySalary > 0) {
+            salaryGuaranteeAmount = player.weeklySalary * 4 * bid.salaryGuaranteeMonths;
+        }
+
+        // I build params struct to avoid stack-too-deep on initializeDeal
+        TransferTypes.DealInitParams memory params = TransferTypes.DealInitParams({
+            offerId:                   offerId,
+            playerId:                  offer.playerId,
+            sellingClub:               offer.sellingClub,
+            buyingClub:                buyingClub,
+            paymentToken:              offer.paymentToken,
+            transferFee:               bid.transferFee,
+            sellOnBps:                 bid.sellOnBps,
+            sellOnRecipient:           bid.sellOnRecipient,
+            sellerAgentBps:            bid.sellerAgentBps,
+            sellerAgent:               bid.sellerAgent,
+            buyerAgentBps:             bid.buyerAgentBps,
+            buyerAgent:                bid.buyerAgent,
+            salaryGuaranteeMonths:     bid.salaryGuaranteeMonths,
+            salaryGuaranteeAmount:     salaryGuaranteeAmount,
+            minimumHijackIncrementBps: offer.minimumHijackIncrementBps,
+            consentWindowDuration:     consentWindow
+        });
+
+        // I get add-ons from offer storage to pass to DealEscrow
+        TransferTypes.AddOn[] storage offerAddOns = _offerAddOns[offerId];
+
+        // I reject all other active/pending bids before handing off
+        address[] storage bidders = _bidders[offerId];
+        for (uint256 i = 0; i < bidders.length; i++) {
+            if (bidders[i] == buyingClub) continue;
+            Bid storage other = _bids[offerId][bidders[i]];
+            if (other.status == BidStatus.NEGOTIATING ||
+                other.status == BidStatus.PENDING) {
+                other.status = BidStatus.REJECTED;
+                emit BidRejected(offerId, bidders[i]);
+            }
+        }
+
+        bid.status         = BidStatus.ACCEPTED;
+        offer.exists       = false;
+        _bidCount[offerId] = 0;
+        _playerOffer[offer.playerId] = 0;
+
+        // I hand off to DealEscrow — it creates the deal and owns the lifecycle
+        uint256 dealId = dealEscrow.initializeDeal(params, offerAddOns);
+
+        emit BidAccepted(offerId, dealId, buyingClub);
+    }
+
+    function rejectBid(uint256 offerId, address buyingClub)
+        external whenNotPaused nonReentrant offerExists(offerId)
+    {
+        Offer storage offer = _offers[offerId];
+        if (offer.sellingClub != msg.sender) revert NotSellingClub();
+
+        Bid storage bid = _bids[offerId][buyingClub];
+        if (bid.status != BidStatus.NEGOTIATING &&
+            bid.status != BidStatus.PENDING) revert BidNotFound();
+
+        bool wasNegotiating = bid.status == BidStatus.NEGOTIATING;
+        bid.status = BidStatus.REJECTED;
+        if (wasNegotiating && offer.activeNegotiations > 0) offer.activeNegotiations--;
+        _bidCount[offerId]--;
+
+        emit BidRejected(offerId, buyingClub);
+
+        if (wasNegotiating) _activateNextPendingBid(offerId);
+    }
+
+    // ─── Buying Club Functions ────────────────────────────────────────────────
+
+    function submitBid(
+        uint256 offerId,
+        uint256 transferFee,
+        uint256 sellOnBps,
+        address sellOnRecipient,
+        uint256 sellerAgentBps,
+        address sellerAgent,
+        uint256 buyerAgentBps,
+        address buyerAgent,
+        uint256 salaryGuaranteeMonths
+    )
+        external whenNotPaused nonReentrant onlyRole(CLUB_ROLE) offerExists(offerId) notBanned
+    {
+        Offer storage offer = _offers[offerId];
+        if (offer.sellingClub == msg.sender) revert CannotBidOnOwnPlayer();
+        if (_bidCount[offerId] >= MAX_TOTAL_BIDS_PER_OFFER) revert MaxNegotiationsReached();
+
+        Bid storage existing = _bids[offerId][msg.sender];
+        if (existing.status == BidStatus.NEGOTIATING ||
+            existing.status == BidStatus.PENDING) revert AlreadyHasActiveBid();
+
+        if (transferFee == 0 || transferFee > MAX_PRICE)     revert InvalidAmount();
+        if (sellOnBps > MAX_SELL_ON_BPS)                      revert InvalidBps();
+        if (sellOnBps > 0 && sellOnRecipient == address(0))   revert InvalidAddress();
+        if (sellerAgentBps > MAX_AGENT_BPS)                   revert InvalidBps();
+        if (sellerAgentBps > 0 && sellerAgent == address(0))  revert InvalidAddress();
+        if (buyerAgentBps > MAX_AGENT_BPS)                                   revert InvalidBps();
+        if (buyerAgentBps > 0 && buyerAgent == address(0))                   revert InvalidAddress();
+        // I cap salary guarantee months — 24 months covers any realistic guarantee clause
+        if (salaryGuaranteeMonths > MAX_SALARY_GUARANTEE_MONTHS)             revert InvalidAmount();
+
+        BidStatus status = offer.activeNegotiations < MAX_ACTIVE_NEGOTIATIONS
+            ? BidStatus.NEGOTIATING
+            : BidStatus.PENDING;
+
+        _bids[offerId][msg.sender] = Bid({
+            offerId:               offerId,
+            buyingClub:            msg.sender,
+            paymentToken:          offer.paymentToken,
+            transferFee:           transferFee,
+            sellOnBps:             sellOnBps,
+            sellOnRecipient:       sellOnRecipient,
+            sellerAgentBps:        sellerAgentBps,
+            sellerAgent:           sellerAgent,
+            buyerAgentBps:         buyerAgentBps,
+            buyerAgent:            buyerAgent,
+            salaryGuaranteeMonths: salaryGuaranteeMonths,
+            submittedAt:           block.timestamp,
+            updatedAt:             block.timestamp,
+            roundNumber:           0,
+            isCounterFromSeller:   false,
+            status:                status
+        });
+
+        if (existing.submittedAt == 0) _bidders[offerId].push(msg.sender);
+        _bidCount[offerId]++;
+        if (status == BidStatus.NEGOTIATING) offer.activeNegotiations++;
+
+        emit BidSubmitted(offerId, msg.sender, transferFee, status);
+    }
+
+    function updateBid(
+        uint256 offerId,
+        uint256 newTransferFee,
+        uint256 newSellOnBps,
+        address newSellOnRecipient,
+        uint256 newSellerAgentBps,
+        address newSellerAgent,
+        uint256 newBuyerAgentBps,
+        address newBuyerAgent,
+        uint256 newSalaryGuaranteeMonths
+    )
+        external whenNotPaused nonReentrant offerExists(offerId)
+    {
+        Bid storage bid = _bids[offerId][msg.sender];
+        if (bid.status != BidStatus.NEGOTIATING)           revert BidCanOnlyBeUpdatedWhenNegotiating();
+        if (bid.roundNumber >= MAX_NEGOTIATION_ROUNDS)     revert MaxNegotiationRoundsReached();
+        if (!bid.isCounterFromSeller && bid.roundNumber > 0) revert NotYourTurnToCounter();
+
+        if (newTransferFee == 0 || newTransferFee > MAX_PRICE)    revert InvalidAmount();
+        if (newSellOnBps > MAX_SELL_ON_BPS)                        revert InvalidBps();
+        if (newSellOnBps > 0 && newSellOnRecipient == address(0))  revert InvalidAddress();
+        if (newSellerAgentBps > MAX_AGENT_BPS)                     revert InvalidBps();
+        if (newSellerAgentBps > 0 && newSellerAgent == address(0)) revert InvalidAddress();
+        if (newBuyerAgentBps > MAX_AGENT_BPS)                                 revert InvalidBps();
+        if (newBuyerAgentBps > 0 && newBuyerAgent == address(0))              revert InvalidAddress();
+        if (newSalaryGuaranteeMonths > MAX_SALARY_GUARANTEE_MONTHS)           revert InvalidAmount();
+
+        bid.transferFee           = newTransferFee;
+        bid.sellOnBps             = newSellOnBps;
+        bid.sellOnRecipient       = newSellOnRecipient;
+        bid.sellerAgentBps        = newSellerAgentBps;
+        bid.sellerAgent           = newSellerAgent;
+        bid.buyerAgentBps         = newBuyerAgentBps;
+        bid.buyerAgent            = newBuyerAgent;
+        bid.salaryGuaranteeMonths = newSalaryGuaranteeMonths;
+        bid.roundNumber++;
+        bid.isCounterFromSeller   = false;
+        bid.updatedAt             = block.timestamp;
+
+        emit BidUpdated(offerId, msg.sender, newTransferFee);
+    }
+
+    function counterBid(
+        uint256 offerId,
+        address buyingClub,
+        uint256 newTransferFee,
+        uint256 newSellOnBps,
+        address newSellOnRecipient,
+        uint256 newSellerAgentBps,
+        address newSellerAgent
+    )
+        external whenNotPaused nonReentrant offerExists(offerId)
+    {
+        Offer storage offer = _offers[offerId];
+        if (offer.sellingClub != msg.sender) revert NotSellingClub();
+
+        Bid storage bid = _bids[offerId][buyingClub];
+        if (bid.status != BidStatus.NEGOTIATING)       revert BidNotFound();
+        if (bid.roundNumber >= MAX_NEGOTIATION_ROUNDS) revert MaxNegotiationRoundsReached();
+        if (bid.isCounterFromSeller)                   revert NotYourTurnToCounter();
+
+        if (newTransferFee == 0 || newTransferFee > MAX_PRICE)     revert InvalidAmount();
+        if (newSellOnBps > MAX_SELL_ON_BPS)                         revert InvalidBps();
+        if (newSellOnBps > 0 && newSellOnRecipient == address(0))   revert InvalidAddress();
+        if (newSellerAgentBps > MAX_AGENT_BPS)                      revert InvalidBps();
+        if (newSellerAgentBps > 0 && newSellerAgent == address(0))  revert InvalidAddress();
+
+        bid.transferFee         = newTransferFee;
+        bid.sellOnBps           = newSellOnBps;
+        bid.sellOnRecipient     = newSellOnRecipient;
+        bid.sellerAgentBps      = newSellerAgentBps;
+        bid.sellerAgent         = newSellerAgent;
+        bid.roundNumber++;
+        bid.isCounterFromSeller = true;
+        bid.updatedAt           = block.timestamp;
+
+        emit CounterOffer(offerId, msg.sender, newTransferFee, bid.roundNumber);
+    }
+
+    function withdrawBid(uint256 offerId)
+        external whenNotPaused nonReentrant offerExists(offerId)
+    {
+        Bid storage bid = _bids[offerId][msg.sender];
+        if (bid.status != BidStatus.NEGOTIATING &&
+            bid.status != BidStatus.PENDING) revert BidNotFound();
+
+        bool wasNegotiating = bid.status == BidStatus.NEGOTIATING;
+        bid.status = BidStatus.WITHDRAWN;
+
+        Offer storage offer = _offers[offerId];
+        if (wasNegotiating && offer.activeNegotiations > 0) offer.activeNegotiations--;
+        _bidCount[offerId]--;
+
+        emit BidWithdrawn(offerId, msg.sender);
+
+        if (wasNegotiating) _activateNextPendingBid(offerId);
+    }
+
+    // ─── Hijack Bid Submission ────────────────────────────────────────────────
+
+    /**
+     * @notice Submit a hijack bid on an agreed deal.
+     * @dev Validates bid, pulls full funding, refunds previous hijacker if any,
+     *      then delegates storage update to DealEscrow via TRANSFER_ESCROW_ROLE.
+     *      Kept in TransferEscrow to stay within DealEscrow's 24KB size limit.
+     */
+    function submitHijackBid(
+        uint256 dealId,
+        uint256 transferFee,
+        uint256 buyerAgentBps,
+        address buyerAgent,
+        uint256 salaryGuaranteeMonths
+    )
         external
         whenNotPaused
         nonReentrant
-        onlyRole(LEAGUE_ROLE)
-        dealExists(dealId)
+        onlyRole(CLUB_ROLE)
+        notBanned
     {
-        Deal storage deal = _deals[dealId];
-        if (deal.state != DealState.COMPLETED) revert DealNotCompleted();
+        // I pull deal data via interface to check state
+        IDealEscrow.DealView memory dv = dealEscrow.getDealView(dealId);
+        if (!dv.exists)                              revert DealNotFound();
+        if (dv.state != IDealEscrow.DealState.HIJACK_WINDOW) revert HijackWindowClosed();
+        if (block.timestamp > dv.stateDeadline)     revert HijackWindowClosed();
+        if (msg.sender == dv.sellingClub)            revert CannotBidOnOwnPlayer();
+        if (msg.sender == dv.buyingClub)             revert CannotHijackOwnDeal();
 
-        AddOn[] storage addOns = _dealAddOns[dealId];
-        if (addOnIndex >= addOns.length) revert AddOnNotFound();
+        uint256 minimumFee = dv.transferFee +
+            (dv.transferFee * dv.minimumHijackIncrementBps) / BPS_DENOMINATOR;
+        if (transferFee < minimumFee) revert BidNotHighEnough(minimumFee, transferFee);
 
-        AddOn storage addOn = addOns[addOnIndex];
-        if (addOn.triggered) revert AddOnAlreadyTriggered();
+        if (buyerAgentBps > MAX_AGENT_BPS)                 revert InvalidBps();
+        if (buyerAgentBps > 0 && buyerAgent == address(0)) revert InvalidAddress();
 
-        addOn.triggered = true;
+        // I send funds directly to DealEscrow — it holds all hijack funds.
+        // Previous hijacker is refunded internally via DealEscrow._claimable.
+        // This avoids cross-contract fund forwarding complexity.
+        IERC20(dv.paymentToken).safeTransferFrom(msg.sender, address(dealEscrow), transferFee);
 
-        address recipient;
-        if (addOn.toPlayer) {
-            // I route to player's own wallet
-            IPlayerRegistry.Player memory player = playerRegistry.getPlayer(deal.playerId);
-            if (player.playerWallet == address(0)) revert PlayerWalletNotSet();
-            recipient = player.playerWallet;
+        // I record the bid in DealEscrow storage after funds arrive
+        dealEscrow.receiveHijackBid(
+            dealId, msg.sender, transferFee, buyerAgentBps, buyerAgent, salaryGuaranteeMonths
+        );
+    }
+
+    // ─── Renegotiation / Dispute Resolution ─────────────────────────────────
+
+    /**
+     * @notice Buying club walks away from medical renegotiation.
+     * @dev No penalty — no funds are locked at MEDICAL_RENEGOTIATION stage.
+     */
+    function walkAwayFromRenegotiation(uint256 dealId)
+        external whenNotPaused nonReentrant
+    {
+        IDealEscrow.DealView memory dv = dealEscrow.getDealView(dealId);
+        if (!dv.exists) revert DealNotFound();
+        uint8 MEDICAL_RENEGOTIATION = 7;
+        if (uint8(dv.state) != MEDICAL_RENEGOTIATION) revert WrongDealState();
+        if (msg.sender != dv.buyingClub) revert DealNotFound();
+        dealEscrow.extWalkAwayPenalty(dealId);
+    }
+
+    /**
+     * @notice League resolves a medical dispute.
+     * @dev op 0 = cancel, op 1 = advance to hijack at original fee,
+     *      op 2 = advance to hijack at league-set fee.
+     */
+    function resolveDeadlock(uint256 dealId, uint8 op, uint256 newFee)
+        external whenNotPaused nonReentrant onlyRole(LEAGUE_ROLE)
+    {
+        IDealEscrow.DealView memory dv = dealEscrow.getDealView(dealId);
+        if (!dv.exists) revert DealNotFound();
+        uint8 MEDICAL_DISPUTE = 8;
+        if (uint8(dv.state) != MEDICAL_DISPUTE) revert WrongDealState();
+        if (op == 0) {
+            dealEscrow.extCancel(dealId, uint8(TransferTypes.CancelReason.LEAGUE_DISPUTE_CANCELLED));
+        } else if (op == 1) {
+            dealEscrow.extAdvanceToHijack(dealId, 0);
+        } else if (op == 2) {
+            if (newFee == 0) revert InvalidAmount();
+            dealEscrow.extAdvanceToHijack(dealId, newFee);
         } else {
-            recipient = deal.sellingClub;
+            revert InvalidAmount();
         }
-
-        // I pull add-on payment from buying club
-        IERC20(deal.paymentToken).safeTransferFrom(deal.buyingClub, address(this), addOn.amount);
-        _claimable[recipient][deal.paymentToken] += addOn.amount;
-
-        emit AddOnTriggered(dealId, addOnIndex, addOn.amount, recipient);
     }
 
-    // ─── Selling Club Functions ───────────────────────────────────────────────
+    // ─── Expiry Processing ────────────────────────────────────────────────────
 
     /**
-     * @notice Selling club claims transfer funds after dispute window.
-     * @dev Salary guarantee stays locked — it belongs to the player, not the selling club.
+     * @notice Process an expired deal state. Anyone can call to unstick a deal.
+     * @dev Moved here from DealEscrow to stay within DealEscrow's 24KB limit.
+     *      Reads state via getExpiryView, delegates mutations back to DealEscrow
+     *      via role-gated callbacks (TRANSFER_ESCROW_ROLE).
      */
-    function claimFunds(uint256 dealId)
-        external
-        whenNotPaused
-        nonReentrant
-        dealExists(dealId)
-    {
-        Deal storage deal = _deals[dealId];
-        if (deal.sellingClub != msg.sender) revert NotSellingClub();
-        if (deal.state != DealState.APPROVED) revert DealNotApproved();
-        if (block.timestamp < deal.approvedAt + DISPUTE_WINDOW) revert DisputeWindowActive();
+    function processExpiry(uint256 dealId) external nonReentrant {
+        (
+            bool    exists,
+            bool    frozen,
+            uint8   state,
+            uint256 stateDeadline,
+            ,
+        ) = dealEscrow.getExpiryView(dealId);
 
-        deal.state = DealState.COMPLETED;
-        _activePlayerDeal[deal.playerId] = 0;
+        if (!exists)                           revert DealNotFound();
+        if (frozen)                            revert DealIsFrozen();
+        if (stateDeadline == 0)                revert WrongDealState();
+        if (block.timestamp <= stateDeadline)  revert WrongDealState();
 
-        uint256 remaining = deal.transferFee;
+        // I map uint8 state to the enum values we care about
+        // Values match TransferTypes.DealState order exactly
+        uint8 AWAITING_PLAYER_CONSENT    = 5;
+        uint8 AWAITING_TRANSFER_MEDICAL  = 6;
+        uint8 MEDICAL_RENEGOTIATION      = 7;
+        uint8 MEDICAL_DISPUTE            = 8;
+        uint8 HIJACK_WINDOW              = 9;
+        uint8 AWAITING_HIJACK_CONSENT    = 10;
+        uint8 AWAITING_HIJACK_MEDICAL    = 11;
+        uint8 FUNDING_PENDING            = 13;
+        uint8 FUNDED                     = 14;
+        uint8 DISPUTE_WINDOW             = 15;
 
-        if (deal.sellOnBps > 0 && deal.sellOnRecipient != address(0)) {
-            uint256 amt = (deal.transferFee * deal.sellOnBps) / BPS_DENOMINATOR;
-            remaining  -= amt;
-            _claimable[deal.sellOnRecipient][deal.paymentToken] += amt;
+        if (state == AWAITING_PLAYER_CONSENT || state == AWAITING_HIJACK_CONSENT) {
+            dealEscrow.extCancel(dealId, uint8(TransferTypes.CancelReason.CONSENT_WINDOW_EXPIRED));
+        } else if (state == AWAITING_TRANSFER_MEDICAL) {
+            dealEscrow.extCancel(dealId, uint8(TransferTypes.CancelReason.MEDICAL_WINDOW_EXPIRED));
+        } else if (state == AWAITING_HIJACK_MEDICAL) {
+            dealEscrow.extHijackStallAndCancel(dealId);
+        } else if (state == MEDICAL_RENEGOTIATION) {
+            dealEscrow.extCancel(dealId, uint8(TransferTypes.CancelReason.RENEGO_NO_RESOLUTION));
+        } else if (state == MEDICAL_DISPUTE) {
+            dealEscrow.extCancel(dealId, uint8(TransferTypes.CancelReason.LEAGUE_DEADLINE_EXPIRED));
+        } else if (state == HIJACK_WINDOW) {
+            dealEscrow.extAdvanceToFunding(dealId);
+        } else if (state == FUNDED) {
+            // Dispute window expired with no dispute raised — settle automatically
+            dealEscrow.extSettle(dealId);
+        } else if (state == DISPUTE_WINDOW) {
+            // League never resolved the dispute before deadline — auto-settle
+            dealEscrow.extSettle(dealId);
+        } else if (state == FUNDING_PENDING) {
+            dealEscrow.extCancel(dealId, uint8(TransferTypes.CancelReason.FUNDING_WINDOW_EXPIRED));
+        } else {
+            revert WrongDealState();
         }
-
-        if (deal.sellerAgentBps > 0 && deal.sellerAgent != address(0)) {
-            uint256 amt = (deal.transferFee * deal.sellerAgentBps) / BPS_DENOMINATOR;
-            remaining  -= amt;
-            _claimable[deal.sellerAgent][deal.paymentToken] += amt;
-        }
-
-        if (deal.buyerAgentBps > 0 && deal.buyerAgent != address(0)) {
-            uint256 amt = (deal.transferFee * deal.buyerAgentBps) / BPS_DENOMINATOR;
-            remaining  -= amt;
-            _claimable[deal.buyerAgent][deal.paymentToken] += amt;
-        }
-
-        _claimable[msg.sender][deal.paymentToken] += remaining;
-
-        // I transfer the player NFT last — CEI pattern
-        playerRegistry.escrowTransfer(deal.playerId, deal.sellingClub, deal.buyingClub);
-
-        emit DealCompleted(dealId, deal.buyingClub);
     }
-
-    // ─── Player Functions ─────────────────────────────────────────────────────
 
     /**
-     * @notice Player claims their salary guarantee if the buying club defaults.
-     * @dev Only callable by the player's registered playerWallet.
-     *      I leave the decision of "when to claim" to the player —
-     *      they can claim anytime after the deal completes.
+     * @notice Clear an expired mutual cancel proposal. Anyone can call.
      */
-    function claimSalaryGuarantee(uint256 dealId)
-        external
-        nonReentrant
-        dealExists(dealId)
-    {
-        Deal storage deal = _deals[dealId];
-        if (deal.state != DealState.COMPLETED) revert DealNotCompleted();
-        if (deal.salaryGuaranteeAmount == 0) revert NoSalaryGuarantee();
-        if (deal.salaryGuaranteeClaimed) revert SalaryGuaranteeAlreadyClaimed();
+    function expireMutualCancel(uint256 dealId) external {
+        (
+            bool    exists,
+            ,
+            ,
+            ,
+            uint256 mutualCancelDeadline,
+            address mutualCancelProposer
+        ) = dealEscrow.getExpiryView(dealId);
 
-        IPlayerRegistry.Player memory player = playerRegistry.getPlayer(deal.playerId);
-        if (player.playerWallet == address(0)) revert PlayerWalletNotSet();
-        if (player.playerWallet != msg.sender) revert InvalidAddress();
+        if (!exists)                                 revert DealNotFound();
+        if (mutualCancelProposer == address(0))      revert WrongDealState();
+        if (block.timestamp <= mutualCancelDeadline) revert WrongDealState();
 
-        deal.salaryGuaranteeClaimed = true;
-        _claimable[msg.sender][deal.paymentToken] += deal.salaryGuaranteeAmount;
-
-        emit SalaryGuaranteeClaimed(dealId, msg.sender, deal.salaryGuaranteeAmount);
+        dealEscrow.extClearMutualCancel(dealId);
+        emit MutualCancelExpired(dealId);
     }
 
-    // ─── Pull Withdrawal ──────────────────────────────────────────────────────
+    // ─── Internal ─────────────────────────────────────────────────────────────
 
-    function withdrawClaimable(address token)
-        external
-        nonReentrant
-        onlyApprovedToken(token)
-    {
-        uint256 amount = _claimable[msg.sender][token];
-        if (amount == 0) revert NothingToClaim();
-        _claimable[msg.sender][token] = 0;
-        IERC20(token).safeTransfer(msg.sender, amount);
-        emit FundsClaimed(msg.sender, token, amount);
+    function _activateNextPendingBid(uint256 offerId) internal {
+        Offer storage offer = _offers[offerId];
+        if (!offer.exists) return;
+        if (offer.activeNegotiations >= MAX_ACTIVE_NEGOTIATIONS) return;
+
+        address[] storage bidders = _bidders[offerId];
+        uint256 len = bidders.length;
+        for (uint256 i = 0; i < len; i++) {
+            Bid storage bid = _bids[offerId][bidders[i]];
+            if (bid.status == BidStatus.PENDING) {
+                bid.status = BidStatus.NEGOTIATING;
+                offer.activeNegotiations++;
+                emit BidActivated(offerId, bidders[i]);
+                return;
+            }
+        }
     }
-
-    // ─── Admin Functions ──────────────────────────────────────────────────────
-    function pause() external onlyRole(ADMIN_ROLE) { _pause(); }
-    function unpause() external onlyRole(ADMIN_ROLE) { _unpause(); }
 
     // ─── Views ────────────────────────────────────────────────────────────────
-    function getDeal(uint256 dealId) external view dealExists(dealId) returns (Deal memory) {
-        return _deals[dealId];
+
+    function getOffer(uint256 offerId)
+        external view offerExists(offerId) returns (Offer memory) {
+        return _offers[offerId];
     }
 
-    function getDealAddOns(uint256 dealId) external view dealExists(dealId) returns (AddOn[] memory) {
-        return _dealAddOns[dealId];
+    function getOfferAddOns(uint256 offerId)
+        external view offerExists(offerId) returns (TransferTypes.AddOn[] memory) {
+        return _offerAddOns[offerId];
     }
 
-    function getClaimable(address account, address token) external view returns (uint256) {
-        return _claimable[account][token];
+    /**
+     * @notice Selling club sees full bid details. Buying club sees their own bid.
+     * @dev UI-level privacy only — raw storage is always public on-chain.
+     */
+    function getBid(uint256 offerId, address buyingClub)
+        external view returns (Bid memory) {
+        Offer storage offer = _offers[offerId];
+        if (msg.sender != offer.sellingClub && msg.sender != buyingClub)
+            revert NotSellingClub();
+        return _bids[offerId][buyingClub];
     }
 
-    function getActivePlayerDeal(uint256 playerId) external view returns (uint256) {
-        return _activePlayerDeal[playerId];
+    function getBidCount(uint256 offerId) external view returns (uint256) {
+        return _bidCount[offerId];
+    }
+
+    function getAllBids(uint256 offerId)
+        external view offerExists(offerId) returns (Bid[] memory) {
+        if (msg.sender != _offers[offerId].sellingClub) revert NotSellingClub();
+
+        address[] storage bidders = _bidders[offerId];
+        uint256 len = bidders.length;
+        Bid[] memory result = new Bid[](len);
+        for (uint256 i = 0; i < len; i++) {
+            result[i] = _bids[offerId][bidders[i]];
+        }
+        return result;
+    }
+
+    function getPlayerOffer(uint256 playerId) external view returns (uint256) {
+        return _playerOffer[playerId];
+    }
+
+    // I forward getPlayerDeal to DealEscrow — ReleaseEscrow calls this to block
+    // release clause triggers when a deal is already live for that player
+    function getPlayerDeal(uint256 playerId) external view returns (uint256) {
+        return dealEscrow.getPlayerDeal(playerId);
+    }
+
+    function getTransferBan(address club) external view returns (TransferBan memory) {
+        return _transferBans[club];
     }
 
     function isTokenApproved(address token) external view returns (bool) {
@@ -475,7 +968,7 @@ contract TransferEscrow is AccessControl, Pausable, ReentrancyGuard {
         return _approvedTokenList;
     }
 
-    function totalDeals() external view returns (uint256) {
-        return _dealIdCounter;
+    function totalOffers() external view returns (uint256) {
+        return _offerIdCounter;
     }
 }

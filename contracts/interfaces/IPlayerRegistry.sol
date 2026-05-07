@@ -26,6 +26,7 @@ interface IPlayerRegistry {
         uint256 askingPrice;
         uint256 releaseClause;
         uint256 registeredAt;
+        string  portraitCID;
     }
 
     struct LegalDocuments {
