@@ -131,7 +131,6 @@ async function main() {
 
   const pr = await ethers.getContractAt("PlayerRegistry", playerRegistryAddr, deployer);
   const ESCROW_ROLE = await pr.ESCROW_ROLE();
-  const CLUB_ROLE   = await pr.CLUB_ROLE();
 
   // Escrow contracts need ESCROW_ROLE on PlayerRegistry
   for (const [name, addr] of [
@@ -169,10 +168,7 @@ async function main() {
     console.log(`  EURC + USDC approved on ${name}`);
   }
 
-  // ── 9. Grant deployer CLUB_ROLE for testing ─────────────────
-  // (remove before mainnet)
-  await (await pr.grantRole(CLUB_ROLE, admin)).wait();
-  console.log("\n  CLUB_ROLE → deployer (testnet only)");
+
 
   // ── 10. Write addresses.json ────────────────────────────────
   const addresses = {
