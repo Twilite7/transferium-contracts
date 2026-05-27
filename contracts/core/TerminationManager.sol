@@ -1,81 +1,94 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "../interfaces/IPlayerRegistry.sol";
 
 interface IPlayerRegistryForTermination {
-    function currentClub(uint256 playerId) external view returns (address);
-    function hasClubRole(address account) external view returns (bool);
+    function getPlayer(uint256 playerId)      external view returns (IPlayerRegistry.Player memory);
+    function currentClub(uint256 playerId)    external view returns (address);
     function hasRole(bytes32 role, address account) external view returns (bool);
-    function getPlayer(uint256 playerId) external view returns (IPlayerRegistry.Player memory);
-    function burnPlayer(uint256 playerId) external;
-    function paused() external view returns (bool);
-    function totalPausedDuration() external view returns (uint256);
+    function paused()                         external view returns (bool);
+    function totalPausedDuration()            external view returns (uint256);
+    function CLUB_ROLE()                      external view returns (bytes32);
+    function LEAGUE_ROLE()                    external view returns (bytes32);
+    function burnPlayer(uint256 playerId)     external;
 }
 
 /**
  * @title  TerminationManager
  * @author Transferium Protocol
- * @notice Manages mutual and unilateral contract termination for player NFTs.
- * @dev    Extracted from PlayerRegistry to keep it under the 24,576-byte limit.
- *         Holds its own termination state. Must be granted ESCROW_ROLE on
- *         PlayerRegistry before use, so it can call burnPlayer().
+ * @notice Manages mutual and unilateral player contract termination.
+ * @dev    Must be granted ESCROW_ROLE on PlayerRegistry (to call burnPlayer).
+ *         PlayerRegistry must have this contract set as terminationManager
+ *         so escrowTransfer can call clearTermination when a player moves clubs.
+ *
+ *         Mutual termination:
+ *           1. Club calls proposeMutualTermination.
+ *           2. Player wallet calls confirmMutualTermination → NFT burned.
+ *
+ *         Unilateral termination:
+ *           1. Club (player must be delisted) or player wallet calls
+ *              proposeUnilateralTermination with a reason string.
+ *           2. Opposing party has 7 days to call disputeTermination.
+ *           3a. No dispute → anyone calls executeTermination → NFT burned.
+ *           3b. Disputed → LEAGUE_ROLE calls forceTerminate or rejectTermination.
+ *
+ *         Transfer interaction:
+ *           If a player is transferred while any termination is pending,
+ *           PlayerRegistry calls clearTermination, voiding the proposal.
+ *           Transfer activity is never frozen by a pending termination.
+ *
+ *         Wage compensation is handled entirely off-chain.
  */
-contract TerminationManager {
+contract TerminationManager is ReentrancyGuard {
 
     // ─── Constants ────────────────────────────────────────────────────────────
 
-    uint256 public constant TERMINATION_DISPUTE_WINDOW = 7 days;
-    uint256 public constant MAX_REASON_LENGTH          = 256;
-    bytes32 public constant LEAGUE_ROLE                = keccak256("LEAGUE_ROLE");
-    bytes32 public constant ESCROW_ROLE                = keccak256("ESCROW_ROLE");
+    uint256 public constant DISPUTE_WINDOW = 7 days;
 
     // ─── State ────────────────────────────────────────────────────────────────
 
-    IPlayerRegistryForTermination public playerRegistry;
-    address public admin;
+    IPlayerRegistryForTermination public immutable playerRegistry;
 
-    mapping(uint256 => bool)                                private _mutualTerminationProposed;
-    mapping(uint256 => IPlayerRegistry.TerminationProposal) private _terminationProposals;
+    mapping(uint256 => IPlayerRegistry.TerminationProposal) private _proposals;
 
     // ─── Events ───────────────────────────────────────────────────────────────
 
-    event MutualTerminationProposed(uint256 indexed playerId, address proposer);
-    event MutualTerminationConfirmed(uint256 indexed playerId);
-    event UnilateralTerminationProposed(uint256 indexed playerId, IPlayerRegistry.TerminationInitiator initiator, string reason, uint256 disputeDeadline);
-    event TerminationDisputed(uint256 indexed playerId, address disputer);
-    event TerminationExecuted(uint256 indexed playerId);
-    event TerminationForced(uint256 indexed playerId, address league);
-    event TerminationRejected(uint256 indexed playerId, address league);
+    event MutualTerminationProposed(uint256 indexed playerId, address indexed club);
+    event MutualTerminationConfirmed(uint256 indexed playerId, address indexed playerWallet);
+    event UnilateralTerminationProposed(
+        uint256 indexed playerId,
+        IPlayerRegistry.TerminationInitiator initiator,
+        string  reason,
+        uint256 disputeDeadline
+    );
+    event TerminationDisputed(uint256 indexed playerId, address indexed disputer);
+    event TerminationExecuted(uint256 indexed playerId, address indexed executor);
+    event TerminationForced(uint256 indexed playerId, address indexed league);
+    event TerminationRejected(uint256 indexed playerId, address indexed league);
+    event TerminationCleared(uint256 indexed playerId);
 
     // ─── Errors ───────────────────────────────────────────────────────────────
 
     error ZeroAddress();
-    error NotAdmin();
-    error NotEscrow();
     error RegistryPaused();
-    error CallerIsNotPlayerClub(uint256 playerId, address caller);
-    error CallerIsNotPlayerWallet(uint256 playerId, address caller);
-    error CallerIsNotClubOrPlayerWallet(uint256 playerId, address caller);
-    error CallerIsNotLeague(address caller);
-    error MutualTerminationNotProposed(uint256 playerId);
-    error MutualTerminationAlreadyProposed(uint256 playerId);
-    error TerminationAlreadyProposed(uint256 playerId);
-    error NoTerminationProposal(uint256 playerId);
-    error TerminationAlreadyDisputed(uint256 playerId);
-    error TerminationDisputeWindowStillOpen(uint256 playerId, uint256 adjustedDeadline, uint256 now_);
-    error TerminationDisputeWindowClosed(uint256 playerId, uint256 adjustedDeadline, uint256 now_);
-    error TerminationNotDisputed(uint256 playerId);
-    error TerminationAlreadyExecuted(uint256 playerId);
-    error EmptyString();
-    error ReasonTooLong(uint256 length, uint256 max);
+    error NotPlayerClub(uint256 playerId, address caller, address club);
+    error NotPlayerWallet(uint256 playerId, address caller, address wallet);
+    error NotLeagueRole(address caller);
+    error NotPlayerRegistry(address caller);
+    error PlayerWalletNotSet(uint256 playerId);
+    error PlayerIsListed(uint256 playerId);
+    error NoProposal(uint256 playerId);
+    error ProposalAlreadyExists(uint256 playerId);
+    error NotMutualProposal(uint256 playerId);
+    error NotUnilateralProposal(uint256 playerId);
+    error NotDisputedProposal(uint256 playerId);
+    error CallerCannotDispute(uint256 playerId, address caller);
+    error DisputeWindowOpen(uint256 playerId, uint256 adjustedDeadline, uint256 now_);
+    error DisputeWindowClosed(uint256 playerId, uint256 adjustedDeadline, uint256 now_);
 
     // ─── Modifiers ────────────────────────────────────────────────────────────
-
-    modifier onlyAdmin() {
-        if (msg.sender != admin) revert NotAdmin();
-        _;
-    }
 
     modifier whenRegistryNotPaused() {
         if (playerRegistry.paused()) revert RegistryPaused();
@@ -84,193 +97,308 @@ contract TerminationManager {
 
     // ─── Constructor ──────────────────────────────────────────────────────────
 
-    constructor(address registry_, address admin_) {
-        if (registry_ == address(0)) revert ZeroAddress();
-        if (admin_    == address(0)) revert ZeroAddress();
-        playerRegistry = IPlayerRegistryForTermination(registry_);
-        admin          = admin_;
+    constructor(address playerRegistry_) {
+        if (playerRegistry_ == address(0)) revert ZeroAddress();
+        playerRegistry = IPlayerRegistryForTermination(playerRegistry_);
     }
 
-    // ─── Admin ────────────────────────────────────────────────────────────────
-
-    function setAdmin(address newAdmin) external onlyAdmin {
-        if (newAdmin == address(0)) revert ZeroAddress();
-        admin = newAdmin;
-    }
+    // ═══════════════════════════════════════════════════════════════════════════
+    // MUTUAL TERMINATION
+    // ═══════════════════════════════════════════════════════════════════════════
 
     /**
-     * @notice Clear termination state for a player.
-     * @dev    Called by PlayerRegistry on escrow transfer or external burn.
-     *         Caller must hold ESCROW_ROLE on PlayerRegistry.
+     * @notice Club proposes mutual termination of a player's contract.
+     *         Player must be delisted before this can be called.
+     *         Player wallet must be set so they can confirm.
      */
-    function clearTermination(uint256 playerId) external {
-        if (!playerRegistry.hasRole(ESCROW_ROLE, msg.sender)) revert NotEscrow();
-        delete _mutualTerminationProposed[playerId];
-        delete _terminationProposals[playerId];
-    }
+    function proposeMutualTermination(uint256 playerId)
+        external
+        whenRegistryNotPaused
+    {
+        address club = playerRegistry.currentClub(playerId);
+        if (msg.sender != club) revert NotPlayerClub(playerId, msg.sender, club);
+        if (!playerRegistry.hasRole(playerRegistry.CLUB_ROLE(), msg.sender))
+            revert NotPlayerClub(playerId, msg.sender, club);
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // TERMINATION — Mutual
-    // ═══════════════════════════════════════════════════════════════════════════
+        if (_proposals[playerId].state != IPlayerRegistry.TerminationState.None)
+            revert ProposalAlreadyExists(playerId);
 
-    function proposeMutualTermination(uint256 playerId) external whenRegistryNotPaused {
-        if (!playerRegistry.hasClubRole(msg.sender))
-            revert CallerIsNotPlayerClub(playerId, msg.sender);
-        if (playerRegistry.currentClub(playerId) != msg.sender)
-            revert CallerIsNotPlayerClub(playerId, msg.sender);
-        if (_mutualTerminationProposed[playerId])
-            revert MutualTerminationAlreadyProposed(playerId);
-        if (_terminationProposals[playerId].state != IPlayerRegistry.TerminationState.None)
-            revert TerminationAlreadyProposed(playerId);
+        IPlayerRegistry.Player memory p = playerRegistry.getPlayer(playerId);
+        if (p.playerWallet == address(0)) revert PlayerWalletNotSet(playerId);
+        if (p.isListed)                   revert PlayerIsListed(playerId);
 
-        _mutualTerminationProposed[playerId] = true;
+        // EFFECTS
+        _proposals[playerId] = IPlayerRegistry.TerminationProposal({
+            initiator:       IPlayerRegistry.TerminationInitiator.Club,
+            state:           IPlayerRegistry.TerminationState.Proposed,
+            reason:          "Mutual termination",
+            disputeDeadline: 0,
+            pauseSnapshot:   0
+        });
+
         emit MutualTerminationProposed(playerId, msg.sender);
     }
 
-    function confirmMutualTermination(uint256 playerId) external whenRegistryNotPaused {
-        IPlayerRegistry.Player memory p = playerRegistry.getPlayer(playerId);
-        if (p.playerWallet != msg.sender)
-            revert CallerIsNotPlayerWallet(playerId, msg.sender);
-        if (!_mutualTerminationProposed[playerId])
-            revert MutualTerminationNotProposed(playerId);
+    /**
+     * @notice Player wallet confirms the club's mutual termination proposal.
+     *         NFT is burned and the player is freed from the registry.
+     */
+    function confirmMutualTermination(uint256 playerId)
+        external
+        whenRegistryNotPaused
+        nonReentrant
+    {
+        IPlayerRegistry.TerminationProposal storage prop = _proposals[playerId];
 
-        delete _mutualTerminationProposed[playerId];
-        delete _terminationProposals[playerId];
+        if (prop.state != IPlayerRegistry.TerminationState.Proposed)
+            revert NoProposal(playerId);
+        if (prop.initiator != IPlayerRegistry.TerminationInitiator.Club)
+            revert NotMutualProposal(playerId);
+
+        IPlayerRegistry.Player memory p = playerRegistry.getPlayer(playerId);
+        if (msg.sender != p.playerWallet)
+            revert NotPlayerWallet(playerId, msg.sender, p.playerWallet);
+
+        // EFFECTS — clear before burn.
+        delete _proposals[playerId];
+
+        // INTERACTIONS
         playerRegistry.burnPlayer(playerId);
 
-        emit MutualTerminationConfirmed(playerId);
+        emit MutualTerminationConfirmed(playerId, msg.sender);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // TERMINATION — Unilateral
+    // UNILATERAL TERMINATION
     // ═══════════════════════════════════════════════════════════════════════════
 
+    /**
+     * @notice Propose unilateral termination of a player's contract.
+     *
+     *         Club initiating: player must be delisted first.
+     *         Player initiating: no listing restriction — the player has the
+     *         right to propose regardless of their transfer status.
+     *
+     * @param playerId  Token ID of the player.
+     * @param reason    Off-chain reason string stored on-chain for transparency.
+     */
     function proposeUnilateralTermination(uint256 playerId, string calldata reason)
-        external whenRegistryNotPaused
+        external
+        whenRegistryNotPaused
     {
-        if (bytes(reason).length == 0)                revert EmptyString();
-        if (bytes(reason).length > MAX_REASON_LENGTH) revert ReasonTooLong(bytes(reason).length, MAX_REASON_LENGTH);
+        if (_proposals[playerId].state != IPlayerRegistry.TerminationState.None)
+            revert ProposalAlreadyExists(playerId);
 
-        address club         = playerRegistry.currentClub(playerId);
-        address playerWallet = playerRegistry.getPlayer(playerId).playerWallet;
+        IPlayerRegistry.Player memory p = playerRegistry.getPlayer(playerId);
+        if (p.playerWallet == address(0)) revert PlayerWalletNotSet(playerId);
 
-        bool isClub   = (msg.sender == club)         && playerRegistry.hasClubRole(msg.sender);
-        bool isPlayer = (msg.sender == playerWallet) && (playerWallet != address(0));
+        address club = playerRegistry.currentClub(playerId);
+        IPlayerRegistry.TerminationInitiator initiator;
 
-        if (!isClub && !isPlayer)
-            revert CallerIsNotClubOrPlayerWallet(playerId, msg.sender);
-        if (_mutualTerminationProposed[playerId])
-            revert MutualTerminationAlreadyProposed(playerId);
-        if (_terminationProposals[playerId].state != IPlayerRegistry.TerminationState.None)
-            revert TerminationAlreadyProposed(playerId);
+        if (msg.sender == club && playerRegistry.hasRole(playerRegistry.CLUB_ROLE(), msg.sender)) {
+            // I require the club to delist the player before proposing termination.
+            if (p.isListed) revert PlayerIsListed(playerId);
+            initiator = IPlayerRegistry.TerminationInitiator.Club;
+        } else if (msg.sender == p.playerWallet) {
+            // I allow the player to propose regardless of listing status.
+            initiator = IPlayerRegistry.TerminationInitiator.Player;
+        } else {
+            // I revert with the most helpful error for the caller.
+            if (p.playerWallet != address(0) && msg.sender != p.playerWallet)
+                revert NotPlayerWallet(playerId, msg.sender, p.playerWallet);
+            revert NotPlayerClub(playerId, msg.sender, club);
+        }
 
-        _terminationProposals[playerId] = IPlayerRegistry.TerminationProposal({
-            initiator:       isClub ? IPlayerRegistry.TerminationInitiator.Club : IPlayerRegistry.TerminationInitiator.Player,
+        uint256 snapshot        = playerRegistry.totalPausedDuration();
+        uint256 disputeDeadline = block.timestamp + DISPUTE_WINDOW;
+
+        // EFFECTS
+        _proposals[playerId] = IPlayerRegistry.TerminationProposal({
+            initiator:       initiator,
             state:           IPlayerRegistry.TerminationState.Proposed,
             reason:          reason,
-            disputeDeadline: block.timestamp + TERMINATION_DISPUTE_WINDOW,
-            pauseSnapshot:   playerRegistry.totalPausedDuration()
+            disputeDeadline: disputeDeadline,
+            pauseSnapshot:   snapshot
         });
 
-        emit UnilateralTerminationProposed(
-            playerId,
-            isClub ? IPlayerRegistry.TerminationInitiator.Club : IPlayerRegistry.TerminationInitiator.Player,
-            reason,
-            block.timestamp + TERMINATION_DISPUTE_WINDOW
-        );
+        emit UnilateralTerminationProposed(playerId, initiator, reason, disputeDeadline);
     }
 
-    function disputeTermination(uint256 playerId) external whenRegistryNotPaused {
-        IPlayerRegistry.TerminationProposal storage proposal = _terminationProposals[playerId];
-        if (proposal.state == IPlayerRegistry.TerminationState.None)
-            revert NoTerminationProposal(playerId);
-        if (proposal.state != IPlayerRegistry.TerminationState.Proposed)
-            revert TerminationAlreadyDisputed(playerId);
+    /**
+     * @notice Opposing party disputes the unilateral termination.
+     *         Must be called within the 7-day dispute window.
+     *         Disputed proposals escalate to LEAGUE_ROLE arbitration.
+     */
+    function disputeTermination(uint256 playerId)
+        external
+        whenRegistryNotPaused
+    {
+        IPlayerRegistry.TerminationProposal storage prop = _proposals[playerId];
 
-        address club         = playerRegistry.currentClub(playerId);
-        address playerWallet = playerRegistry.getPlayer(playerId).playerWallet;
+        if (prop.state != IPlayerRegistry.TerminationState.Proposed)
+            revert NoProposal(playerId);
+        if (prop.initiator == IPlayerRegistry.TerminationInitiator.Club &&
+            prop.disputeDeadline == 0)
+            revert NotUnilateralProposal(playerId);
 
-        bool isOpposingParty =
-            (proposal.initiator == IPlayerRegistry.TerminationInitiator.Club   && msg.sender == playerWallet) ||
-            (proposal.initiator == IPlayerRegistry.TerminationInitiator.Player && msg.sender == club && playerRegistry.hasClubRole(msg.sender));
+        // I check the caller is the opposing party.
+        _assertOpposingParty(playerId, prop);
 
-        if (!isOpposingParty)
-            revert CallerIsNotClubOrPlayerWallet(playerId, msg.sender);
+        // I check we are still inside the dispute window (pause-adjusted).
+        uint256 pausedSince = playerRegistry.totalPausedDuration() - prop.pauseSnapshot;
+        uint256 deadline_   = prop.disputeDeadline + pausedSince;
+        if (block.timestamp > deadline_)
+            revert DisputeWindowClosed(playerId, deadline_, block.timestamp);
 
-        uint256 pausedSince      = playerRegistry.totalPausedDuration() - proposal.pauseSnapshot;
-        uint256 adjustedDeadline = proposal.disputeDeadline + pausedSince;
+        // EFFECTS
+        prop.state = IPlayerRegistry.TerminationState.Disputed;
 
-        if (block.timestamp > adjustedDeadline)
-            revert TerminationDisputeWindowClosed(playerId, adjustedDeadline, block.timestamp);
-
-        proposal.state = IPlayerRegistry.TerminationState.Disputed;
         emit TerminationDisputed(playerId, msg.sender);
     }
 
-    function executeTermination(uint256 playerId) external whenRegistryNotPaused {
-        IPlayerRegistry.TerminationProposal storage proposal = _terminationProposals[playerId];
-        if (proposal.state == IPlayerRegistry.TerminationState.None)
-            revert NoTerminationProposal(playerId);
-        if (proposal.state == IPlayerRegistry.TerminationState.Disputed)
-            revert TerminationAlreadyDisputed(playerId);
-        if (proposal.state == IPlayerRegistry.TerminationState.Executed)
-            revert TerminationAlreadyExecuted(playerId);
+    /**
+     * @notice Execute an undisputed termination after the 7-day window has passed.
+     *         Anyone may call this — it is permissionless once the deadline is reached.
+     */
+    function executeTermination(uint256 playerId)
+        external
+        whenRegistryNotPaused
+        nonReentrant
+    {
+        IPlayerRegistry.TerminationProposal storage prop = _proposals[playerId];
 
-        uint256 pausedSince      = playerRegistry.totalPausedDuration() - proposal.pauseSnapshot;
-        uint256 adjustedDeadline = proposal.disputeDeadline + pausedSince;
+        if (prop.state != IPlayerRegistry.TerminationState.Proposed)
+            revert NoProposal(playerId);
+        if (prop.disputeDeadline == 0)
+            revert NotUnilateralProposal(playerId);
 
-        if (block.timestamp <= adjustedDeadline)
-            revert TerminationDisputeWindowStillOpen(playerId, adjustedDeadline, block.timestamp);
+        // I confirm the dispute window is fully elapsed (pause-adjusted).
+        uint256 pausedSince = playerRegistry.totalPausedDuration() - prop.pauseSnapshot;
+        uint256 deadline_   = prop.disputeDeadline + pausedSince;
+        if (block.timestamp <= deadline_)
+            revert DisputeWindowOpen(playerId, deadline_, block.timestamp);
 
-        proposal.state = IPlayerRegistry.TerminationState.Executed;
-        delete _mutualTerminationProposed[playerId];
+        // EFFECTS
+        delete _proposals[playerId];
+
+        // INTERACTIONS
         playerRegistry.burnPlayer(playerId);
 
-        emit TerminationExecuted(playerId);
+        emit TerminationExecuted(playerId, msg.sender);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // LEAGUE — Termination arbitration
+    // LEAGUE — Arbitration
     // ═══════════════════════════════════════════════════════════════════════════
 
-    function forceTerminate(uint256 playerId) external whenRegistryNotPaused {
-        if (!playerRegistry.hasRole(LEAGUE_ROLE, msg.sender))
-            revert CallerIsNotLeague(msg.sender);
+    /**
+     * @notice League approves the disputed termination. NFT is burned.
+     */
+    function forceTerminate(uint256 playerId)
+        external
+        whenRegistryNotPaused
+        nonReentrant
+    {
+        if (!playerRegistry.hasRole(playerRegistry.LEAGUE_ROLE(), msg.sender))
+            revert NotLeagueRole(msg.sender);
 
-        IPlayerRegistry.TerminationProposal storage proposal = _terminationProposals[playerId];
-        if (proposal.state != IPlayerRegistry.TerminationState.Disputed)
-            revert TerminationNotDisputed(playerId);
+        IPlayerRegistry.TerminationProposal storage prop = _proposals[playerId];
+        if (prop.state != IPlayerRegistry.TerminationState.Disputed)
+            revert NotDisputedProposal(playerId);
 
-        proposal.state = IPlayerRegistry.TerminationState.Executed;
-        delete _mutualTerminationProposed[playerId];
+        // EFFECTS
+        delete _proposals[playerId];
+
+        // INTERACTIONS
         playerRegistry.burnPlayer(playerId);
 
         emit TerminationForced(playerId, msg.sender);
     }
 
-    function rejectTermination(uint256 playerId) external whenRegistryNotPaused {
-        if (!playerRegistry.hasRole(LEAGUE_ROLE, msg.sender))
-            revert CallerIsNotLeague(msg.sender);
+    /**
+     * @notice League rejects the disputed termination. Player remains registered.
+     *         The proposal is cleared and both parties may resume normal activity.
+     */
+    function rejectTermination(uint256 playerId)
+        external
+        whenRegistryNotPaused
+    {
+        if (!playerRegistry.hasRole(playerRegistry.LEAGUE_ROLE(), msg.sender))
+            revert NotLeagueRole(msg.sender);
 
-        IPlayerRegistry.TerminationProposal storage proposal = _terminationProposals[playerId];
-        if (proposal.state != IPlayerRegistry.TerminationState.Disputed)
-            revert TerminationNotDisputed(playerId);
+        IPlayerRegistry.TerminationProposal storage prop = _proposals[playerId];
+        if (prop.state != IPlayerRegistry.TerminationState.Disputed)
+            revert NotDisputedProposal(playerId);
 
-        delete _terminationProposals[playerId];
+        // EFFECTS
+        delete _proposals[playerId];
+
         emit TerminationRejected(playerId, msg.sender);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PLAYERREGISTRY CALLBACK
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * @notice Called by PlayerRegistry during escrowTransfer to void any pending
+     *         termination proposal when a player changes clubs.
+     * @dev    Restricted to address(playerRegistry) only.
+     */
+    function clearTermination(uint256 playerId) external {
+        if (msg.sender != address(playerRegistry))
+            revert NotPlayerRegistry(msg.sender);
+        if (_proposals[playerId].state != IPlayerRegistry.TerminationState.None) {
+            delete _proposals[playerId];
+            emit TerminationCleared(playerId);
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
     // VIEW
     // ═══════════════════════════════════════════════════════════════════════════
 
-    function getTerminationProposal(uint256 playerId)
-        external view returns (IPlayerRegistry.TerminationProposal memory)
+    function getProposal(uint256 playerId)
+        external view
+        returns (IPlayerRegistry.TerminationProposal memory)
     {
-        return _terminationProposals[playerId];
+        return _proposals[playerId];
     }
 
-    function isMutualTerminationProposed(uint256 playerId) external view returns (bool) {
-        return _mutualTerminationProposed[playerId];
+    /**
+     * @notice Returns the pause-adjusted dispute deadline for an active proposal.
+     *         Returns 0 if there is no proposal or it has no dispute window.
+     */
+    function adjustedDisputeDeadline(uint256 playerId) external view returns (uint256) {
+        IPlayerRegistry.TerminationProposal storage prop = _proposals[playerId];
+        if (prop.state == IPlayerRegistry.TerminationState.None) return 0;
+        if (prop.disputeDeadline == 0) return 0;
+        uint256 pausedSince = playerRegistry.totalPausedDuration() - prop.pauseSnapshot;
+        return prop.disputeDeadline + pausedSince;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // INTERNAL
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * @notice Asserts the caller is the party opposing the termination initiator.
+     *         Club initiated → only player wallet can dispute.
+     *         Player initiated → only current club can dispute.
+     */
+    function _assertOpposingParty(
+        uint256 playerId,
+        IPlayerRegistry.TerminationProposal storage prop
+    ) internal view {
+        IPlayerRegistry.Player memory p = playerRegistry.getPlayer(playerId);
+
+        if (prop.initiator == IPlayerRegistry.TerminationInitiator.Club) {
+            if (msg.sender != p.playerWallet)
+                revert CallerCannotDispute(playerId, msg.sender);
+        } else {
+            address club = playerRegistry.currentClub(playerId);
+            if (msg.sender != club)
+                revert CallerCannotDispute(playerId, msg.sender);
+        }
     }
 }
