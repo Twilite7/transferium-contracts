@@ -9,6 +9,12 @@ pragma solidity ^0.8.28;
  */
 library TransferTypes {
 
+    struct Installment {
+        uint256 amount;   // token units (6 decimals for EURC)
+        uint256 dueDate;  // unix timestamp when payment is due
+        bool    paid;
+    }
+
     struct AddOn {
         string  description;
         uint256 amount;
@@ -74,9 +80,12 @@ library TransferTypes {
         address sellerAgent;
         uint256 buyerAgentBps;
         address buyerAgent;
-        uint256 salaryGuaranteeMonths;
-        uint256 salaryGuaranteeAmount;
+        uint256 signingBonusMonths;
+        uint256 signingBonusAmount;
         uint256 minimumHijackIncrementBps;
         uint256 consentWindowDuration;
+        // Installment payment schedule — lengths must match, sum must equal transferFee
+        uint256[] installmentAmounts;
+        uint256[] installmentDueDates;
     }
 }

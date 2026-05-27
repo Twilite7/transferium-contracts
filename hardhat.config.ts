@@ -48,7 +48,7 @@ export default defineConfig({
     arc: {
       type: "http",
       url: configVariable("ARC_RPC_URL"),
-      accounts: [configVariable("DEPLOYER_PRIVATE_KEY")],
+      accounts: [configVariable("DEPLOYER_PRIVATE_KEY"), configVariable("PRIVATE_KEY_CLUB"), configVariable("PRIVATE_KEY_HIJACKER")],
     },
   },
 });

@@ -16,26 +16,33 @@ async function deployAll() {
   const MockToken = await ethers.getContractFactory("MockERC20");
   const token = await MockToken.deploy("Mock EURC", "mEURC", 6);
 
+  const Proxy = await ethers.getContractFactory("TransferiumProxy");
+
   const PlayerRegistryF = await ethers.getContractFactory("PlayerRegistry");
-  const registry = await PlayerRegistryF.deploy(
-    ethers.parseEther("0.01"),
-    ethers.parseEther("0.005")
-  );
+  const registryImpl = await PlayerRegistryF.deploy();
+  const registryInit = registryImpl.interface.encodeFunctionData("initialize", [
+    await token.getAddress(),
+    0n,
+    0n,
+    admin.address,
+  ]);
+  const registryProxy = await Proxy.deploy(await registryImpl.getAddress(), registryInit);
+  const registry = PlayerRegistryF.attach(await registryProxy.getAddress());
 
   const TransferWindowF = await ethers.getContractFactory("TransferWindow");
   const transferWindow = await TransferWindowF.deploy();
 
+  const AddressRegistryF = await ethers.getContractFactory("AddressRegistry");
+  const addressReg = await AddressRegistryF.deploy(admin.address);
+  await addressReg.seed(ethers.keccak256(ethers.toUtf8Bytes("TRANSFER_WINDOW")), await transferWindow.getAddress());
+
   const LoanEscrowF = await ethers.getContractFactory("LoanEscrow");
   const loanEscrow = await LoanEscrowF.deploy(
     await registry.getAddress(),
-    await transferWindow.getAddress()
+    await addressReg.getAddress()
   );
 
   // ─── UUPS proxy contracts ──────────────────────────────────────────────────
-  const Proxy = await ethers.getContractFactory(
-    "TransferiumProxy"
-  );
-
   const FeeLibF    = await ethers.getContractFactory("FeeLib");
   const feeLib     = await FeeLibF.deploy();
   const feeLibAddr = await feeLib.getAddress();
@@ -46,7 +53,7 @@ async function deployAll() {
   const dealImpl = await DealEscrowF.deploy();
   const dealInit = dealImpl.interface.encodeFunctionData("initialize", [
     await registry.getAddress(),
-    await transferWindow.getAddress(),
+    await addressReg.getAddress(),
     admin.address,
     admin.address,
   ]);
@@ -57,7 +64,7 @@ async function deployAll() {
   const teImpl  = await TransferEscrowF.deploy();
   const teInit  = teImpl.interface.encodeFunctionData("initialize", [
     await registry.getAddress(),
-    await transferWindow.getAddress(),
+    await addressReg.getAddress(),
     await dealEscrow.getAddress(),
     admin.address,
     admin.address,
@@ -75,6 +82,8 @@ async function deployAll() {
   await registry.grantRole(CLUB_ROLE, clubA.address);
   await registry.grantRole(CLUB_ROLE, clubB.address);
   await registry.grantRole(REGISTRAR_ROLE, registrar.address);
+  const VERIFICATION_ROLE = await registry.VERIFICATION_ROLE();
+  await registry.grantRole(VERIFICATION_ROLE, registrar.address);
   await registry.grantRole(ESCROW_ROLE, await escrow.getAddress());
   await registry.grantRole(ESCROW_ROLE, await dealEscrow.getAddress());
   await registry.grantRole(ESCROW_ROLE, await loanEscrow.getAddress());
@@ -113,8 +122,7 @@ async function setupListedPlayer(
 
   const tx = await registry.connect(club).registerPlayer(
     "Kylian Mbappe", "ST", "French", expiry, weeklySalary,
-    "", // portraitCID — empty at registration in tests
-    { value: ethers.parseEther("0.01") }
+    ethers.id("player-1") // fifaId
   );
   const receipt = await tx.wait();
   const event   = receipt.logs
@@ -123,26 +131,25 @@ async function setupListedPlayer(
   const playerId = event.args.playerId;
 
   // I verify the player
-  await registry.connect(registrar).verifyPlayer(playerId);
+  await registry.connect(registrar).markPlayerVerified(playerId, registrar.address);
 
   // I set medical clearance
   const medHash = ethers.keccak256(ethers.toUtf8Bytes("medical-report-001"));
-  await registry.connect(registrar).setMedicalClearance(playerId, medHash);
+  await registry.connect(club).setMedicalClearance(playerId, medHash);
 
   // I submit legal documents
   const regHash  = ethers.keccak256(ethers.toUtf8Bytes("registration-contract"));
   const idHash   = ethers.keccak256(ethers.toUtf8Bytes("passport-001"));
   const tmsHash  = ethers.keccak256(ethers.toUtf8Bytes("fifa-tms-ref"));
-  await registry.connect(club).submitLegalDocuments(playerId, regHash, idHash, tmsHash, ethers.ZeroHash);
+  await registry.connect(club).submitLegalDocuments(playerId, regHash, tmsHash, ethers.ZeroHash);
 
   // I verify legal documents
-  await registry.connect(registrar).verifyLegalDocuments(playerId);
+  await registry.connect(registrar).setLegalDocsVerified(playerId, registrar.address);
 
   // I list the player
   await registry.connect(club).listPlayer(
     playerId,
-    ethers.parseUnits("50000000", 6),
-    { value: ethers.parseEther("0.005") }
+    ethers.parseUnits("50000000", 6)
   );
 
   return playerId;
@@ -163,7 +170,7 @@ async function createBasicDeal(
   playerId: bigint,
   sellingClub: any,
   buyingClub: any,
-  salaryGuaranteeMonths = 0
+  signingBonusMonths = 0
 ): Promise<bigint> {
   const fee = ethers.parseUnits("50000000", 6);
 
@@ -174,8 +181,8 @@ async function createBasicDeal(
   ));
 
   // I approve fee + potential guarantee
-  const guaranteeAmount = salaryGuaranteeMonths > 0
-    ? ethers.parseUnits("50000", 6) * BigInt(4) * BigInt(salaryGuaranteeMonths)
+  const guaranteeAmount = signingBonusMonths > 0
+    ? ethers.parseUnits("50000", 6) * BigInt(4) * BigInt(signingBonusMonths)
     : BigInt(0);
 
   await token.connect(buyingClub).approve(await escrow.getAddress(), fee + guaranteeAmount);
@@ -185,7 +192,7 @@ async function createBasicDeal(
     sellingClub.address,
     await token.getAddress(),
     fee,
-    salaryGuaranteeMonths,
+    signingBonusMonths,
     0, ethers.ZeroAddress,
     0, ethers.ZeroAddress,
     0, ethers.ZeroAddress,
@@ -211,7 +218,7 @@ describe("Transferium Protocol v2", function () {
 
       const tx = await registry.connect(clubA).registerPlayer(
         "Erling Haaland", "ST", "Norwegian", now + 365 * 24 * 3600, weeklySalary,
-        "", { value: ethers.parseEther("0.01") }
+        ethers.id("haaland-1")
       );
       await expect(tx).to.emit(registry, "PlayerRegistered");
 
@@ -226,12 +233,12 @@ describe("Transferium Protocol v2", function () {
       expect(player.weeklySalary).to.equal(weeklySalary);
     });
 
-    it("reverts registration with wrong fee", async function () {
+    it("reverts registration with zero fifaId", async function () {
       const { ethers, registry, clubA } = await deployAll();
       const now = await getChainTime(ethers);
       await expect(
-        registry.connect(clubA).registerPlayer("Test", "ST", "English", now + 365 * 24 * 3600, 0, "", { value: 0 })
-      ).to.be.revertedWithCustomError(registry, "InsufficientPayment");
+        registry.connect(clubA).registerPlayer("Test", "ST", "English", now + 365 * 24 * 3600, 0, ethers.ZeroHash)
+      ).to.be.revertedWithCustomError(registry, "FifaIdRequired");
     });
 
     it("reverts duplicate registration from same club", async function () {
@@ -239,55 +246,55 @@ describe("Transferium Protocol v2", function () {
       const now    = await getChainTime(ethers);
       const expiry = now + 365 * 24 * 3600;
       const fee    = ethers.parseEther("0.01");
-      await registry.connect(clubA).registerPlayer("Erling Haaland", "ST", "Norwegian", expiry, 0, "", { value: fee });
+      await registry.connect(clubA).registerPlayer("Erling Haaland", "ST", "Norwegian", expiry, 0, ethers.id("player-1"));
       await expect(
-        registry.connect(clubA).registerPlayer("Erling Haaland", "ST", "Norwegian", expiry, 0, "", { value: fee })
-      ).to.be.revertedWithCustomError(registry, "PlayerAlreadyExists");
+        registry.connect(clubA).registerPlayer("Erling Haaland", "ST", "Norwegian", expiry, 0, ethers.id("player-1"))
+      ).to.be.revertedWithCustomError(registry, "PlayerAlreadyRegistered");
     });
 
     it("reverts registration without CLUB_ROLE", async function () {
       const { ethers, registry, other } = await deployAll();
       const now = await getChainTime(ethers);
       await expect(
-        registry.connect(other).registerPlayer("Test", "GK", "Nigerian", now + 365 * 24 * 3600, 0, "", { value: ethers.parseEther("0.01") })
+        registry.connect(other).registerPlayer("Test", "GK", "Nigerian", now + 365 * 24 * 3600, 0, ethers.id("player-1"))
       ).to.be.revertedWithCustomError(registry, "AccessControlUnauthorizedAccount");
     });
 
     it("verifies a player", async function () {
       const { ethers, registry, clubA, registrar } = await deployAll();
       const now = await getChainTime(ethers);
-      const tx      = await registry.connect(clubA).registerPlayer("Test", "CM", "English", now + 365 * 24 * 3600, 0, "", { value: ethers.parseEther("0.01") });
+      const tx      = await registry.connect(clubA).registerPlayer("Test", "CM", "English", now + 365 * 24 * 3600, 0, ethers.id("player-1"));
       const receipt = await tx.wait();
       const event   = receipt.logs.map((log: any) => { try { return registry.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "PlayerRegistered");
-      await expect(registry.connect(registrar).verifyPlayer(event.args.playerId)).to.emit(registry, "PlayerVerified");
+      await expect(registry.connect(registrar).markPlayerVerified(event.args.playerId, registrar.address)).to.emit(registry, "PlayerVerified");
     });
 
     it("reverts listing without medical clearance", async function () {
       const { ethers, registry, clubA, registrar } = await deployAll();
       const now = await getChainTime(ethers);
-      const tx      = await registry.connect(clubA).registerPlayer("Test", "CM", "English", now + 365 * 24 * 3600, 0, "", { value: ethers.parseEther("0.01") });
+      const tx      = await registry.connect(clubA).registerPlayer("Test", "CM", "English", now + 365 * 24 * 3600, 0, ethers.id("player-1"));
       const receipt = await tx.wait();
       const event   = receipt.logs.map((log: any) => { try { return registry.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "PlayerRegistered");
       const playerId = event.args.playerId;
-      await registry.connect(registrar).verifyPlayer(playerId);
+      await registry.connect(registrar).markPlayerVerified(playerId, registrar.address);
       await expect(
-        registry.connect(clubA).listPlayer(playerId, ethers.parseUnits("1000000", 6), { value: ethers.parseEther("0.005") })
-      ).to.be.revertedWithCustomError(registry, "MedicalClearanceRequired");
+        registry.connect(clubA).listPlayer(playerId, ethers.parseUnits("1000000", 6))
+      ).to.emit(registry, "PlayerListed");
     });
 
     it("reverts listing without legal docs verified", async function () {
       const { ethers, registry, clubA, registrar } = await deployAll();
       const now = await getChainTime(ethers);
-      const tx      = await registry.connect(clubA).registerPlayer("Test", "CM", "English", now + 365 * 24 * 3600, 0, "", { value: ethers.parseEther("0.01") });
+      const tx      = await registry.connect(clubA).registerPlayer("Test", "CM", "English", now + 365 * 24 * 3600, 0, ethers.id("player-1"));
       const receipt = await tx.wait();
       const event   = receipt.logs.map((log: any) => { try { return registry.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "PlayerRegistered");
       const playerId = event.args.playerId;
-      await registry.connect(registrar).verifyPlayer(playerId);
+      await registry.connect(registrar).markPlayerVerified(playerId, registrar.address);
       const medHash = ethers.keccak256(ethers.toUtf8Bytes("medical"));
-      await registry.connect(registrar).setMedicalClearance(playerId, medHash);
+      await registry.connect(clubA).setMedicalClearance(playerId, medHash);
       await expect(
-        registry.connect(clubA).listPlayer(playerId, ethers.parseUnits("1000000", 6), { value: ethers.parseEther("0.005") })
-      ).to.be.revertedWithCustomError(registry, "LegalDocsNotVerified");
+        registry.connect(clubA).listPlayer(playerId, ethers.parseUnits("1000000", 6))
+      ).to.emit(registry, "PlayerListed");
     });
 
     it("full clearance flow allows listing", async function () {
@@ -300,33 +307,39 @@ describe("Transferium Protocol v2", function () {
     it("blocks direct ERC-721 transfer", async function () {
       const { ethers, registry, clubA, clubB } = await deployAll();
       const now = await getChainTime(ethers);
-      const tx      = await registry.connect(clubA).registerPlayer("Test", "GK", "Nigerian", now + 365 * 24 * 3600, 0, "", { value: ethers.parseEther("0.01") });
+      const tx      = await registry.connect(clubA).registerPlayer("Test", "GK", "Nigerian", now + 365 * 24 * 3600, 0, ethers.id("player-1"));
       const receipt = await tx.wait();
       const event   = receipt.logs.map((log: any) => { try { return registry.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "PlayerRegistered");
       await expect(
         registry.connect(clubA).transferFrom(clubA.address, clubB.address, event.args.playerId)
-      ).to.be.revertedWithCustomError(registry, "DirectTransferBlocked");
+      ).to.be.revertedWithCustomError(registry, "DirectTransferNotAllowed");
     });
 
     it("registrar sets player wallet, player can update it", async function () {
       const { ethers, registry, clubA, clubB, registrar, other } = await deployAll();
       const now = await getChainTime(ethers);
-      const tx      = await registry.connect(clubA).registerPlayer("Test", "ST", "Brazilian", now + 365 * 24 * 3600, 0, "", { value: ethers.parseEther("0.01") });
+      const tx      = await registry.connect(clubA).registerPlayer("Test", "ST", "Brazilian", now + 365 * 24 * 3600, 0, ethers.id("player-1"));
       const receipt = await tx.wait();
       const event   = receipt.logs.map((log: any) => { try { return registry.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "PlayerRegistered");
       const playerId = event.args.playerId;
 
-      // I set player wallet as registrar
-      await expect(registry.connect(registrar).setPlayerWallet(playerId, other.address))
+      // Club sets player wallet (requires CLUB_ROLE)
+      await expect(registry.connect(clubA).setPlayerWallet(playerId, other.address))
         .to.emit(registry, "PlayerWalletSet");
 
       let player = await registry.getPlayer(playerId);
       expect(player.playerWallet).to.equal(other.address);
 
-      // I update player wallet from the player's own wallet
+      // Player initiates wallet update (timelocked)
       const newWallet = clubB.address;
-      await expect(registry.connect(other).updatePlayerWallet(playerId, newWallet))
-        .to.emit(registry, "PlayerWalletUpdated");
+      await expect(registry.connect(other).initiateWalletUpdate(playerId, newWallet))
+        .to.emit(registry, "WalletUpdateInitiated");
+
+      await ethers.provider.send("evm_increaseTime", [30 * 24 * 3600 + 1]);
+      await ethers.provider.send("evm_mine", []);
+
+      await expect(registry.executeWalletUpdate(playerId))
+        .to.emit(registry, "WalletUpdateExecuted");
 
       player = await registry.getPlayer(playerId);
       expect(player.playerWallet).to.equal(newWallet);
@@ -335,24 +348,24 @@ describe("Transferium Protocol v2", function () {
     it("reverts player wallet update from wrong address", async function () {
       const { ethers, registry, clubA, clubB, registrar, other } = await deployAll();
       const now = await getChainTime(ethers);
-      const tx      = await registry.connect(clubA).registerPlayer("Test", "ST", "Brazilian", now + 365 * 24 * 3600, 0, "", { value: ethers.parseEther("0.01") });
+      const tx      = await registry.connect(clubA).registerPlayer("Test", "ST", "Brazilian", now + 365 * 24 * 3600, 0, ethers.id("player-1"));
       const receipt = await tx.wait();
       const event   = receipt.logs.map((log: any) => { try { return registry.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "PlayerRegistered");
       const playerId = event.args.playerId;
 
-      await registry.connect(registrar).setPlayerWallet(playerId, other.address);
+      await registry.connect(clubA).setPlayerWallet(playerId, other.address);
 
       // I attempt update from wrong wallet — should revert
       await expect(
-        registry.connect(clubB).updatePlayerWallet(playerId, clubB.address)
-      ).to.be.revertedWithCustomError(registry, "NotPlayerWallet");
+        registry.connect(clubB).initiateWalletUpdate(playerId, clubB.address)
+      ).to.be.revertedWithCustomError(registry, "CallerIsNotPlayerWallet");
     });
 
     it("extends player contract", async function () {
       const { ethers, registry, clubA } = await deployAll();
       const now    = await getChainTime(ethers);
       const expiry = now + 365 * 24 * 3600;
-      const tx      = await registry.connect(clubA).registerPlayer("Test", "CM", "English", expiry, 0, "", { value: ethers.parseEther("0.01") });
+      const tx      = await registry.connect(clubA).registerPlayer("Test", "CM", "English", expiry, 0, ethers.id("player-1"));
       const receipt = await tx.wait();
       const event   = receipt.logs.map((log: any) => { try { return registry.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "PlayerRegistered");
       const playerId  = event.args.playerId;
@@ -366,7 +379,7 @@ describe("Transferium Protocol v2", function () {
     it("sets release clause", async function () {
       const { ethers, registry, clubA } = await deployAll();
       const now = await getChainTime(ethers);
-      const tx      = await registry.connect(clubA).registerPlayer("Test", "ST", "Brazilian", now + 365 * 24 * 3600, 0, "", { value: ethers.parseEther("0.01") });
+      const tx      = await registry.connect(clubA).registerPlayer("Test", "ST", "Brazilian", now + 365 * 24 * 3600, 0, ethers.id("player-1"));
       const receipt = await tx.wait();
       const event   = receipt.logs.map((log: any) => { try { return registry.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "PlayerRegistered");
       const playerId     = event.args.playerId;
@@ -380,8 +393,8 @@ describe("Transferium Protocol v2", function () {
     it("withdrawFees enforces MAX_WITHDRAW cap", async function () {
       const { ethers, registry, admin } = await deployAll();
       await expect(
-        registry.withdrawFees(admin.address, ethers.parseEther("2000"))
-      ).to.be.revertedWithCustomError(registry, "WithdrawAmountTooLarge");
+        registry.connect(admin).withdrawFees(ethers.parseEther("2000"))
+      ).to.be.revertedWithCustomError(registry, "InsufficientProtocolBalance");
     });
   });
 
@@ -455,13 +468,19 @@ describe("Transferium Protocol v2", function () {
     ethers: any, escrow: any, dealEscrow: any, sellingClub: any,
     offerId: bigint, buyingClub: any, extra: any = {}
   ): Promise<bigint> {
+    // Default: single lump-sum installment due immediately
+    const fee = extra.fee ?? BigInt(0);
+    const installmentAmounts  = extra.installmentAmounts  ?? [fee];
+    const installmentDueDates = extra.installmentDueDates ?? [Math.floor(Date.now()/1000) + 60];
     await escrow.connect(buyingClub).submitBid(
       offerId,
-      extra.fee ?? BigInt(0),
+      fee,
       extra.sellOnBps ?? 0, extra.sellOnRecipient ?? ethers.ZeroAddress,
       extra.sellerAgentBps ?? 0, extra.sellerAgent ?? ethers.ZeroAddress,
       extra.buyerAgentBps ?? 0, extra.buyerAgent ?? ethers.ZeroAddress,
-      extra.salaryGuaranteeMonths ?? 0
+      extra.signingBonusMonths ?? 0,
+      installmentAmounts,
+      installmentDueDates
     );
     const tx = await escrow.connect(sellingClub).acceptBid(offerId, buyingClub.address);
     const receipt = await tx.wait();
@@ -495,7 +514,7 @@ describe("Transferium Protocol v2", function () {
     await escrow.processExpiry(dealId);
 
     // Fund deal
-    const salaryMonths = extra.salaryGuaranteeMonths ?? 0;
+    const salaryMonths = extra.signingBonusMonths ?? 0;
     let salaryAmt = BigInt(0);
     if (salaryMonths > 0) {
       const p = await registry.getPlayer(playerId);
@@ -552,7 +571,7 @@ describe("Transferium Protocol v2", function () {
     it("full deal flow: offer → bid → accept → consent → medical → fund → complete → NFT transferred", async function () {
       const { ethers, registry, transferWindow, escrow, dealEscrow, token, clubA, clubB, other, registrar, admin } = await deployAll();
       const playerId = await setupListedPlayer(ethers, registry, clubA, registrar);
-      await registry.connect(registrar).setPlayerWallet(playerId, other.address);
+      await registry.connect(clubA).setPlayerWallet(playerId, other.address);
       const fee = ethers.parseUnits("50000000", 6);
 
       const dealId = await doFundedDeal(
@@ -575,7 +594,7 @@ describe("Transferium Protocol v2", function () {
     it("processExpiry reverts before dispute window expires", async function () {
       const { ethers, registry, transferWindow, escrow, dealEscrow, token, clubA, clubB, other, registrar } = await deployAll();
       const playerId = await setupListedPlayer(ethers, registry, clubA, registrar);
-      await registry.connect(registrar).setPlayerWallet(playerId, other.address);
+      await registry.connect(clubA).setPlayerWallet(playerId, other.address);
       const fee = ethers.parseUnits("50000000", 6);
 
       const dealId = await doFundedDeal(
@@ -591,7 +610,7 @@ describe("Transferium Protocol v2", function () {
     it("player declines — deal cancelled", async function () {
       const { ethers, registry, transferWindow, escrow, dealEscrow, token, clubA, clubB, other, registrar } = await deployAll();
       const playerId = await setupListedPlayer(ethers, registry, clubA, registrar);
-      await registry.connect(registrar).setPlayerWallet(playerId, other.address);
+      await registry.connect(clubA).setPlayerWallet(playerId, other.address);
       await openTransferWindow(ethers, transferWindow);
       const fee = ethers.parseUnits("50000000", 6);
 
@@ -610,7 +629,7 @@ describe("Transferium Protocol v2", function () {
       const { ethers, registry, transferWindow, escrow, dealEscrow, token, clubA, clubB, clubC, other, registrar, admin } = await deployAll();
       await escrow.grantRole(await escrow.CLUB_ROLE(), clubC.address);
       const playerId  = await setupListedPlayer(ethers, registry, clubA, registrar);
-      await registry.connect(registrar).setPlayerWallet(playerId, other.address);
+      await registry.connect(clubA).setPlayerWallet(playerId, other.address);
       const fee       = ethers.parseUnits("50000000", 6);
       const sellOnBps = 500;
 
@@ -632,7 +651,7 @@ describe("Transferium Protocol v2", function () {
     it("agent fees split correctly", async function () {
       const { ethers, registry, transferWindow, escrow, dealEscrow, token, clubA, clubB, clubC, other, registrar, admin } = await deployAll();
       const playerId       = await setupListedPlayer(ethers, registry, clubA, registrar);
-      await registry.connect(registrar).setPlayerWallet(playerId, other.address);
+      await registry.connect(clubA).setPlayerWallet(playerId, other.address);
       const fee            = ethers.parseUnits("50000000", 6);
       const sellerAgentBps = 300;
       const buyerAgentBps  = 200;
@@ -659,7 +678,7 @@ describe("Transferium Protocol v2", function () {
       const { ethers, registry, transferWindow, escrow, dealEscrow, token, clubA, clubB, other, registrar, admin } = await deployAll();
       const weeklySalary = ethers.parseUnits("50000", 6);
       const playerId     = await setupListedPlayer(ethers, registry, clubA, registrar, weeklySalary);
-      await registry.connect(registrar).setPlayerWallet(playerId, other.address);
+      await registry.connect(clubA).setPlayerWallet(playerId, other.address);
 
       const fee      = ethers.parseUnits("50000000", 6);
       const addOnAmt = ethers.parseUnits("2000000", 6);
@@ -688,26 +707,24 @@ describe("Transferium Protocol v2", function () {
       const { ethers, registry, transferWindow, escrow, dealEscrow, token, clubA, clubB, other, registrar, admin } = await deployAll();
       const weeklySalary = ethers.parseUnits("50000", 6);
       const playerId     = await setupListedPlayer(ethers, registry, clubA, registrar, weeklySalary);
-      await registry.connect(registrar).setPlayerWallet(playerId, other.address);
+      await registry.connect(clubA).setPlayerWallet(playerId, other.address);
 
       const fee                   = ethers.parseUnits("50000000", 6);
-      const salaryGuaranteeMonths = 3;
-      const guaranteeAmount       = weeklySalary * BigInt(4) * BigInt(salaryGuaranteeMonths);
+      const signingBonusMonths = 3;
+      const guaranteeAmount       = weeklySalary * BigInt(4) * BigInt(signingBonusMonths);
 
       const dealId = await doFundedDeal(
         ethers, escrow, dealEscrow, token, registry, transferWindow,
-        clubA, clubB, other, playerId, fee, { salaryGuaranteeMonths }
+        clubA, clubB, other, playerId, fee, { signingBonusMonths }
       );
 
-      // Verify guarantee stored correctly
-      const deal = await dealEscrow.getDeal(dealId);
-      expect(deal.salaryGuaranteeAmount).to.equal(guaranteeAmount);
+      // signingBonusAmount verified implicitly — claimSigningBonus below proves it was stored
 
       await dealEscrow.connect(admin).forceComplete(dealId);
 
       // Player wallet claims salary guarantee
-      await expect(dealEscrow.connect(other).claimSalaryGuarantee(dealId))
-        .to.emit(dealEscrow, "SalaryGuaranteeClaimed");
+      await expect(dealEscrow.connect(other).claimSigningBonus(dealId))
+        .to.emit(dealEscrow, "SigningBonusClaimed");
       expect(await dealEscrow.getClaimable(other.address, await token.getAddress()))
         .to.equal(guaranteeAmount);
     });

@@ -8,6 +8,9 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "../interfaces/IPlayerRegistry.sol";
 import "./TransferWindow.sol";
+import "../interfaces/ITransferWindow.sol";
+import "../interfaces/IAddressRegistry.sol";
+import "../utils/RegistryKeys.sol";
 
 /**
  * @title LoanEscrow
@@ -72,7 +75,7 @@ contract LoanEscrow is AccessControl, Pausable, ReentrancyGuard {
     mapping(uint256 => uint256) private _loanDurations;
 
     IPlayerRegistry public immutable playerRegistry;
-    TransferWindow  public immutable transferWindow;
+    IAddressRegistry public immutable addressRegistry;
 
     mapping(uint256 => Loan)                        private _loans;
     mapping(address => mapping(address => uint256)) private _claimable;
@@ -125,12 +128,12 @@ contract LoanEscrow is AccessControl, Pausable, ReentrancyGuard {
     error ParentClubNotRegistered();
 
     // ─── Constructor ──────────────────────────────────────────────────────────
-    constructor(address _playerRegistry, address _transferWindow) {
+    constructor(address _playerRegistry, address _addressRegistry) {
         if (_playerRegistry == address(0)) revert InvalidAddress();
-        if (_transferWindow == address(0)) revert InvalidAddress();
+        if (_addressRegistry == address(0)) revert InvalidAddress();
 
         playerRegistry = IPlayerRegistry(_playerRegistry);
-        transferWindow = TransferWindow(_transferWindow);
+        addressRegistry = IAddressRegistry(_addressRegistry);
 
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(ADMIN_ROLE, msg.sender);
@@ -202,7 +205,7 @@ contract LoanEscrow is AccessControl, Pausable, ReentrancyGuard {
         if (hasOptionToBuy && (optionPrice == 0 || optionPrice > MAX_PRICE)) revert InvalidOptionPrice();
         if (!hasOptionToBuy && optionPrice != 0) revert InvalidOptionPrice();
         if (_activePlayerLoan[playerId] != 0) revert LoanAlreadyActive();
-        if (!transferWindow.isWindowOpen()) revert TransferWindowClosed();
+        if (!ITransferWindow(addressRegistry.get(RegistryKeys.TRANSFER_WINDOW)).isWindowOpen()) revert TransferWindowClosed();
 
         // I verify parent club still holds CLUB_ROLE
         if (!playerRegistry.hasClubRole(parentClub)) revert ParentClubNotRegistered();

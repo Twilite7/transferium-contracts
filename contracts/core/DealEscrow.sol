@@ -9,6 +9,8 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "../interfaces/IPlayerRegistry.sol";
 import "../interfaces/ITransferWindow.sol";
+import "../interfaces/IAddressRegistry.sol";
+import "../utils/RegistryKeys.sol";
 import "../interfaces/IDealEscrow.sol";
 import "../libraries/FeeLib.sol";
 import "../types/TransferTypes.sol";
@@ -42,7 +44,7 @@ contract DealEscrow is
     uint256 public constant HIJACK_FAIL_PENALTY_BPS  = 200;
     uint256 public constant HIJACK_STALL_PENALTY_BPS = 500;
     uint256 public constant LEAGUE_DISPUTE_DEADLINE  = 7 days;
-    uint256 public constant MIN_TIMER                = 1 hours;
+    uint256 public constant MIN_TIMER = 10 seconds;
 
     struct Deal {
         uint256  offerId;
@@ -57,9 +59,10 @@ contract DealEscrow is
         address  sellerAgent;
         uint256  buyerAgentBps;
         address  buyerAgent;
-        uint256  salaryGuaranteeMonths;
-        uint256  salaryGuaranteeAmount;
-        bool     salaryGuaranteeClaimed;
+        uint256  signingBonusMonths;
+        uint256  signingBonusAmount;
+        bool     signingBonusClaimed;
+        uint256  signingBonusExpiry;   // timestamp after which league can rescue unclaimed bonus
         uint256  minimumHijackIncrementBps;
         TransferTypes.DealState      state;
         uint256  stateDeadline;
@@ -73,6 +76,9 @@ contract DealEscrow is
         address  hijackDepositClub;
         address  mutualCancelProposer;
         uint256  mutualCancelDeadline;
+        // Installment schedule
+        uint8    installmentCount;   // 1 = lump sum
+        uint8    installmentsPaid;   // how many installments paid so far
     }
 
     struct HijackBid {
@@ -80,7 +86,7 @@ contract DealEscrow is
         uint256 transferFee;
         uint256 buyerAgentBps;
         address buyerAgent;
-        uint256 salaryGuaranteeMonths;
+        uint256 signingBonusMonths;
         uint256 depositedAt;
         bool    exists;
     }
@@ -88,7 +94,7 @@ contract DealEscrow is
     uint256 private _dealIdCounter;
 
     IPlayerRegistry public playerRegistry;
-    ITransferWindow public transferWindow;
+    IAddressRegistry public addressRegistry;
     address public treasury;
     uint256 public protocolFeeBps;
     uint256 public consentWindow;
@@ -106,6 +112,8 @@ contract DealEscrow is
     mapping(address => mapping(address => uint256))         private _claimable;
     mapping(uint256 => mapping(address => uint256))         private _addOnDeposits;
     mapping(address => bool)                                private _approvedTokens;
+    // installmentSchedule[dealId][index] = Installment
+    mapping(uint256 => mapping(uint8 => TransferTypes.Installment)) private _installments;
 
     event DealCreated(uint256 indexed dealId, uint256 indexed playerId, address indexed buyingClub);
     event PlayerConsentRequested(uint256 indexed dealId, uint256 indexed playerId, address buyingClub);
@@ -123,6 +131,7 @@ contract DealEscrow is
     event MutualCancelConfirmed(uint256 indexed dealId);
     event MutualCancelExpired(uint256 indexed dealId);
     event FundingReceived(uint256 indexed dealId, address indexed buyingClub, uint256 amount);
+    event SigningBonusRescued(uint256 indexed dealId, address indexed recipient, uint256 amount);
     event DealCompleted(uint256 indexed dealId, uint256 indexed playerId, address indexed newClub);
     event DealCancelled(uint256 indexed dealId, TransferTypes.CancelReason reason);
     event DealFrozen(uint256 indexed dealId);
@@ -130,12 +139,13 @@ contract DealEscrow is
     event DisputeRaised(uint256 indexed dealId, address indexed raisedBy);
     event DisputeResolved(uint256 indexed dealId);
     event AddOnTriggered(uint256 indexed dealId, uint256 indexed idx, uint256 amount, address recipient);
-    event SalaryGuaranteeClaimed(uint256 indexed dealId, address indexed wallet, uint256 amount);
+    event SigningBonusClaimed(uint256 indexed dealId, address indexed wallet, uint256 amount);
     event FundsClaimed(address indexed recipient, address indexed token, uint256 amount);
     event TreasuryUpdated(address indexed newTreasury);
     event ProtocolFeeUpdated(uint256 newBps);
 
     error ReentrantCall();
+    error InvalidInstallmentSchedule();
     error InvalidAddress();
     error InvalidAmount();
     error TokenNotApproved();
@@ -154,8 +164,10 @@ contract DealEscrow is
     error MedicalAlreadySubmitted();
     error HijackWindowClosed();
     error NothingToClaim();
-    error NoSalaryGuarantee();
-    error SalaryGuaranteeAlreadyClaimed();
+    error NoSigningBonus();
+    error SigningBonusAlreadyClaimed();
+    error SigningBonusNotExpired();
+    error NoSigningBonusToRescue();
     error AddOnNotFound();
     error AddOnAlreadyTriggered();
     error TransferWindowClosed();
@@ -172,19 +184,19 @@ contract DealEscrow is
 
     function initialize(
         address _playerRegistry,
-        address _transferWindow,
+        address _addressRegistry,
         address _treasury,
         address _admin
     ) external initializer {
         if (_playerRegistry == address(0)) revert InvalidAddress();
-        if (_transferWindow  == address(0)) revert InvalidAddress();
+        if (_addressRegistry == address(0)) revert InvalidAddress();
         if (_treasury        == address(0)) revert InvalidAddress();
         if (_admin           == address(0)) revert InvalidAddress();
         __AccessControl_init();
         __Pausable_init();
         _reentrancyStatus = _NOT_ENTERED;
         playerRegistry    = IPlayerRegistry(_playerRegistry);
-        transferWindow    = ITransferWindow(_transferWindow);
+        addressRegistry   = IAddressRegistry(_addressRegistry);
         treasury          = _treasury;
         consentWindow     = 72 hours;
         medicalWindow     = 72 hours;
@@ -266,6 +278,18 @@ contract DealEscrow is
         _dealIdCounter++;
         dealId = _dealIdCounter;
 
+        // I validate installment schedule before storing
+        uint256 instCount = p.installmentAmounts.length;
+        if (instCount == 0 || instCount > 8) revert InvalidInstallmentSchedule();
+        if (p.installmentDueDates.length != instCount) revert InvalidInstallmentSchedule();
+        uint256 instSum = 0;
+        for (uint256 i = 0; i < instCount; i++) {
+            if (p.installmentAmounts[i] == 0) revert InvalidInstallmentSchedule();
+            if (i > 0 && p.installmentDueDates[i] <= p.installmentDueDates[i-1]) revert InvalidInstallmentSchedule();
+            instSum += p.installmentAmounts[i];
+        }
+        if (instSum != p.transferFee) revert InvalidInstallmentSchedule();
+
         _deals[dealId] = Deal({
             offerId:                   p.offerId,
             playerId:                  p.playerId,
@@ -279,9 +303,10 @@ contract DealEscrow is
             sellerAgent:               p.sellerAgent,
             buyerAgentBps:             p.buyerAgentBps,
             buyerAgent:                p.buyerAgent,
-            salaryGuaranteeMonths:     p.salaryGuaranteeMonths,
-            salaryGuaranteeAmount:     p.salaryGuaranteeAmount,
-            salaryGuaranteeClaimed:    false,
+            signingBonusMonths:     p.signingBonusMonths,
+            signingBonusAmount:     p.signingBonusAmount,
+            signingBonusClaimed:    false,
+            signingBonusExpiry:     0,
             minimumHijackIncrementBps: p.minimumHijackIncrementBps,
             state:                     TransferTypes.DealState.AWAITING_PLAYER_CONSENT,
             stateDeadline:             block.timestamp + p.consentWindowDuration,
@@ -294,8 +319,19 @@ contract DealEscrow is
             hijackDeposit:             0,
             hijackDepositClub:         address(0),
             mutualCancelProposer:      address(0),
-            mutualCancelDeadline:      0
+            mutualCancelDeadline:      0,
+            installmentCount:          uint8(instCount),
+            installmentsPaid:          0
         });
+
+        // I store the installment schedule
+        for (uint256 i = 0; i < instCount; i++) {
+            _installments[dealId][uint8(i)] = TransferTypes.Installment({
+                amount:  p.installmentAmounts[i],
+                dueDate: p.installmentDueDates[i],
+                paid:    false
+            });
+        }
 
         for (uint256 i = 0; i < addOns.length; i++) {
             _dealAddOns[dealId].push(addOns[i]);
@@ -312,7 +348,7 @@ contract DealEscrow is
         uint256 transferFee,
         uint256 buyerAgentBps,
         address buyerAgent,
-        uint256 salaryGuaranteeMonths
+        uint256 signingBonusMonths
     )
         external
         onlyRole(TRANSFER_ESCROW_ROLE)
@@ -334,7 +370,7 @@ contract DealEscrow is
             transferFee:           transferFee,
             buyerAgentBps:         buyerAgentBps,
             buyerAgent:            buyerAgent,
-            salaryGuaranteeMonths: salaryGuaranteeMonths,
+            signingBonusMonths: signingBonusMonths,
             depositedAt:           block.timestamp,
             exists:                true
         });
@@ -428,18 +464,18 @@ contract DealEscrow is
         if (!hijack.exists) revert WrongDealState();
 
         IPlayerRegistry.Player memory player = playerRegistry.getPlayer(deal.playerId);
-        uint256 newSalaryGuarantee = 0;
-        if (hijack.salaryGuaranteeMonths > 0 && player.weeklySalary > 0) {
-            newSalaryGuarantee = player.weeklySalary * 4 * hijack.salaryGuaranteeMonths;
+        uint256 newSigningBonus = 0;
+        if (hijack.signingBonusMonths > 0 && player.weeklySalary > 0) {
+            newSigningBonus = player.weeklySalary * 4 * hijack.signingBonusMonths;
         }
 
         deal.buyingClub             = hijack.buyingClub;
         deal.transferFee            = hijack.transferFee;
         deal.buyerAgentBps          = hijack.buyerAgentBps;
         deal.buyerAgent             = hijack.buyerAgent;
-        deal.salaryGuaranteeMonths  = hijack.salaryGuaranteeMonths;
-        deal.salaryGuaranteeAmount  = newSalaryGuarantee;
-        deal.salaryGuaranteeClaimed = false;
+        deal.signingBonusMonths  = hijack.signingBonusMonths;
+        deal.signingBonusAmount  = newSigningBonus;
+        deal.signingBonusClaimed = false;
         deal.state                  = TransferTypes.DealState.AWAITING_HIJACK_CONSENT;
         deal.stateDeadline          = block.timestamp + consentWindow;
         deal.medicalHash            = bytes32(0);
@@ -515,24 +551,45 @@ contract DealEscrow is
         if (deal.state != TransferTypes.DealState.FUNDING_PENDING) revert WrongDealState();
         if (deal.buyingClub != msg.sender)                          revert NotBuyingClub();
         if (block.timestamp > deal.stateDeadline)                   revert FundingWindowExpired();
-        if (!transferWindow.isWindowOpen())                         revert TransferWindowClosed();
+        if (!ITransferWindow(addressRegistry.get(RegistryKeys.TRANSFER_WINDOW)).isWindowOpen())                         revert TransferWindowClosed();
 
-        uint256 totalRequired = deal.transferFee + deal.salaryGuaranteeAmount;
-        uint256 alreadyHeld   = 0;
+        // I only require installment #0 + salary guarantee at funding — real-world practice
+        uint256 firstInstallment = _installments[dealId][0].amount;
+        uint256 totalRequired    = firstInstallment + deal.signingBonusAmount;
+        uint256 alreadyHeld      = 0;
         if (deal.hijackDepositClub == msg.sender && deal.hijackDeposit > 0) {
-            alreadyHeld            = deal.hijackDeposit;
-            deal.hijackDeposit     = 0;
-            deal.hijackDepositClub = address(0);
+            alreadyHeld            = deal.hijackDeposit > firstInstallment ? firstInstallment : deal.hijackDeposit;
+            deal.hijackDeposit    -= alreadyHeld;
+            if (deal.hijackDeposit == 0) deal.hijackDepositClub = address(0);
         }
         if (totalRequired > alreadyHeld) {
             IERC20(deal.paymentToken).safeTransferFrom(
                 msg.sender, address(this), totalRequired - alreadyHeld
             );
         }
+        _installments[dealId][0].paid = true;
         deal.state         = TransferTypes.DealState.FUNDED;
         deal.fundedAt      = block.timestamp;
         deal.stateDeadline = block.timestamp + disputeWindow;
         emit FundingReceived(dealId, msg.sender, totalRequired);
+    }
+
+    function getInstallment(uint256 dealId, uint8 index)
+        external view returns (TransferTypes.Installment memory)
+    {
+        return _installments[dealId][index];
+    }
+
+    function getInstallmentMeta(uint256 dealId) external view returns (
+        address buyingClub,
+        address sellingClub,
+        address paymentToken,
+        uint8   installmentCount,
+        uint8   installmentsPaid,
+        uint8   state
+    ) {
+        Deal storage d = _deals[dealId];
+        return (d.buyingClub, d.sellingClub, d.paymentToken, d.installmentCount, d.installmentsPaid, uint8(d.state));
     }
 
     function raiseDispute(uint256 dealId)
@@ -680,19 +737,35 @@ contract DealEscrow is
         }
     }
 
-    function claimSalaryGuarantee(uint256 dealId)
+    // ── Signing bonus rescue (league) ──────────────────────────────────────────
+    /// @notice After signingBonusExpiry, league can redirect unclaimed bonus to any address.
+    ///         Protects against lost/compromised player wallets on mainnet.
+    function rescueSigningBonus(uint256 dealId, address recipient)
+        external onlyRole(LEAGUE_ROLE) nonReentrant dealExists(dealId)
+    {
+        Deal storage deal = _deals[dealId];
+        if (deal.signingBonusAmount == 0)    revert NoSigningBonusToRescue();
+        if (deal.signingBonusClaimed)        revert SigningBonusAlreadyClaimed();
+        if (block.timestamp < deal.signingBonusExpiry) revert SigningBonusNotExpired();
+        if (recipient == address(0))         revert InvalidAddress();
+        deal.signingBonusClaimed = true;
+        _claimable[recipient][deal.paymentToken] += deal.signingBonusAmount;
+        emit SigningBonusRescued(dealId, recipient, deal.signingBonusAmount);
+    }
+
+    function claimSigningBonus(uint256 dealId)
         external nonReentrant dealExists(dealId)
     {
         Deal storage deal = _deals[dealId];
         if (deal.state != TransferTypes.DealState.COMPLETED) revert WrongDealState();
-        if (deal.salaryGuaranteeAmount == 0)                 revert NoSalaryGuarantee();
-        if (deal.salaryGuaranteeClaimed)                     revert SalaryGuaranteeAlreadyClaimed();
+        if (deal.signingBonusAmount == 0)                 revert NoSigningBonus();
+        if (deal.signingBonusClaimed)                     revert SigningBonusAlreadyClaimed();
         IPlayerRegistry.Player memory player = playerRegistry.getPlayer(deal.playerId);
         if (player.playerWallet == address(0)) revert PlayerWalletNotSet();
         if (player.playerWallet != msg.sender) revert NotPlayerWallet();
-        deal.salaryGuaranteeClaimed = true;
-        _claimable[msg.sender][deal.paymentToken] += deal.salaryGuaranteeAmount;
-        emit SalaryGuaranteeClaimed(dealId, msg.sender, deal.salaryGuaranteeAmount);
+        deal.signingBonusClaimed = true;
+        _claimable[msg.sender][deal.paymentToken] += deal.signingBonusAmount;
+        emit SigningBonusClaimed(dealId, msg.sender, deal.signingBonusAmount);
     }
 
     // ─── External Callbacks (TRANSFER_ESCROW_ROLE only) ───────────────────────
@@ -775,9 +848,11 @@ contract DealEscrow is
     function _settleDeal(uint256 dealId) internal {
         Deal storage deal = _deals[dealId];
         deal.state             = TransferTypes.DealState.COMPLETED;
+        deal.signingBonusExpiry   = block.timestamp + 90 days;
         _playerDeal[deal.playerId] = 0;
 
-        uint256 fee = deal.transferFee;
+        // I only settle installment #0 here — subsequent installments paid via payInstallment
+        uint256 fee = _installments[dealId][0].amount;
         (
             uint256 protocolAmt,
             uint256 sellOnAmt,
@@ -810,8 +885,9 @@ contract DealEscrow is
 
         if (prevState == TransferTypes.DealState.FUNDED ||
             prevState == TransferTypes.DealState.DISPUTE_WINDOW) {
+            // I refund installment #0 only — that is what was actually deposited
             _claimable[deal.buyingClub][deal.paymentToken] +=
-                deal.transferFee + deal.salaryGuaranteeAmount;
+                _installments[dealId][0].amount + deal.signingBonusAmount;
         }
 
         HijackBid storage hijack = _hijackBids[dealId];
@@ -833,21 +909,6 @@ contract DealEscrow is
     }
 
     // ─── Views ────────────────────────────────────────────────────────────────
-
-    function getDeal(uint256 dealId)
-        external view dealExists(dealId) returns (Deal memory) {
-        return _deals[dealId];
-    }
-
-    function getDealAddOns(uint256 dealId)
-        external view dealExists(dealId) returns (TransferTypes.AddOn[] memory) {
-        return _dealAddOns[dealId];
-    }
-
-    function getHijackBid(uint256 dealId)
-        external view dealExists(dealId) returns (HijackBid memory) {
-        return _hijackBids[dealId];
-    }
 
     function getDealView(uint256 dealId)
         external view returns (IDealEscrow.DealView memory v)

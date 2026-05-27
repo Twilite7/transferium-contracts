@@ -61,7 +61,7 @@ interface IDealEscrow {
         uint256 transferFee,
         uint256 buyerAgentBps,
         address buyerAgent,
-        uint256 salaryGuaranteeMonths
+        uint256 signingBonusMonths
     ) external;
 
     // ─── processExpiry callbacks (TRANSFER_ESCROW_ROLE only) ──────────────────
@@ -104,6 +104,18 @@ interface IDealEscrow {
 
     // I expose settlement for processExpiry auto-complete path
     function extSettle(uint256 dealId) external;
+
+    // ─── Installment support ──────────────────────────────────────────────────
+    function getInstallment(uint256 dealId, uint8 index) external view returns (TransferTypes.Installment memory);
+    function creditInstallment(uint256 dealId, uint8 index, uint256 amount) external;
+    function getInstallmentMeta(uint256 dealId) external view returns (
+        address buyingClub,
+        address sellingClub,
+        address paymentToken,
+        uint8   installmentCount,
+        uint8   installmentsPaid,
+        uint8   state
+    );
     /**
      * @notice Advance a MEDICAL_DISPUTE deal to HIJACK_WINDOW.
      * @dev newFee = 0 keeps original fee, non-zero overrides it.

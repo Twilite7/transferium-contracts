@@ -9,6 +9,8 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "../interfaces/IPlayerRegistry.sol";
 import "../interfaces/ITransferWindow.sol";
+import "../interfaces/IAddressRegistry.sol";
+import "../utils/RegistryKeys.sol";
 import "../interfaces/ITransferEscrow.sol";
 
 /**
@@ -96,7 +98,7 @@ contract ReleaseEscrow is
     uint256 private _releaseIdCounter;
 
     IPlayerRegistry  public playerRegistry;
-    ITransferWindow  public transferWindow;
+    IAddressRegistry public addressRegistry;
     ITransferEscrow  public transferEscrow;
 
     // I store treasury separately — cannot be zero after init
@@ -164,13 +166,13 @@ contract ReleaseEscrow is
 
     function initialize(
         address _playerRegistry,
-        address _transferWindow,
+        address _addressRegistry,
         address _transferEscrow,
         address _treasury,
         address _admin
     ) external initializer {
         if (_playerRegistry  == address(0)) revert InvalidAddress();
-        if (_transferWindow  == address(0)) revert InvalidAddress();
+        if (_addressRegistry == address(0)) revert InvalidAddress();
         if (_transferEscrow  == address(0)) revert InvalidAddress();
         if (_treasury        == address(0)) revert InvalidAddress();
         if (_admin           == address(0)) revert InvalidAddress();
@@ -181,7 +183,7 @@ contract ReleaseEscrow is
         _reentrancyStatus = _NOT_ENTERED;
 
         playerRegistry = IPlayerRegistry(_playerRegistry);
-        transferWindow = ITransferWindow(_transferWindow);
+        addressRegistry = IAddressRegistry(_addressRegistry);
         transferEscrow = ITransferEscrow(_transferEscrow);
         treasury       = _treasury;
 
@@ -393,7 +395,7 @@ contract ReleaseEscrow is
             if (outcome == MedicalOutcome.CONCERN) {
                 emit MedicalSubmitted(releaseId, MedicalOutcome.CONCERN);
             }
-            if (transferWindow.isWindowOpen()) {
+            if (ITransferWindow(addressRegistry.get(RegistryKeys.TRANSFER_WINDOW)).isWindowOpen()) {
                 _settleRelease(releaseId);
             } else {
                 // I park the deal — buying club calls executeRelease when window opens
@@ -417,7 +419,7 @@ contract ReleaseEscrow is
         ReleaseDeal storage rel = _releases[releaseId];
         if (rel.state != ReleaseState.PENDING_WINDOW) revert WrongReleaseState();
         if (rel.buyingClub != msg.sender)             revert NotBuyingClub();
-        if (!transferWindow.isWindowOpen())            revert TransferWindowClosed();
+        if (!ITransferWindow(addressRegistry.get(RegistryKeys.TRANSFER_WINDOW)).isWindowOpen())            revert TransferWindowClosed();
 
         _settleRelease(releaseId);
     }

@@ -9,6 +9,8 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "../interfaces/IPlayerRegistry.sol";
 import "../interfaces/ITransferWindow.sol";
+import "../interfaces/IAddressRegistry.sol";
+import "../utils/RegistryKeys.sol";
 import "../interfaces/IDealEscrow.sol";
 import "../types/TransferTypes.sol";
 
@@ -70,8 +72,8 @@ contract TransferEscrow is
     uint256 public constant HIJACK_FAIL_PENALTY_BPS  = 200;
     uint256 public constant HIJACK_STALL_PENALTY_BPS    = 500;
     // I cap salary guarantee months — a value like 10000 would produce an
-    // unfundable salaryGuaranteeAmount that locks the deal in FUNDING_PENDING permanently
-    uint256 public constant MAX_SALARY_GUARANTEE_MONTHS = 24;
+    // unfundable signingBonusAmount that locks the deal in FUNDING_PENDING permanently
+    uint256 public constant MAX_SIGNING_BONUS_MONTHS = 24;
 
     // ─── Enums ────────────────────────────────────────────────────────────────
 
@@ -112,7 +114,9 @@ contract TransferEscrow is
         address   sellerAgent;
         uint256   buyerAgentBps;
         address   buyerAgent;
-        uint256   salaryGuaranteeMonths;
+        uint256   signingBonusMonths;
+        uint256[] installmentAmounts;
+        uint256[] installmentDueDates;
         uint256   submittedAt;
         uint256   updatedAt;
         uint256   roundNumber;
@@ -130,7 +134,7 @@ contract TransferEscrow is
     uint256 private _offerIdCounter;
 
     IPlayerRegistry public playerRegistry;
-    ITransferWindow public transferWindow;
+    IAddressRegistry public addressRegistry;
     IDealEscrow     public dealEscrow;
 
     address public treasury;
@@ -211,13 +215,13 @@ contract TransferEscrow is
 
     function initialize(
         address _playerRegistry,
-        address _transferWindow,
+        address _addressRegistry,
         address _dealEscrow,
         address _treasury,
         address _admin
     ) external initializer {
         if (_playerRegistry == address(0)) revert InvalidAddress();
-        if (_transferWindow  == address(0)) revert InvalidAddress();
+        if (_addressRegistry == address(0)) revert InvalidAddress();
         if (_dealEscrow      == address(0)) revert InvalidAddress();
         if (_treasury        == address(0)) revert InvalidAddress();
         if (_admin           == address(0)) revert InvalidAddress();
@@ -227,7 +231,7 @@ contract TransferEscrow is
         _reentrancyStatus = _NOT_ENTERED;
 
         playerRegistry = IPlayerRegistry(_playerRegistry);
-        transferWindow = ITransferWindow(_transferWindow);
+        addressRegistry = IAddressRegistry(_addressRegistry);
         dealEscrow     = IDealEscrow(_dealEscrow);
         treasury       = _treasury;
 
@@ -372,7 +376,7 @@ contract TransferEscrow is
         onlyApprovedToken(paymentToken)
         returns (uint256 offerId)
     {
-        if (!transferWindow.isWindowOpen())                   revert TransferWindowClosed();
+        if (!ITransferWindow(addressRegistry.get(RegistryKeys.TRANSFER_WINDOW)).isWindowOpen())                   revert TransferWindowClosed();
         if (_playerOffer[playerId] != 0)                      revert PlayerHasActiveOffer();
         // I check DealEscrow for active deal — it owns _playerDeal after split
         if (dealEscrow.getPlayerDeal(playerId) != 0)          revert PlayerHasActiveDeal();
@@ -484,9 +488,9 @@ contract TransferEscrow is
         if (bid.isCounterFromSeller) revert NotYourTurnToCounter();
 
         IPlayerRegistry.Player memory player = playerRegistry.getPlayer(offer.playerId);
-        uint256 salaryGuaranteeAmount = 0;
-        if (bid.salaryGuaranteeMonths > 0 && player.weeklySalary > 0) {
-            salaryGuaranteeAmount = player.weeklySalary * 4 * bid.salaryGuaranteeMonths;
+        uint256 signingBonusAmount = 0;
+        if (bid.signingBonusMonths > 0 && player.weeklySalary > 0) {
+            signingBonusAmount = player.weeklySalary * 4 * bid.signingBonusMonths;
         }
 
         // I build params struct to avoid stack-too-deep on initializeDeal
@@ -503,10 +507,12 @@ contract TransferEscrow is
             sellerAgent:               bid.sellerAgent,
             buyerAgentBps:             bid.buyerAgentBps,
             buyerAgent:                bid.buyerAgent,
-            salaryGuaranteeMonths:     bid.salaryGuaranteeMonths,
-            salaryGuaranteeAmount:     salaryGuaranteeAmount,
+            signingBonusMonths:     bid.signingBonusMonths,
+            signingBonusAmount:     signingBonusAmount,
             minimumHijackIncrementBps: offer.minimumHijackIncrementBps,
-            consentWindowDuration:     consentWindow
+            consentWindowDuration:     consentWindow,
+            installmentAmounts:        bid.installmentAmounts,
+            installmentDueDates:       bid.installmentDueDates
         });
 
         // I get add-ons from offer storage to pass to DealEscrow
@@ -558,15 +564,17 @@ contract TransferEscrow is
     // ─── Buying Club Functions ────────────────────────────────────────────────
 
     function submitBid(
-        uint256 offerId,
-        uint256 transferFee,
-        uint256 sellOnBps,
-        address sellOnRecipient,
-        uint256 sellerAgentBps,
-        address sellerAgent,
-        uint256 buyerAgentBps,
-        address buyerAgent,
-        uint256 salaryGuaranteeMonths
+        uint256   offerId,
+        uint256   transferFee,
+        uint256   sellOnBps,
+        address   sellOnRecipient,
+        uint256   sellerAgentBps,
+        address   sellerAgent,
+        uint256   buyerAgentBps,
+        address   buyerAgent,
+        uint256   signingBonusMonths,
+        uint256[] calldata installmentAmounts,
+        uint256[] calldata installmentDueDates
     )
         external whenNotPaused nonReentrant onlyRole(CLUB_ROLE) offerExists(offerId) notBanned
     {
@@ -586,30 +594,48 @@ contract TransferEscrow is
         if (buyerAgentBps > MAX_AGENT_BPS)                                   revert InvalidBps();
         if (buyerAgentBps > 0 && buyerAgent == address(0))                   revert InvalidAddress();
         // I cap salary guarantee months — 24 months covers any realistic guarantee clause
-        if (salaryGuaranteeMonths > MAX_SALARY_GUARANTEE_MONTHS)             revert InvalidAmount();
+        if (signingBonusMonths > MAX_SIGNING_BONUS_MONTHS)             revert InvalidAmount();
+        // I validate installment schedule upfront — DealEscrow will re-validate but fail early here
+        if (installmentAmounts.length == 0 || installmentAmounts.length > 8) revert InvalidAmount();
+        if (installmentDueDates.length != installmentAmounts.length)          revert InvalidAmount();
+        uint256 _instSum = 0;
+        for (uint256 i = 0; i < installmentAmounts.length; i++) {
+            if (installmentAmounts[i] == 0) revert InvalidAmount();
+            // I require due dates to be in the future and strictly increasing
+            if (i == 0 && installmentDueDates[0] < block.timestamp) revert InvalidAmount();
+            if (i > 0 && installmentDueDates[i] <= installmentDueDates[i-1]) revert InvalidAmount();
+            _instSum += installmentAmounts[i];
+        }
+        if (_instSum != transferFee) revert InvalidAmount();
 
         BidStatus status = offer.activeNegotiations < MAX_ACTIVE_NEGOTIATIONS
             ? BidStatus.NEGOTIATING
             : BidStatus.PENDING;
 
-        _bids[offerId][msg.sender] = Bid({
-            offerId:               offerId,
-            buyingClub:            msg.sender,
-            paymentToken:          offer.paymentToken,
-            transferFee:           transferFee,
-            sellOnBps:             sellOnBps,
-            sellOnRecipient:       sellOnRecipient,
-            sellerAgentBps:        sellerAgentBps,
-            sellerAgent:           sellerAgent,
-            buyerAgentBps:         buyerAgentBps,
-            buyerAgent:            buyerAgent,
-            salaryGuaranteeMonths: salaryGuaranteeMonths,
-            submittedAt:           block.timestamp,
-            updatedAt:             block.timestamp,
-            roundNumber:           0,
-            isCounterFromSeller:   false,
-            status:                status
-        });
+        Bid storage newBid = _bids[offerId][msg.sender];
+        newBid.offerId               = offerId;
+        newBid.buyingClub            = msg.sender;
+        newBid.paymentToken          = offer.paymentToken;
+        newBid.transferFee           = transferFee;
+        newBid.sellOnBps             = sellOnBps;
+        newBid.sellOnRecipient       = sellOnRecipient;
+        newBid.sellerAgentBps        = sellerAgentBps;
+        newBid.sellerAgent           = sellerAgent;
+        newBid.buyerAgentBps         = buyerAgentBps;
+        newBid.buyerAgent            = buyerAgent;
+        newBid.signingBonusMonths = signingBonusMonths;
+        newBid.submittedAt           = block.timestamp;
+        newBid.updatedAt             = block.timestamp;
+        newBid.roundNumber           = 0;
+        newBid.isCounterFromSeller   = false;
+        newBid.status                = status;
+        // I copy arrays explicitly — Solidity can't assign dynamic arrays in struct literals
+        delete newBid.installmentAmounts;
+        delete newBid.installmentDueDates;
+        for (uint256 i = 0; i < installmentAmounts.length; i++) {
+            newBid.installmentAmounts.push(installmentAmounts[i]);
+            newBid.installmentDueDates.push(installmentDueDates[i]);
+        }
 
         if (existing.submittedAt == 0) _bidders[offerId].push(msg.sender);
         _bidCount[offerId]++;
@@ -643,7 +669,7 @@ contract TransferEscrow is
         if (newSellerAgentBps > 0 && newSellerAgent == address(0)) revert InvalidAddress();
         if (newBuyerAgentBps > MAX_AGENT_BPS)                                 revert InvalidBps();
         if (newBuyerAgentBps > 0 && newBuyerAgent == address(0))              revert InvalidAddress();
-        if (newSalaryGuaranteeMonths > MAX_SALARY_GUARANTEE_MONTHS)           revert InvalidAmount();
+        if (newSalaryGuaranteeMonths > MAX_SIGNING_BONUS_MONTHS)           revert InvalidAmount();
 
         bid.transferFee           = newTransferFee;
         bid.sellOnBps             = newSellOnBps;
@@ -652,7 +678,7 @@ contract TransferEscrow is
         bid.sellerAgent           = newSellerAgent;
         bid.buyerAgentBps         = newBuyerAgentBps;
         bid.buyerAgent            = newBuyerAgent;
-        bid.salaryGuaranteeMonths = newSalaryGuaranteeMonths;
+        bid.signingBonusMonths = newSalaryGuaranteeMonths;
         bid.roundNumber++;
         bid.isCounterFromSeller   = false;
         bid.updatedAt             = block.timestamp;
@@ -729,7 +755,7 @@ contract TransferEscrow is
         uint256 transferFee,
         uint256 buyerAgentBps,
         address buyerAgent,
-        uint256 salaryGuaranteeMonths
+        uint256 signingBonusMonths
     )
         external
         whenNotPaused
@@ -759,7 +785,7 @@ contract TransferEscrow is
 
         // I record the bid in DealEscrow storage after funds arrive
         dealEscrow.receiveHijackBid(
-            dealId, msg.sender, transferFee, buyerAgentBps, buyerAgent, salaryGuaranteeMonths
+            dealId, msg.sender, transferFee, buyerAgentBps, buyerAgent, signingBonusMonths
         );
     }
 

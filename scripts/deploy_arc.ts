@@ -119,6 +119,51 @@ async function main() {
   console.log(`DEAL_ESCROW:      ${await dealProxy.getAddress()}`);
   console.log(`TRANSFER_ESCROW:  ${await teProxy.getAddress()}`);
   console.log(`RELEASE_ESCROW:   ${await releaseProxy.getAddress()}`);
+
+  // 8. SwapEscrow (UUPS proxy)
+  const SwapEscrowF = await ethers.getContractFactory("SwapEscrow");
+  const swapImpl    = await SwapEscrowF.deploy();
+  await swapImpl.waitForDeployment();
+  const swapInit    = swapImpl.interface.encodeFunctionData("initialize", [
+    await registry.getAddress(),
+    await window.getAddress(),
+    await escrow.getAddress(),
+    deployer.address,
+    deployer.address,
+  ]);
+  const swapProxy   = await Proxy.deploy(await swapImpl.getAddress(), swapInit);
+  await swapProxy.waitForDeployment();
+  const swapEscrow  = SwapEscrowF.attach(await swapProxy.getAddress());
+  console.log("SwapEscrow proxy:", await swapProxy.getAddress());
+
+  // 9. FreeTransferEscrow (UUPS proxy)
+  const FreeTransferF = await ethers.getContractFactory("FreeTransferEscrow");
+  const freeImpl      = await FreeTransferF.deploy();
+  await freeImpl.waitForDeployment();
+  const freeInit      = freeImpl.interface.encodeFunctionData("initialize", [
+    await registry.getAddress(),
+    await window.getAddress(),
+    await escrow.getAddress(),
+    deployer.address,
+    deployer.address,
+  ]);
+  const freeProxy     = await Proxy.deploy(await freeImpl.getAddress(), freeInit);
+  await freeProxy.waitForDeployment();
+  const freeEscrow    = FreeTransferF.attach(await freeProxy.getAddress());
+  console.log("FreeTransferEscrow proxy:", await freeProxy.getAddress());
+
+  // 10. Grant ESCROW_ROLE to new contracts
+  await registry.grantRole(ESCROW_ROLE, await swapEscrow.getAddress());
+  await registry.grantRole(ESCROW_ROLE, await freeEscrow.getAddress());
+
+  // 11. Whitelist tokens on new contracts
+  for (const token of [EURC, USDC]) {
+    await swapEscrow.approveToken(token);
+    await freeEscrow.approveToken(token);
+  }
+  console.log("Roles and tokens set for SwapEscrow + FreeTransferEscrow.");
+  console.log(`SWAP_ESCROW:           ${await swapProxy.getAddress()}`);
+  console.log(`FREE_TRANSFER_ESCROW:  ${await freeProxy.getAddress()}`);
 }
 
 main().catch(e => { console.error(e); process.exit(1); });

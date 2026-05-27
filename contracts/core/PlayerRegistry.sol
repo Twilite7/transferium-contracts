@@ -1,616 +1,880 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
-import "@openzeppelin/contracts/access/AccessControl.sol";
-import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC721/ERC721Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/utils/Base64.sol";
-import "@openzeppelin/contracts/utils/Strings.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "../interfaces/IPlayerRegistry.sol";
 
+interface IPlayerTokenURIRenderer {
+    function render(
+        IPlayerRegistry.Player memory p,
+        IPlayerRegistry.LegalDocuments memory ld
+    ) external pure returns (string memory);
+}
+
+interface ITerminationManager {
+    function clearTermination(uint256 playerId) external;
+}
+
 /**
- * @title PlayerRegistry
+ * @title  PlayerRegistry
  * @author Transferium Protocol
- * @notice ERC-721 player registration for professional football.
- *         Each player is an NFT. The token owner is the registered club.
- * @dev Security-first:
- *      - Direct ERC-721 transfers blocked — only ESCROW_ROLE can move tokens
- *      - Medical clearance + legal document verification required before listing
- *      - Player wallet set by registrar, updatable by player themselves
- *      - Portrait stored as IPFS CID — frontend prepends gateway, no URL lock-in
- *      - ESCROW_ROLE must be granted post-deployment to TransferEscrow and LoanEscrow
+ * @notice ERC-721 registry for professional football players.
+ *         Each NFT = one registered player. Ownership = current club.
+ *
+ * @dev    UUPS upgradeable. Call initialize() on the proxy after deployment.
+ *
+ *         Verification logic lives in VerificationManager (VERIFICATION_ROLE).
+ *         Termination logic lives in TerminationManager (ESCROW_ROLE).
+ *         Grant both roles after deploying the satellite contracts.
  */
-contract PlayerRegistry is IPlayerRegistry, ERC721, AccessControl, Pausable, ReentrancyGuard {
-    using Strings for uint256;
+contract PlayerRegistry is
+    IPlayerRegistry,
+    Initializable,
+    ERC721Upgradeable,
+    AccessControlUpgradeable,
+    PausableUpgradeable,
+    ReentrancyGuard,
+    UUPSUpgradeable
+{
+    using SafeERC20 for IERC20;
 
     // ─── Roles ────────────────────────────────────────────────────────────────
-    bytes32 public constant ADMIN_ROLE     = keccak256("ADMIN_ROLE");
-    bytes32 public constant CLUB_ROLE      = keccak256("CLUB_ROLE");
-    bytes32 public constant REGISTRAR_ROLE = keccak256("REGISTRAR_ROLE");
-    bytes32 public constant ESCROW_ROLE    = keccak256("ESCROW_ROLE");
+
+    bytes32 public constant ADMIN_ROLE        = keccak256("ADMIN_ROLE");
+    bytes32 public constant REGISTRAR_ROLE    = keccak256("REGISTRAR_ROLE");
+    bytes32 public constant CLUB_ROLE         = keccak256("CLUB_ROLE");
+    bytes32 public constant ESCROW_ROLE       = keccak256("ESCROW_ROLE");
+    bytes32 public constant LEAGUE_ROLE       = keccak256("LEAGUE_ROLE");
+    bytes32 public constant VERIFICATION_ROLE = keccak256("VERIFICATION_ROLE");
 
     // ─── Constants ────────────────────────────────────────────────────────────
-    uint256 public constant MAX_FEE        = 10_000 ether;
-    uint256 public constant MAX_PRICE      = 500_000_000 ether;
-    uint256 public constant MAX_STRING_LEN = 64;
-    uint256 public constant MAX_WITHDRAW   = 1_000 ether;
-    uint256 public constant MAX_SALARY     = 10_000_000 ether;
 
-    // ─── State ────────────────────────────────────────────────────────────────
-    uint256 private _playerIdCounter;
+    uint256 public constant MAX_FEE                    = 10_000 * 1e6;
+    uint256 public constant MAX_PROTOCOL_FEE_BPS       = 2_000;
+    uint256 public constant MAX_REGISTRAR_FEE_EXCESS   = 2_000;
+    uint256 public constant WALLET_UPDATE_TIMELOCK     = 48 hours;
+    uint256 public constant FEE_SCHEDULE_DELAY         = 10 days;
+    uint256 public constant TREASURY_UPDATE_DELAY      = 48 hours;
+    uint256 public constant MAX_NAME_LENGTH            = 64;
 
-    uint256 public registrationFee;
-    uint256 public listingFee;
+    // ─── External contracts ───────────────────────────────────────────────────
 
-    mapping(uint256 => Player)          private _players;
-    mapping(uint256 => LegalDocuments)  private _legalDocs;
-    mapping(address => uint256[])       private _clubPlayers;
-    mapping(uint256 => uint256)         private _playerIndexInClub;
-    mapping(bytes32 => bool)            private _playerExists;
-    mapping(bytes32 => bool)            private _usedDocumentHashes;
-    mapping(address => bool)            private _usedPlayerWallets;
+    IERC20                  public EURC;
+    IPlayerTokenURIRenderer public tokenURIRenderer;
+    address                 public terminationManager;
 
-    // ─── Events ───────────────────────────────────────────────────────────────
-    event RegistrationFeeUpdated(uint256 oldFee, uint256 newFee);
-    event ListingFeeUpdated(uint256 oldFee, uint256 newFee);
-    event FeesWithdrawn(address indexed to, uint256 amount);
-    // I emit the full CID so indexers can update off-chain metadata without
-    // reading storage separately
-    event PortraitUpdated(uint256 indexed playerId, string cid);
+    // ─── Protocol fees ────────────────────────────────────────────────────────
+
+    uint64  public registrationFee;
+    uint64  public listingFee;
+    uint64  public baseVerificationFee;
+    uint16  public protocolFeeBps;
+
+    uint64  private _pendingBaseVerificationFee;
+    uint256 private _pendingBaseVerificationFeeEffectiveAt;
+
+    // ─── Protocol treasury ────────────────────────────────────────────────────
+
+    address public  protocolTreasury;
+    address private _pendingProtocolTreasury;
+    uint256 private _pendingProtocolTreasuryEffectiveAt;
+
+    // ─── Fee accumulator ──────────────────────────────────────────────────────
+
+    uint256 public  protocolFeesAccumulated;
+
+    // ─── Pause accounting ─────────────────────────────────────────────────────
+
+    uint256 private _pausedAt;
+    uint256 public  totalPausedDuration;
+
+    // ─── Player state ─────────────────────────────────────────────────────────
+
+    uint256 public  totalPlayers;
+
+    mapping(uint256 => Player)         private _players;
+    mapping(uint256 => LegalDocuments) private _legalDocs;
+    mapping(address => uint256[])      private _clubPlayers;
+    mapping(bytes32  => bool)          private _usedPlayerHashes;
+    mapping(bytes32  => bool)          private _usedDocumentHashes;
+    mapping(bytes32  => bool)          private _usedFifaIds;
+
+    // ─── Verification gate ────────────────────────────────────────────────────
+    // Full VerificationRequest state lives in VerificationManager.
+    // PlayerRegistry only tracks the active gate so document/wallet setters
+    // can guard against mid-verification modifications cheaply.
+
+    mapping(uint256 => bool) public  verificationActive;
+
+    // ─── Club state ───────────────────────────────────────────────────────────
+
+    mapping(address => string)  private _clubNames;
+    mapping(address => address) private _clubRegistrar;
+
+    // ─── Registrar state ──────────────────────────────────────────────────────
+
+    mapping(address => uint256) private _registrarFee;
+    mapping(address => uint256) private _registrarClaimable;
+
+    // ─── Wallet update state ──────────────────────────────────────────────────
+
+    mapping(uint256 => WalletUpdateRequest) private _walletUpdateRequests;
+
+    // ─── Storage gap ──────────────────────────────────────────────────────────
+
+    uint256[50] private __gap;
 
     // ─── Errors ───────────────────────────────────────────────────────────────
-    error InvalidString();
-    error PlayerNotFound();
-    error PlayerAlreadyExists();
-    error PlayerAlreadyVerified();
-    error PlayerNotVerified();
-    error PlayerAlreadyListed();
-    error PlayerNotListed();
-    error NotPlayerClub();
-    error InvalidPrice();
-    error InvalidFee();
-    error InvalidAddress();
-    error InsufficientPayment();
-    error ContractExpired();
-    error WithdrawFailed();
-    error WithdrawAmountTooLarge();
-    error InsufficientBalance();
-    error DirectTransferBlocked();
-    error MedicalClearanceRequired();
-    error LegalDocsNotVerified();
-    error InvalidExpiry();
-    error MedicalAlreadyCleared();
-    error DocumentsAlreadyVerified();
-    error PlayerWalletNotSet();
-    error NotPlayerWallet();
-    error InvalidSalary();
-    // I declare NotAuthorised separately from NotPlayerClub so callers know
-    // whether the rejection is club-level or wallet-level
-    error NotAuthorised();
 
-    // ─── Constructor ──────────────────────────────────────────────────────────
-    constructor(uint256 _registrationFee, uint256 _listingFee)
-        ERC721("Transferium Player", "TPLYR")
-    {
-        if (_registrationFee > MAX_FEE) revert InvalidFee();
-        if (_listingFee > MAX_FEE) revert InvalidFee();
+    error ZeroAddress();
+    error ZeroAmount();
+    error EmptyString();
 
-        registrationFee = _registrationFee;
-        listingFee      = _listingFee;
+    error PlayerDoesNotExist(uint256 playerId);
+    error PlayerAlreadyRegistered(bytes32 playerHash);
+    error FifaIdAlreadyRegistered(bytes32 fifaId);
+    error FifaIdRequired();
+    error NameTooLong(uint256 length, uint256 max);
 
-        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
-        _grantRole(ADMIN_ROLE, msg.sender);
-        _grantRole(REGISTRAR_ROLE, msg.sender);
-    }
+    error CallerIsNotPlayerClub(uint256 playerId, address caller);
+    error CallerIsNotPlayerWallet(uint256 playerId, address caller);
+    error RegistrarNotAssignedToClub(address club);
+    error RegistrarNotRegistered(address registrar);
+    error RegistrarAlreadyRegistered(address registrar);
 
-    // ─── ERC-721 Transfer Block ───────────────────────────────────────────────
+    error ClubAlreadyRegistered(address club);
+    error ClubNotRegistered(address club);
+    error ClubHasActivePlayers(address club, uint256 count);
 
-    /**
-     * @notice Block all direct ERC-721 transfers.
-     * @dev Only ESCROW_ROLE contracts can move player tokens via escrowTransfer().
-     */
-    function _update(address to, uint256 tokenId, address auth)
-        internal
-        override
-        returns (address)
-    {
-        address from = _ownerOf(tokenId);
-        if (from != address(0) && !hasRole(ESCROW_ROLE, msg.sender)) {
-            revert DirectTransferBlocked();
-        }
-        return super._update(to, tokenId, auth);
-    }
+    error VerificationAlreadyActive(uint256 playerId);
+
+    error HashAlreadyUsed(bytes32 hash);
+    error HashesNotDistinct();
+    error InvalidHashZero();
+
+    error PlayerNotVerified(uint256 playerId);
+    error PlayerAlreadyListed(uint256 playerId);
+    error PlayerNotListed(uint256 playerId);
+
+    error FeeTooHigh(uint256 provided, uint256 max);
+    error FeeBpsTooHigh(uint256 provided, uint256 max);
+    error RegistrarFeeTooHigh(uint256 provided, uint256 maxAllowed);
+    error NothingToWithdraw();
+    error InsufficientProtocolBalance(uint256 requested, uint256 available);
+    error NoPendingFeeSchedule();
+    error FeeScheduleNotReady(uint256 effectiveAt, uint256 now_);
+
+    error NoPendingTreasuryUpdate();
+    error TreasuryUpdateNotReady(uint256 effectiveAt, uint256 now_);
+
+    error WalletUpdateAlreadyPending(uint256 playerId);
+    error NoWalletUpdatePending(uint256 playerId);
+    error WalletUpdateNotReady(uint256 playerId, uint256 adjustedExecutable, uint256 now_);
+    error WalletUpdateAlreadySet(uint256 playerId, address wallet);
+
+    error DirectTransferNotAllowed();
 
     // ─── Modifiers ────────────────────────────────────────────────────────────
-    modifier validString(string calldata s) {
-        if (bytes(s).length == 0 || bytes(s).length > MAX_STRING_LEN) revert InvalidString();
-        _;
-    }
 
     modifier playerExists(uint256 playerId) {
-        if (_players[playerId].registeredAt == 0) revert PlayerNotFound();
+        if (_players[playerId].id == 0) revert PlayerDoesNotExist(playerId);
         _;
     }
 
     modifier onlyPlayerClub(uint256 playerId) {
-        if (ownerOf(playerId) != msg.sender) revert NotPlayerClub();
+        if (ownerOf(playerId) != msg.sender)
+            revert CallerIsNotPlayerClub(playerId, msg.sender);
         _;
     }
 
-    // ─── Club Functions ───────────────────────────────────────────────────────
+    modifier onlyPlayerWallet(uint256 playerId) {
+        if (_players[playerId].playerWallet != msg.sender)
+            revert CallerIsNotPlayerWallet(playerId, msg.sender);
+        _;
+    }
 
-    /**
-     * @notice Register a new player and mint their NFT to the registering club.
-     * @dev portraitCID is the IPFS CID of the player portrait image.
-     *      Pass empty string if not yet available — updateable later via setPortrait().
-     */
-    function registerPlayer(
-        string calldata name,
-        string calldata position,
-        string calldata nationality,
-        uint256 contractExpiry,
-        uint256 weeklySalary,
-        string calldata portraitCID
-    )
-        external
-        payable
-        whenNotPaused
-        nonReentrant
-        onlyRole(CLUB_ROLE)
-        validString(name)
-        validString(position)
-        validString(nationality)
-        returns (uint256 playerId)
+    // ─── Constructor & initializer ────────────────────────────────────────────
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize(
+        address eurc_,
+        uint64  registrationFee_,
+        uint64  listingFee_,
+        address treasury_
+    ) external initializer {
+        if (eurc_     == address(0)) revert ZeroAddress();
+        if (treasury_ == address(0)) revert ZeroAddress();
+        if (registrationFee_ > MAX_FEE) revert FeeTooHigh(registrationFee_, MAX_FEE);
+        if (listingFee_      > MAX_FEE) revert FeeTooHigh(listingFee_,      MAX_FEE);
+
+        __ERC721_init("Transferium Player", "TRFP");
+        __AccessControl_init();
+        __Pausable_init();
+
+        EURC             = IERC20(eurc_);
+        registrationFee  = registrationFee_;
+        listingFee       = listingFee_;
+        protocolTreasury = treasury_;
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(ADMIN_ROLE,         msg.sender);
+    }
+
+    function _authorizeUpgrade(address) internal override onlyRole(ADMIN_ROLE) {}
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ADMIN — Role management
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function registerClub(address club, string calldata name, address registrar)
+        external onlyRole(ADMIN_ROLE)
     {
-        if (msg.value != registrationFee) revert InsufficientPayment();
-        if (contractExpiry <= block.timestamp) revert ContractExpired();
-        if (weeklySalary > MAX_SALARY) revert InvalidSalary();
+        if (club      == address(0))              revert ZeroAddress();
+        if (registrar == address(0))              revert ZeroAddress();
+        if (bytes(name).length == 0)              revert EmptyString();
+        if (bytes(name).length > MAX_NAME_LENGTH) revert NameTooLong(bytes(name).length, MAX_NAME_LENGTH);
+        if (hasRole(CLUB_ROLE, club))             revert ClubAlreadyRegistered(club);
+        if (!hasRole(REGISTRAR_ROLE, registrar))  revert RegistrarNotRegistered(registrar);
 
-        bytes32 playerHash = keccak256(abi.encodePacked(name, msg.sender));
-        if (_playerExists[playerHash]) revert PlayerAlreadyExists();
+        _grantRole(CLUB_ROLE, club);
+        _clubNames[club]     = name;
+        _clubRegistrar[club] = registrar;
+        emit ClubRegistered(club, name, registrar);
+    }
 
-        _playerIdCounter++;
-        playerId = _playerIdCounter;
+    function deregisterClub(address club) external onlyRole(ADMIN_ROLE) {
+        if (!hasRole(CLUB_ROLE, club))     revert ClubNotRegistered(club);
+        if (_clubPlayers[club].length > 0) revert ClubHasActivePlayers(club, _clubPlayers[club].length);
+        _revokeRole(CLUB_ROLE, club);
+        delete _clubRegistrar[club];
+        delete _clubNames[club];
+        emit ClubDeregistered(club);
+    }
+
+    function grantRegistrarRole(address registrar) external onlyRole(ADMIN_ROLE) {
+        if (registrar == address(0))            revert ZeroAddress();
+        if (hasRole(REGISTRAR_ROLE, registrar)) revert RegistrarAlreadyRegistered(registrar);
+        _grantRole(REGISTRAR_ROLE, registrar);
+        emit RegistrarRoleGranted(registrar);
+    }
+
+    function revokeRegistrarRole(address registrar) external onlyRole(ADMIN_ROLE) {
+        if (!hasRole(REGISTRAR_ROLE, registrar)) revert RegistrarNotRegistered(registrar);
+        _revokeRole(REGISTRAR_ROLE, registrar);
+        emit RegistrarRoleRevoked(registrar);
+    }
+
+    function grantLeagueRole(address league) external onlyRole(ADMIN_ROLE) {
+        if (league == address(0)) revert ZeroAddress();
+        _grantRole(LEAGUE_ROLE, league);
+    }
+
+    function revokeLeagueRole(address league) external onlyRole(ADMIN_ROLE) {
+        _revokeRole(LEAGUE_ROLE, league);
+    }
+
+    function grantEscrowRole(address escrow) external onlyRole(ADMIN_ROLE) {
+        if (escrow == address(0)) revert ZeroAddress();
+        _grantRole(ESCROW_ROLE, escrow);
+    }
+
+    function grantVerificationRole(address verifier) external onlyRole(ADMIN_ROLE) {
+        if (verifier == address(0)) revert ZeroAddress();
+        _grantRole(VERIFICATION_ROLE, verifier);
+    }
+
+    // ─── Admin setters ────────────────────────────────────────────────────────
+
+    function setTokenURIRenderer(address renderer) external onlyRole(ADMIN_ROLE) {
+        if (renderer == address(0)) revert ZeroAddress();
+        tokenURIRenderer = IPlayerTokenURIRenderer(renderer);
+    }
+
+    function setTerminationManager(address mgr) external onlyRole(ADMIN_ROLE) {
+        if (mgr == address(0)) revert ZeroAddress();
+        terminationManager = mgr;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ADMIN — Fee configuration
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function setRegistrationFee(uint64 fee) external onlyRole(ADMIN_ROLE) {
+        if (fee > MAX_FEE) revert FeeTooHigh(fee, MAX_FEE);
+        registrationFee = fee;
+        emit RegistrationFeeSet(fee);
+    }
+
+    function setListingFee(uint64 fee) external onlyRole(ADMIN_ROLE) {
+        if (fee > MAX_FEE) revert FeeTooHigh(fee, MAX_FEE);
+        listingFee = fee;
+        emit ListingFeeSet(fee);
+    }
+
+    function setProtocolFeeBps(uint16 bps) external onlyRole(ADMIN_ROLE) {
+        if (bps > MAX_PROTOCOL_FEE_BPS) revert FeeBpsTooHigh(bps, MAX_PROTOCOL_FEE_BPS);
+        protocolFeeBps = bps;
+        emit ProtocolFeeBpsSet(bps);
+    }
+
+    function scheduleBaseVerificationFee(uint64 newFee) external onlyRole(ADMIN_ROLE) {
+        if (newFee > MAX_FEE) revert FeeTooHigh(newFee, MAX_FEE);
+        _pendingBaseVerificationFee            = newFee;
+        _pendingBaseVerificationFeeEffectiveAt = block.timestamp + FEE_SCHEDULE_DELAY;
+        emit BaseVerificationFeeScheduled(newFee, _pendingBaseVerificationFeeEffectiveAt);
+    }
+
+    function activateBaseVerificationFee() external {
+        if (_pendingBaseVerificationFeeEffectiveAt == 0)        revert NoPendingFeeSchedule();
+        if (block.timestamp < _pendingBaseVerificationFeeEffectiveAt)
+            revert FeeScheduleNotReady(_pendingBaseVerificationFeeEffectiveAt, block.timestamp);
+        baseVerificationFee                    = _pendingBaseVerificationFee;
+        _pendingBaseVerificationFeeEffectiveAt = 0;
+        emit BaseVerificationFeeActivated(baseVerificationFee);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ADMIN — Treasury management
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function scheduleProtocolTreasuryUpdate(address newTreasury) external onlyRole(ADMIN_ROLE) {
+        if (newTreasury == address(0)) revert ZeroAddress();
+        _pendingProtocolTreasury            = newTreasury;
+        _pendingProtocolTreasuryEffectiveAt = block.timestamp + TREASURY_UPDATE_DELAY;
+        emit ProtocolTreasuryUpdateScheduled(newTreasury, _pendingProtocolTreasuryEffectiveAt);
+    }
+
+    function executeProtocolTreasuryUpdate() external onlyRole(ADMIN_ROLE) {
+        if (_pendingProtocolTreasuryEffectiveAt == 0)
+            revert NoPendingTreasuryUpdate();
+        if (block.timestamp < _pendingProtocolTreasuryEffectiveAt)
+            revert TreasuryUpdateNotReady(_pendingProtocolTreasuryEffectiveAt, block.timestamp);
+        address old      = protocolTreasury;
+        protocolTreasury = _pendingProtocolTreasury;
+        _pendingProtocolTreasuryEffectiveAt = 0;
+        emit ProtocolTreasuryUpdated(old, protocolTreasury);
+    }
+
+    function withdrawFees(uint256 amount) external onlyRole(ADMIN_ROLE) nonReentrant {
+        if (amount == 0)                       revert ZeroAmount();
+        if (amount > protocolFeesAccumulated) revert InsufficientProtocolBalance(amount, protocolFeesAccumulated);
+        protocolFeesAccumulated -= amount;
+        EURC.safeTransfer(protocolTreasury, amount);
+        emit FeesWithdrawn(protocolTreasury, amount);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ADMIN — Pause
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function pause() external onlyRole(ADMIN_ROLE) {
+        _pausedAt = block.timestamp;
+        _pause();
+    }
+
+    function unpause() external onlyRole(ADMIN_ROLE) {
+        if (_pausedAt != 0) {
+            totalPausedDuration += block.timestamp - _pausedAt;
+            _pausedAt = 0;
+        }
+        _unpause();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // REGISTRAR — Fee & earnings
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function setVerificationFee(uint256 fee) external onlyRole(REGISTRAR_ROLE) {
+        if (fee > MAX_FEE) revert FeeTooHigh(fee, MAX_FEE);
+        if (baseVerificationFee > 0) {
+            uint256 maxAllowed = baseVerificationFee
+                + (uint256(baseVerificationFee) * MAX_REGISTRAR_FEE_EXCESS / 10_000);
+            if (fee > maxAllowed) revert RegistrarFeeTooHigh(fee, maxAllowed);
+        }
+        _registrarFee[msg.sender] = fee;
+        emit VerificationFeeSet(msg.sender, fee);
+    }
+
+    function withdrawRegistrarFees() external onlyRole(REGISTRAR_ROLE) nonReentrant {
+        uint256 amount = _registrarClaimable[msg.sender];
+        if (amount == 0) revert NothingToWithdraw();
+        _registrarClaimable[msg.sender] = 0;
+        EURC.safeTransfer(msg.sender, amount);
+        emit RegistrarFeesWithdrawn(msg.sender, amount);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CLUB — Player registration
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function registerPlayer(
+        string  calldata name,
+        string  calldata position,
+        string  calldata nationality,
+        uint40           contractExpiry,
+        uint256          weeklySalary,
+        bytes32          fifaId
+    ) external onlyRole(CLUB_ROLE) whenNotPaused nonReentrant {
+        if (bytes(name).length == 0)              revert EmptyString();
+        if (bytes(name).length > MAX_NAME_LENGTH) revert NameTooLong(bytes(name).length, MAX_NAME_LENGTH);
+        if (fifaId == bytes32(0))                 revert FifaIdRequired();
+
+        bytes32 playerHash = keccak256(abi.encodePacked(name, msg.sender, fifaId));
+        if (_usedPlayerHashes[playerHash]) revert PlayerAlreadyRegistered(playerHash);
+        if (_usedFifaIds[fifaId])          revert FifaIdAlreadyRegistered(fifaId);
+
+        if (registrationFee > 0) {
+            EURC.safeTransferFrom(msg.sender, address(this), registrationFee);
+            protocolFeesAccumulated += registrationFee;
+        }
+
+        totalPlayers++;
+        uint256 playerId = totalPlayers;
 
         _players[playerId] = Player({
             id:                  playerId,
             name:                name,
             position:            position,
             nationality:         nationality,
-            contractExpiry:      contractExpiry,
             weeklySalary:        weeklySalary,
+            askingPrice:         0,
+            releaseClause:       0,
+            medicalDocumentHash: bytes32(0),
+            fifaId:              fifaId,
             playerWallet:        address(0),
+            contractExpiry:      contractExpiry,
+            registeredAt:        uint40(block.timestamp),
             isVerified:          false,
             isListed:            false,
             medicalClearance:    false,
-            medicalDocumentHash: bytes32(0),
-            askingPrice:         0,
-            releaseClause:       0,
-            registeredAt:        block.timestamp,
-            // I store only the CID — frontend prepends the gateway URL so
-            // switching gateways never requires a contract change
-            portraitCID:         portraitCID
+            medicalVerified:     false,
+            portraitCID:         ""
         });
 
-        _playerIndexInClub[playerId] = _clubPlayers[msg.sender].length;
+        _usedPlayerHashes[playerHash] = true;
+        _usedFifaIds[fifaId]          = true;
         _clubPlayers[msg.sender].push(playerId);
-        _playerExists[playerHash] = true;
 
-        _mint(msg.sender, playerId);
-
+        _safeMint(msg.sender, playerId);
         emit PlayerRegistered(playerId, name, msg.sender);
     }
 
-    /**
-     * @notice Update the IPFS portrait CID for a player.
-     * @dev The current owning club OR the player's own wallet can update.
-     *      Passing empty string clears the portrait.
-     */
-    function setPortrait(uint256 playerId, string calldata cid)
-        external
-        whenNotPaused
-        nonReentrant
-        playerExists(playerId)
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CLUB — Document submission
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function setMedicalClearance(uint256 playerId, bytes32 documentHash)
+        external onlyRole(CLUB_ROLE) onlyPlayerClub(playerId) whenNotPaused playerExists(playerId)
     {
-        address club   = ownerOf(playerId);
-        address wallet = _players[playerId].playerWallet;
-        // I allow either the club holding the NFT or the verified player wallet
-        if (msg.sender != club && msg.sender != wallet) revert NotAuthorised();
-        _players[playerId].portraitCID = cid;
-        emit PortraitUpdated(playerId, cid);
+        if (documentHash == bytes32(0))      revert InvalidHashZero();
+        if (verificationActive[playerId])   revert VerificationAlreadyActive(playerId);
+
+        bytes32 oldHash = _players[playerId].medicalDocumentHash;
+        if (documentHash != oldHash) {
+            if (_usedDocumentHashes[documentHash]) revert HashAlreadyUsed(documentHash);
+            if (oldHash != bytes32(0)) _usedDocumentHashes[oldHash] = false;
+            _usedDocumentHashes[documentHash] = true;
+        }
+
+        _players[playerId].medicalDocumentHash = documentHash;
+        _players[playerId].medicalClearance    = true;
+        _players[playerId].medicalVerified     = false;
+        emit MedicalClearanceSet(playerId, documentHash);
     }
 
-    /**
-     * @notice List a verified player for transfer.
-     * @dev Requires: verified + medical clearance + legal docs verified.
-     */
-    function listPlayer(uint256 playerId, uint256 askingPrice)
-        external
-        payable
-        whenNotPaused
-        nonReentrant
-        onlyRole(CLUB_ROLE)
-        playerExists(playerId)
-        onlyPlayerClub(playerId)
-    {
-        Player storage player = _players[playerId];
-
-        if (!player.isVerified) revert PlayerNotVerified();
-        if (!player.medicalClearance) revert MedicalClearanceRequired();
-        if (!_legalDocs[playerId].documentsVerified) revert LegalDocsNotVerified();
-        if (player.isListed) revert PlayerAlreadyListed();
-        if (askingPrice == 0 || askingPrice > MAX_PRICE) revert InvalidPrice();
-        if (msg.value != listingFee) revert InsufficientPayment();
-        if (player.contractExpiry <= block.timestamp) revert ContractExpired();
-
-        player.isListed    = true;
-        player.askingPrice = askingPrice;
-
-        emit PlayerListed(playerId, askingPrice);
-    }
-
-    function delistPlayer(uint256 playerId)
-        external
-        whenNotPaused
-        nonReentrant
-        onlyRole(CLUB_ROLE)
-        playerExists(playerId)
-        onlyPlayerClub(playerId)
-    {
-        Player storage player = _players[playerId];
-        if (!player.isListed) revert PlayerNotListed();
-
-        player.isListed    = false;
-        player.askingPrice = 0;
-
-        emit PlayerDelisted(playerId);
-    }
-
-    function setReleaseClause(uint256 playerId, uint256 amount)
-        external
-        whenNotPaused
-        nonReentrant
-        onlyRole(CLUB_ROLE)
-        playerExists(playerId)
-        onlyPlayerClub(playerId)
-    {
-        if (amount > MAX_PRICE) revert InvalidPrice();
-        _players[playerId].releaseClause = amount;
-        emit ReleaseClauseSet(playerId, amount);
-    }
-
-    function extendContract(uint256 playerId, uint256 newExpiry)
-        external
-        whenNotPaused
-        nonReentrant
-        onlyRole(CLUB_ROLE)
-        playerExists(playerId)
-        onlyPlayerClub(playerId)
-    {
-        if (newExpiry <= block.timestamp) revert InvalidExpiry();
-        if (newExpiry <= _players[playerId].contractExpiry) revert InvalidExpiry();
-        _players[playerId].contractExpiry = newExpiry;
-        emit ContractExtended(playerId, newExpiry);
-    }
-
-    /**
-     * @notice Club submits legal document hashes for a player.
-     * @dev Documents live off-chain. Hashes are the on-chain proof.
-     *      workPermitHash can be zero for domestic transfers.
-     */
     function submitLegalDocuments(
         uint256 playerId,
         bytes32 registrationContractHash,
-        bytes32 identityDocumentHash,
         bytes32 fifaTMSHash,
         bytes32 workPermitHash
-    )
-        external
-        whenNotPaused
-        nonReentrant
-        onlyRole(CLUB_ROLE)
-        playerExists(playerId)
-        onlyPlayerClub(playerId)
-    {
-        if (registrationContractHash == bytes32(0)) revert InvalidAddress();
-        if (identityDocumentHash == bytes32(0)) revert InvalidAddress();
-        if (fifaTMSHash == bytes32(0)) revert InvalidAddress();
-        if (_usedDocumentHashes[registrationContractHash]) revert InvalidAddress();
-        if (_usedDocumentHashes[identityDocumentHash])     revert InvalidAddress();
-        if (_usedDocumentHashes[fifaTMSHash])              revert InvalidAddress();
-        if (workPermitHash != bytes32(0) && _usedDocumentHashes[workPermitHash]) revert InvalidAddress();
+    ) external onlyRole(CLUB_ROLE) onlyPlayerClub(playerId) whenNotPaused playerExists(playerId) {
+        if (registrationContractHash == bytes32(0)) revert InvalidHashZero();
+        if (fifaTMSHash              == bytes32(0)) revert InvalidHashZero();
+        if (registrationContractHash == fifaTMSHash) revert HashesNotDistinct();
+        if (workPermitHash != bytes32(0) && workPermitHash == registrationContractHash) revert HashesNotDistinct();
+        if (workPermitHash != bytes32(0) && workPermitHash == fifaTMSHash)              revert HashesNotDistinct();
+        if (verificationActive[playerId]) revert VerificationAlreadyActive(playerId);
+
+        LegalDocuments storage existing = _legalDocs[playerId];
+        _releaseDocHash(existing.registrationContractHash, registrationContractHash);
+        _releaseDocHash(existing.fifaTMSHash,              fifaTMSHash);
+        _releaseDocHash(existing.workPermitHash,           workPermitHash);
+
+        if (_usedDocumentHashes[registrationContractHash]) revert HashAlreadyUsed(registrationContractHash);
+        if (_usedDocumentHashes[fifaTMSHash])              revert HashAlreadyUsed(fifaTMSHash);
+        if (workPermitHash != bytes32(0) && _usedDocumentHashes[workPermitHash]) revert HashAlreadyUsed(workPermitHash);
+
+        _usedDocumentHashes[registrationContractHash] = true;
+        _usedDocumentHashes[fifaTMSHash]              = true;
+        if (workPermitHash != bytes32(0)) _usedDocumentHashes[workPermitHash] = true;
 
         _legalDocs[playerId] = LegalDocuments({
             registrationContractHash: registrationContractHash,
-            identityDocumentHash:     identityDocumentHash,
             fifaTMSHash:              fifaTMSHash,
             workPermitHash:           workPermitHash,
             documentsVerified:        false
         });
-        _usedDocumentHashes[registrationContractHash] = true;
-        _usedDocumentHashes[identityDocumentHash]     = true;
-        _usedDocumentHashes[fifaTMSHash]              = true;
-        if (workPermitHash != bytes32(0)) _usedDocumentHashes[workPermitHash] = true;
 
         emit LegalDocumentsSubmitted(playerId);
     }
 
-    // ─── Registrar Functions ──────────────────────────────────────────────────
-
-    function verifyPlayer(uint256 playerId)
-        external
-        whenNotPaused
-        onlyRole(REGISTRAR_ROLE)
-        playerExists(playerId)
+    function setPlayerWallet(uint256 playerId, address wallet)
+        external onlyRole(CLUB_ROLE) onlyPlayerClub(playerId) whenNotPaused playerExists(playerId)
     {
-        if (_players[playerId].isVerified) revert PlayerAlreadyVerified();
-        _players[playerId].isVerified = true;
-        emit PlayerVerified(playerId, msg.sender);
+        if (wallet == address(0))                      revert ZeroAddress();
+        if (_players[playerId].playerWallet == wallet) revert WalletUpdateAlreadySet(playerId, wallet);
+        if (verificationActive[playerId])             revert VerificationAlreadyActive(playerId);
+        _players[playerId].playerWallet = wallet;
+        emit PlayerWalletSet(playerId, wallet);
     }
 
-    function setMedicalClearance(uint256 playerId, bytes32 documentHash)
-        external
-        whenNotPaused
-        nonReentrant
-        onlyRole(REGISTRAR_ROLE)
-        playerExists(playerId)
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CLUB — Listing
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function listPlayer(uint256 playerId, uint256 askingPrice)
+        external onlyRole(CLUB_ROLE) onlyPlayerClub(playerId) whenNotPaused playerExists(playerId)
     {
-        if (documentHash == bytes32(0)) revert InvalidAddress();
-        if (_usedDocumentHashes[documentHash]) revert InvalidAddress();
-        if (_players[playerId].medicalClearance) revert MedicalAlreadyCleared();
+        Player storage p = _players[playerId];
+        if (!p.isVerified) revert PlayerNotVerified(playerId);
+        if (p.isListed)    revert PlayerAlreadyListed(playerId);
 
-        _players[playerId].medicalClearance    = true;
-        _players[playerId].medicalDocumentHash = documentHash;
-        _usedDocumentHashes[documentHash]      = true;
+        if (listingFee > 0) {
+            EURC.safeTransferFrom(msg.sender, address(this), listingFee);
+            protocolFeesAccumulated += listingFee;
+        }
 
-        emit MedicalClearanceSet(playerId, documentHash);
+        p.isListed    = true;
+        p.askingPrice = askingPrice;
+        emit PlayerListed(playerId, askingPrice);
     }
 
-    /**
-     * @notice Registrar verifies submitted legal documents after off-chain review.
-     */
-    function verifyLegalDocuments(uint256 playerId)
-        external
-        whenNotPaused
-        nonReentrant
-        onlyRole(REGISTRAR_ROLE)
-        playerExists(playerId)
+    function delistPlayer(uint256 playerId)
+        external onlyRole(CLUB_ROLE) onlyPlayerClub(playerId) whenNotPaused playerExists(playerId)
     {
-        LegalDocuments storage docs = _legalDocs[playerId];
-        if (docs.documentsVerified) revert DocumentsAlreadyVerified();
-        if (docs.registrationContractHash == bytes32(0)) revert InvalidAddress();
-
-        docs.documentsVerified = true;
-
-        emit LegalDocumentsVerified(playerId, msg.sender);
+        if (!_players[playerId].isListed) revert PlayerNotListed(playerId);
+        _players[playerId].isListed    = false;
+        _players[playerId].askingPrice = 0;
+        emit PlayerDelisted(playerId);
     }
 
-    /**
-     * @notice Registrar sets the player wallet address after identity verification.
-     * @dev Once set, only the player themselves can update it via updatePlayerWallet().
-     */
-    function setPlayerWallet(uint256 playerId, address playerWallet)
-        external
-        whenNotPaused
-        nonReentrant
-        onlyRole(REGISTRAR_ROLE)
-        playerExists(playerId)
+    function updateAskingPrice(uint256 playerId, uint256 askingPrice)
+        external onlyRole(CLUB_ROLE) onlyPlayerClub(playerId) whenNotPaused playerExists(playerId)
     {
-        if (playerWallet == address(0)) revert InvalidAddress();
-        if (_players[playerId].playerWallet != address(0)) revert InvalidAddress();
-        if (_usedPlayerWallets[playerWallet]) revert InvalidAddress();
-
-        _players[playerId].playerWallet = playerWallet;
-        _usedPlayerWallets[playerWallet] = true;
-
-        emit PlayerWalletSet(playerId, playerWallet);
+        if (!_players[playerId].isListed) revert PlayerNotListed(playerId);
+        _players[playerId].askingPrice = askingPrice;
     }
 
-    // ─── Player Functions ─────────────────────────────────────────────────────
-
-    /**
-     * @notice Player updates their own wallet address.
-     * @dev Only callable from the currently registered playerWallet.
-     *      Allows players to rotate wallets without club or registrar involvement.
-     */
-    function updatePlayerWallet(uint256 playerId, address newWallet)
-        external
-        whenNotPaused
-        nonReentrant
-        playerExists(playerId)
+    function setReleaseClause(uint256 playerId, uint256 amount)
+        external onlyRole(CLUB_ROLE) onlyPlayerClub(playerId) whenNotPaused playerExists(playerId)
     {
-        Player storage player = _players[playerId];
-        if (player.playerWallet == address(0)) revert PlayerWalletNotSet();
-        if (player.playerWallet != msg.sender) revert NotPlayerWallet();
-        if (newWallet == address(0)) revert InvalidAddress();
-        if (_usedPlayerWallets[newWallet]) revert InvalidAddress();
-
-        address oldWallet             = player.playerWallet;
-        _usedPlayerWallets[oldWallet] = false;
-        _usedPlayerWallets[newWallet] = true;
-        player.playerWallet           = newWallet;
-
-        emit PlayerWalletUpdated(playerId, oldWallet, newWallet);
+        _players[playerId].releaseClause = amount;
+        emit ReleaseClauseSet(playerId, amount);
     }
 
-    // ─── Escrow Functions ─────────────────────────────────────────────────────
-
-    function escrowTransfer(uint256 playerId, address fromClub, address toClub)
-        external
-        override
-        whenNotPaused
-        nonReentrant
-        onlyRole(ESCROW_ROLE)
-        playerExists(playerId)
+    function extendContract(uint256 playerId, uint40 newExpiry)
+        external onlyRole(CLUB_ROLE) onlyPlayerClub(playerId) whenNotPaused playerExists(playerId)
     {
-        if (toClub == address(0)) revert InvalidAddress();
-        if (fromClub == toClub) revert InvalidAddress();
-        if (ownerOf(playerId) != fromClub) revert NotPlayerClub();
+        _players[playerId].contractExpiry = uint40(newExpiry);
+        emit ContractExtended(playerId, newExpiry);
+    }
 
-        // I remove from old club array via swap-and-pop
-        uint256 index  = _playerIndexInClub[playerId];
-        uint256 lastId = _clubPlayers[fromClub][_clubPlayers[fromClub].length - 1];
-        _clubPlayers[fromClub][index] = lastId;
-        _playerIndexInClub[lastId]    = index;
-        _clubPlayers[fromClub].pop();
 
-        // I add to new club array
-        _playerIndexInClub[playerId] = _clubPlayers[toClub].length;
-        _clubPlayers[toClub].push(playerId);
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CLUB — Wallet update (cancel)
+    // ═══════════════════════════════════════════════════════════════════════════
 
-        // I clear listing, medical clearance and legal docs — fresh start at new club
-        // I intentionally keep portraitCID — the player's face does not change clubs
-        Player storage player        = _players[playerId];
-        player.isListed              = false;
-        player.askingPrice           = 0;
-        player.medicalClearance      = false;
-        player.medicalDocumentHash   = bytes32(0);
+    function cancelWalletUpdate(uint256 playerId)
+        external onlyRole(CLUB_ROLE) onlyPlayerClub(playerId) playerExists(playerId)
+    {
+        if (!_walletUpdateRequests[playerId].active) revert NoWalletUpdatePending(playerId);
+        delete _walletUpdateRequests[playerId];
+        emit WalletUpdateCancelled(playerId);
+    }
 
-        // I reset legal documents — new club must submit fresh docs for their jurisdiction
-        _legalDocs[playerId] = LegalDocuments({
-            registrationContractHash: bytes32(0),
-            identityDocumentHash:     bytes32(0),
-            fifaTMSHash:              bytes32(0),
-            workPermitHash:           bytes32(0),
-            documentsVerified:        false
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PLAYER WALLET — Wallet rotation
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function initiateWalletUpdate(uint256 playerId, address newWallet)
+        external onlyPlayerWallet(playerId) whenNotPaused playerExists(playerId)
+    {
+        if (newWallet == address(0))                      revert ZeroAddress();
+        if (newWallet == _players[playerId].playerWallet) revert WalletUpdateAlreadySet(playerId, newWallet);
+        if (_walletUpdateRequests[playerId].active)       revert WalletUpdateAlreadyPending(playerId);
+
+        _walletUpdateRequests[playerId] = WalletUpdateRequest({
+            newWallet:     newWallet,
+            executable:    block.timestamp + WALLET_UPDATE_TIMELOCK,
+            pauseSnapshot: totalPausedDuration,
+            active:        true
         });
 
-        _transfer(fromClub, toClub, playerId);
+        emit WalletUpdateInitiated(playerId, newWallet, block.timestamp + WALLET_UPDATE_TIMELOCK);
+    }
 
+    function executeWalletUpdate(uint256 playerId) external playerExists(playerId) {
+        WalletUpdateRequest storage req = _walletUpdateRequests[playerId];
+        if (!req.active) revert NoWalletUpdatePending(playerId);
+
+        uint256 pausedSince        = totalPausedDuration - req.pauseSnapshot;
+        uint256 adjustedExecutable = req.executable + pausedSince;
+
+        if (block.timestamp < adjustedExecutable)
+            revert WalletUpdateNotReady(playerId, adjustedExecutable, block.timestamp);
+
+        address oldWallet = _players[playerId].playerWallet;
+        address newWallet = req.newWallet;
+        delete _walletUpdateRequests[playerId];
+        _players[playerId].playerWallet = newWallet;
+
+        emit WalletUpdateExecuted(playerId, oldWallet, newWallet);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ESCROW
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function escrowTransfer(uint256 playerId, address fromClub, address toClub)
+        external onlyRole(ESCROW_ROLE) playerExists(playerId)
+    {
+        if (fromClub == address(0)) revert ZeroAddress();
+        if (toClub   == address(0)) revert ZeroAddress();
+
+        if (terminationManager != address(0))
+            ITerminationManager(terminationManager).clearTermination(playerId);
+
+        verificationActive[playerId] = false;
+
+        Player storage p = _players[playerId];
+        p.isListed         = false;
+        p.askingPrice      = 0;
+        p.releaseClause    = 0;
+        p.medicalClearance = false;
+        p.medicalVerified  = false;
+
+        if (p.medicalDocumentHash != bytes32(0)) {
+            _usedDocumentHashes[p.medicalDocumentHash] = false;
+            p.medicalDocumentHash = bytes32(0);
+        }
+
+        LegalDocuments storage ld = _legalDocs[playerId];
+        if (ld.registrationContractHash != bytes32(0)) _usedDocumentHashes[ld.registrationContractHash] = false;
+        if (ld.fifaTMSHash              != bytes32(0)) _usedDocumentHashes[ld.fifaTMSHash]              = false;
+        if (ld.workPermitHash           != bytes32(0)) _usedDocumentHashes[ld.workPermitHash]           = false;
+        delete _legalDocs[playerId];
+
+        _removeFromClub(playerId, fromClub);
+        _clubPlayers[toClub].push(playerId);
+
+        _transfer(fromClub, toClub, playerId);
         emit ClubOwnershipTransferred(playerId, fromClub, toClub);
     }
 
-    // ─── Token URI ────────────────────────────────────────────────────────────
-
-    /**
-     * @notice Returns ERC-721 metadata as a base64-encoded JSON data URI.
-     * @dev Image uses ipfs:// URI scheme — wallets and marketplaces resolve
-     *      this via their own gateway so there is no centralised URL dependency.
-     */
-    function tokenURI(uint256 playerId)
-        public
-        view
-        override
-        playerExists(playerId)
-        returns (string memory)
+    function burnPlayer(uint256 playerId)
+        external onlyRole(ESCROW_ROLE) playerExists(playerId)
     {
-        Player memory p = _players[playerId];
-        address club    = ownerOf(playerId);
-
-        // I build the image field only when a portrait CID has been set
-        string memory imageField = bytes(p.portraitCID).length > 0
-            ? string(abi.encodePacked('"image":"ipfs://', p.portraitCID, '",'))
-            : '"image":"",';
-
-        string memory json = string(abi.encodePacked(
-            '{"name":"', p.name, ' #', playerId.toString(), '",',
-            imageField,
-            '"description":"Transferium Protocol - Professional Football Player Registration",',
-            '"attributes":[',
-                '{"trait_type":"Position","value":"', p.position, '"},',
-                '{"trait_type":"Nationality","value":"', p.nationality, '"},',
-                '{"trait_type":"Verified","value":"', p.isVerified ? "true" : "false", '"},',
-                '{"trait_type":"Medical Clearance","value":"', p.medicalClearance ? "true" : "false", '"},',
-                '{"trait_type":"Listed","value":"', p.isListed ? "true" : "false", '"},',
-                '{"trait_type":"Weekly Salary (EURC)","value":', p.weeklySalary.toString(), '},',
-                '{"trait_type":"Current Club","value":"', Strings.toHexString(uint256(uint160(club)), 20), '"},',
-                '{"trait_type":"Contract Expiry","value":', p.contractExpiry.toString(), '}',
-            ']}'
-        ));
-
-        return string(abi.encodePacked(
-            "data:application/json;base64,",
-            Base64.encode(bytes(json))
-        ));
+        _burnPlayer(playerId);
     }
 
-    // ─── Admin Functions ──────────────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════════════════════
+    // VERIFICATION CALLBACKS — called by VerificationManager only
+    // ═══════════════════════════════════════════════════════════════════════════
 
-    function setRegistrationFee(uint256 newFee) external onlyRole(ADMIN_ROLE) {
-        if (newFee > MAX_FEE) revert InvalidFee();
-        emit RegistrationFeeUpdated(registrationFee, newFee);
-        registrationFee = newFee;
-    }
-
-    function setListingFee(uint256 newFee) external onlyRole(ADMIN_ROLE) {
-        if (newFee > MAX_FEE) revert InvalidFee();
-        emit ListingFeeUpdated(listingFee, newFee);
-        listingFee = newFee;
-    }
-
-    function withdrawFees(address payable to, uint256 amount)
-        external
-        nonReentrant
-        onlyRole(ADMIN_ROLE)
+    function setVerificationActive(uint256 playerId, bool active)
+        external onlyRole(VERIFICATION_ROLE)
     {
-        if (to == address(0)) revert InvalidAddress();
-        if (amount == 0 || amount > MAX_WITHDRAW) revert WithdrawAmountTooLarge();
-        if (amount > address(this).balance) revert InsufficientBalance();
-        (bool success, ) = to.call{value: amount}("");
-        if (!success) revert WithdrawFailed();
-        emit FeesWithdrawn(to, amount);
+        verificationActive[playerId] = active;
     }
 
-    function pause() external onlyRole(ADMIN_ROLE) { _pause(); }
-    function unpause() external onlyRole(ADMIN_ROLE) { _unpause(); }
+    function setMedicalVerified(uint256 playerId, address actor)
+        external onlyRole(VERIFICATION_ROLE) playerExists(playerId)
+    {
+        _players[playerId].medicalVerified = true;
+        emit MedicalClearanceVerified(playerId, actor);
+    }
 
-    // ─── Views ────────────────────────────────────────────────────────────────
+    function setLegalDocsVerified(uint256 playerId, address actor)
+        external onlyRole(VERIFICATION_ROLE) playerExists(playerId)
+    {
+        _legalDocs[playerId].documentsVerified = true;
+        emit LegalDocumentsVerified(playerId, actor);
+    }
+
+    function markPlayerVerified(uint256 playerId, address actor)
+        external onlyRole(VERIFICATION_ROLE) playerExists(playerId)
+    {
+        _players[playerId].isVerified = true;
+        emit VerificationApproved(playerId, actor);
+        emit PlayerVerified(playerId, actor);
+    }
+
+    function addProtocolFees(uint256 amount) external onlyRole(VERIFICATION_ROLE) {
+        protocolFeesAccumulated += amount;
+    }
+
+    function addRegistrarFees(address registrar, uint256 amount) external onlyRole(VERIFICATION_ROLE) {
+        _registrarClaimable[registrar] += amount;
+    }
+
+    function resetWallet(uint256 playerId, address actor)
+        external onlyRole(VERIFICATION_ROLE) playerExists(playerId)
+    {
+        _players[playerId].playerWallet = address(0);
+        if (_walletUpdateRequests[playerId].active) {
+            delete _walletUpdateRequests[playerId];
+            emit WalletUpdateCancelled(playerId);
+        }
+        emit PlayerWalletReset(playerId, actor);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // VIEW FUNCTIONS
+    // ═══════════════════════════════════════════════════════════════════════════
 
     function getPlayer(uint256 playerId)
-        external
-        view
-        override
-        playerExists(playerId)
-        returns (Player memory)
+        external view playerExists(playerId) returns (Player memory)
     {
         return _players[playerId];
     }
 
     function getLegalDocuments(uint256 playerId)
-        external
-        view
-        override
-        playerExists(playerId)
-        returns (LegalDocuments memory)
+        external view playerExists(playerId) returns (LegalDocuments memory)
     {
         return _legalDocs[playerId];
     }
 
-    function getClubPlayers(address club)
-        external
-        view
-        override
-        returns (uint256[] memory)
-    {
+    function getClubPlayers(address club) external view returns (uint256[] memory) {
         return _clubPlayers[club];
     }
 
-    function currentClub(uint256 playerId)
-        external
-        view
-        override
-        playerExists(playerId)
-        returns (address)
+    function getClubRegistrar(address club) external view returns (address) {
+        return _clubRegistrar[club];
+    }
+
+
+    function getRegistrarFee(address registrar) external view returns (uint256) {
+        return _registrarFee[registrar];
+    }
+
+    function getRegistrarClaimable(address registrar) external view returns (uint256) {
+        return _registrarClaimable[registrar];
+    }
+
+    function getWalletUpdateRequest(uint256 playerId)
+        external view returns (WalletUpdateRequest memory)
     {
+        return _walletUpdateRequests[playerId];
+    }
+
+
+
+    function currentClub(uint256 playerId) external view returns (address) {
         return ownerOf(playerId);
     }
 
-    function hasClubRole(address account) external view override returns (bool) {
+    function hasClubRole(address account) external view returns (bool) {
         return hasRole(CLUB_ROLE, account);
     }
 
-    function totalPlayers() external view override returns (uint256) {
-        return _playerIdCounter;
+
+
+
+
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ERC-721 OVERRIDES
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function transferFrom(address, address, uint256) public pure override {
+        revert DirectTransferNotAllowed();
     }
 
-    // ─── ERC-165 ──────────────────────────────────────────────────────────────
+    function safeTransferFrom(address, address, uint256, bytes memory) public pure override {
+        revert DirectTransferNotAllowed();
+    }
+
+    function approve(address, uint256) public pure override {
+        revert DirectTransferNotAllowed();
+    }
+
+    function setApprovalForAll(address, bool) public pure override {
+        revert DirectTransferNotAllowed();
+    }
+
+    function tokenURI(uint256 playerId)
+        public view override playerExists(playerId) returns (string memory)
+    {
+        return tokenURIRenderer.render(_players[playerId], _legalDocs[playerId]);
+    }
+
     function supportsInterface(bytes4 interfaceId)
-        public
-        view
-        override(ERC721, AccessControl)
+        public view override(ERC721Upgradeable, AccessControlUpgradeable)
         returns (bool)
     {
         return super.supportsInterface(interfaceId);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // INTERNAL HELPERS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function _burnPlayer(uint256 playerId) internal {
+        address club = ownerOf(playerId);
+
+        verificationActive[playerId] = false;
+
+        if (terminationManager != address(0))
+            ITerminationManager(terminationManager).clearTermination(playerId);
+
+        delete _walletUpdateRequests[playerId];
+
+        LegalDocuments storage ld = _legalDocs[playerId];
+        if (ld.registrationContractHash != bytes32(0)) _usedDocumentHashes[ld.registrationContractHash] = false;
+        if (ld.fifaTMSHash              != bytes32(0)) _usedDocumentHashes[ld.fifaTMSHash]              = false;
+        if (ld.workPermitHash           != bytes32(0)) _usedDocumentHashes[ld.workPermitHash]           = false;
+
+        bytes32 medHash = _players[playerId].medicalDocumentHash;
+        if (medHash != bytes32(0)) _usedDocumentHashes[medHash] = false;
+
+        bytes32 fifaId = _players[playerId].fifaId;
+        if (fifaId != bytes32(0)) _usedFifaIds[fifaId] = false;
+
+        delete _legalDocs[playerId];
+        delete _players[playerId];
+
+        _removeFromClub(playerId, club);
+        _burn(playerId);
+
+        emit PlayerBurned(playerId);
+    }
+
+    function _removeFromClub(uint256 playerId, address club) internal {
+        uint256[] storage ids = _clubPlayers[club];
+        uint256 len = ids.length;
+        for (uint256 i = 0; i < len; i++) {
+            if (ids[i] == playerId) {
+                ids[i] = ids[len - 1];
+                ids.pop();
+                return;
+            }
+        }
+    }
+
+    function _releaseDocHash(bytes32 existing, bytes32 incoming) internal {
+        if (existing != bytes32(0) && existing != incoming) {
+            _usedDocumentHashes[existing] = false;
+        }
     }
 }
