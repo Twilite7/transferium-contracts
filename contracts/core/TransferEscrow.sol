@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
+import "../base/ProtocolFeeBase.sol";
+
 import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
@@ -30,6 +32,7 @@ import "../types/TransferTypes.sol";
  *      - UUPS upgrade protected by DEFAULT_ADMIN_ROLE
  */
 contract TransferEscrow is
+    ProtocolFeeBase,
     Initializable,
     AccessControlUpgradeable,
     PausableUpgradeable,
@@ -60,7 +63,6 @@ contract TransferEscrow is
 
     uint256 public constant MAX_SELL_ON_BPS          = 2000;
     uint256 public constant MAX_AGENT_BPS            = 300;
-    uint256 public constant MAX_PROTOCOL_FEE_BPS     = 200;
     uint256 public constant BPS_DENOMINATOR          = 10_000;
     uint256 public constant MAX_PRICE                = 500_000_000 ether;
     uint256 public constant MAX_ADDONS               = 10;
@@ -137,8 +139,7 @@ contract TransferEscrow is
     IAddressRegistry public addressRegistry;
     IDealEscrow     public dealEscrow;
 
-    address public treasury;
-    uint256 public protocolFeeBps;
+    mapping(address => uint256) public protocolFeesAccumulated;
     uint256 public consentWindow;
 
     mapping(uint256 => Offer)                           private _offers;
@@ -168,7 +169,6 @@ contract TransferEscrow is
     event TransferBanIssued(address indexed club, uint256 windows);
     event TransferBanLifted(address indexed club);
     event BanWindowDecremented(address indexed club, uint256 windowsRemaining);
-    event ProtocolFeeUpdated(uint256 newBps);
     event TreasuryUpdated(address indexed newTreasury);
     event MutualCancelExpired(uint256 indexed dealId);
     event DealCancelled(uint256 indexed dealId, uint8 reason);
@@ -176,6 +176,8 @@ contract TransferEscrow is
     // ─── Errors ───────────────────────────────────────────────────────────────
 
     error InvalidAddress();
+    error NothingToWithdraw();
+    error InsufficientProtocolBalance(uint256 requested, uint256 available);
     error InvalidAmount();
     error InvalidBps();
     error TokenNotApproved();
@@ -199,7 +201,6 @@ contract TransferEscrow is
     error NoBanToLift();
     error NoBanToDecrement();
     error TooManyAddOns();
-    error ProtocolFeeTooHigh();
     error TimerTooShort();
     error ReentrantCall();
     error DealNotFound();
@@ -287,16 +288,27 @@ contract TransferEscrow is
         emit TokenRevoked(token);
     }
 
-    function setProtocolFee(uint256 bps) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (bps > MAX_PROTOCOL_FEE_BPS) revert ProtocolFeeTooHigh();
-        protocolFeeBps = bps;
-        emit ProtocolFeeUpdated(bps);
+    function setProtocolFee(uint256 bps) external onlyRole(ADMIN_ROLE) {
+        _setProtocolFee(bps);
     }
 
-    function setTreasury(address _treasury) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (_treasury == address(0)) revert InvalidAddress();
-        treasury = _treasury;
-        emit TreasuryUpdated(_treasury);
+    function scheduleProtocolTreasuryUpdate(address newTreasury) external onlyRole(ADMIN_ROLE) {
+        if (newTreasury == address(0)) revert InvalidAddress();
+        _scheduleProtocolTreasuryUpdate(newTreasury);
+    }
+
+    function executeProtocolTreasuryUpdate() external onlyRole(ADMIN_ROLE) {
+        _executeProtocolTreasuryUpdate();
+    }
+
+    function withdrawFees(address token, uint256 amount) external onlyRole(ADMIN_ROLE) nonReentrant {
+        if (amount == 0) revert NothingToWithdraw();
+        if (treasury == address(0)) revert InvalidAddress();
+        uint256 avail = protocolFeesAccumulated[token];
+        if (amount > avail) revert InsufficientProtocolBalance(amount, avail);
+        protocolFeesAccumulated[token] = avail - amount;
+        IERC20(token).safeTransfer(treasury, amount);
+        emit ProtocolFeesWithdrawn(treasury, token, amount);
     }
 
     function setConsentWindow(uint256 duration) external onlyRole(ADMIN_ROLE) {

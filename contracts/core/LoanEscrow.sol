@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
+import "../base/ProtocolFeeBase.sol";
+
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
@@ -22,7 +24,7 @@ import "../utils/RegistryKeys.sol";
  *      whitelisted tokens only. Player ownership always has a defined home.
  *      Requires ESCROW_ROLE on PlayerRegistry — must be granted post-deployment by admin.
  */
-contract LoanEscrow is AccessControl, Pausable, ReentrancyGuard {
+contract LoanEscrow is ProtocolFeeBase, AccessControl, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     // ─── Roles ────────────────────────────────────────────────────────────────
@@ -126,6 +128,10 @@ contract LoanEscrow is AccessControl, Pausable, ReentrancyGuard {
     error PlayerNotListed();
     error ParentClubMismatch();
     error ParentClubNotRegistered();
+
+    error NothingToWithdraw();
+    error InsufficientProtocolBalance(uint256 requested, uint256 available);
+
 
     // ─── Constructor ──────────────────────────────────────────────────────────
     constructor(address _playerRegistry, address _addressRegistry) {
@@ -332,7 +338,13 @@ contract LoanEscrow is AccessControl, Pausable, ReentrancyGuard {
         if (loan.loanFeeClaimed) revert LoanFeeAlreadyClaimed();
 
         loan.loanFeeClaimed = true;
-        _claimable[msg.sender][loan.paymentToken] += loan.loanFee;
+        uint256 loanFeeNet = loan.loanFee;
+        if (treasury != address(0) && protocolFeeBps > 0) {
+            uint256 protocolAmt = loanFeeNet * protocolFeeBps / 10_000;
+            loanFeeNet -= protocolAmt;
+            _claimable[treasury][loan.paymentToken] += protocolAmt;
+        }
+        _claimable[msg.sender][loan.paymentToken] += loanFeeNet;
 
         emit LoanFeeClaimed(loanId);
     }
@@ -442,8 +454,14 @@ contract LoanEscrow is AccessControl, Pausable, ReentrancyGuard {
         // does not leave the parent club with a claimable balance backed by no tokens
         IERC20(loan.paymentToken).safeTransferFrom(msg.sender, address(this), loan.optionPrice);
 
-        // I credit parent club only after funds are confirmed received
-        _claimable[loan.parentClub][loan.paymentToken] += loan.optionPrice;
+        // I credit parent club only after funds are confirmed received, less protocol cut
+        uint256 optionNet = loan.optionPrice;
+        if (treasury != address(0) && protocolFeeBps > 0) {
+            uint256 protocolAmt = optionNet * protocolFeeBps / 10_000;
+            optionNet -= protocolAmt;
+            _claimable[treasury][loan.paymentToken] += protocolAmt;
+        }
+        _claimable[loan.parentClub][loan.paymentToken] += optionNet;
 
         // Note: player ownership is already at borrowingClub from approveLoan.
         // COMPLETED state means no expiry or recall can move it back — ownership
@@ -469,6 +487,29 @@ contract LoanEscrow is AccessControl, Pausable, ReentrancyGuard {
     }
 
     // ─── Admin Functions ──────────────────────────────────────────────────────
+    function setProtocolFee(uint256 bps) external onlyRole(ADMIN_ROLE) {
+        _setProtocolFee(bps);
+    }
+
+    function scheduleProtocolTreasuryUpdate(address newTreasury) external onlyRole(ADMIN_ROLE) {
+        if (newTreasury == address(0)) revert InvalidAddress();
+        _scheduleProtocolTreasuryUpdate(newTreasury);
+    }
+
+    function executeProtocolTreasuryUpdate() external onlyRole(ADMIN_ROLE) {
+        _executeProtocolTreasuryUpdate();
+    }
+
+    function withdrawFees(address token, uint256 amount) external onlyRole(ADMIN_ROLE) nonReentrant {
+        if (amount == 0) revert NothingToWithdraw();
+        if (treasury == address(0)) revert InvalidAddress();
+        uint256 avail = _claimable[treasury][token];
+        if (amount > avail) revert InsufficientProtocolBalance(amount, avail);
+        _claimable[treasury][token] = avail - amount;
+        IERC20(token).safeTransfer(treasury, amount);
+        emit ProtocolFeesWithdrawn(treasury, token, amount);
+    }
+
     function pause() external onlyRole(ADMIN_ROLE) { _pause(); }
     function unpause() external onlyRole(ADMIN_ROLE) { _unpause(); }
 

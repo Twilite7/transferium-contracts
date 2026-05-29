@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
+import "../base/ProtocolFeeBase.sol";
+
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
@@ -14,14 +16,12 @@ import "../interfaces/IDealEscrow.sol";
  * @notice Handles post-completion installment payments for transfer deals.
  *         Separated from DealEscrow to keep DealEscrow under the 24KB limit.
  */
-contract InstallmentEscrow is AccessControl, Pausable, ReentrancyGuard {
+contract InstallmentEscrow is ProtocolFeeBase, AccessControl, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     bytes32 public constant LEAGUE_ROLE = keccak256("LEAGUE_ROLE");
 
     IDealEscrow public dealEscrow;
-    address     public treasury;
-    uint256     public protocolFeeBps;
 
     // COMPLETED is ordinal 16 in DealState enum
     uint8 constant DEAL_COMPLETED = 16;
@@ -40,10 +40,18 @@ contract InstallmentEscrow is AccessControl, Pausable, ReentrancyGuard {
     error WrongDealState();
     error NothingToClaim();
 
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+
+    error InvalidAddress();
+    error NothingToWithdraw();
+    error InsufficientProtocolBalance(uint256 requested, uint256 available);
+
     constructor(address _dealEscrow, address _treasury, uint256 _protocolFeeBps) {
         dealEscrow     = IDealEscrow(_dealEscrow);
         treasury       = _treasury;
         protocolFeeBps = _protocolFeeBps;
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(ADMIN_ROLE, msg.sender);
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(LEAGUE_ROLE, msg.sender);
     }
@@ -78,6 +86,29 @@ contract InstallmentEscrow is AccessControl, Pausable, ReentrancyGuard {
         _claimable[sellingClub][paymentToken] += sellerAmt;
 
         emit InstallmentPaid(dealId, index, inst.amount);
+    }
+
+    function setProtocolFee(uint256 bps) external onlyRole(ADMIN_ROLE) {
+        _setProtocolFee(bps);
+    }
+
+    function scheduleProtocolTreasuryUpdate(address newTreasury) external onlyRole(ADMIN_ROLE) {
+        if (newTreasury == address(0)) revert InvalidAddress();
+        _scheduleProtocolTreasuryUpdate(newTreasury);
+    }
+
+    function executeProtocolTreasuryUpdate() external onlyRole(ADMIN_ROLE) {
+        _executeProtocolTreasuryUpdate();
+    }
+
+    function withdrawFees(address token, uint256 amount) external onlyRole(ADMIN_ROLE) nonReentrant {
+        if (amount == 0) revert NothingToWithdraw();
+        if (treasury == address(0)) revert InvalidAddress();
+        uint256 avail = _claimable[treasury][token];
+        if (amount > avail) revert InsufficientProtocolBalance(amount, avail);
+        _claimable[treasury][token] = avail - amount;
+        IERC20(token).safeTransfer(treasury, amount);
+        emit ProtocolFeesWithdrawn(treasury, token, amount);
     }
 
     function flagOverdue(uint256 dealId, uint8 index) external onlyRole(LEAGUE_ROLE) {

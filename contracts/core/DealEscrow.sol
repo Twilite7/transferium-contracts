@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
+import "../base/ProtocolFeeBase.sol";
+
 import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
@@ -16,6 +18,7 @@ import "../libraries/FeeLib.sol";
 import "../types/TransferTypes.sol";
 
 contract DealEscrow is
+    ProtocolFeeBase,
     Initializable,
     AccessControlUpgradeable,
     PausableUpgradeable,
@@ -38,13 +41,12 @@ contract DealEscrow is
     bytes32 public constant LEAGUE_ROLE          = keccak256("LEAGUE_ROLE");
     bytes32 public constant TRANSFER_ESCROW_ROLE = keccak256("TRANSFER_ESCROW_ROLE");
 
-    uint256 public constant MAX_PRICE                = 500_000_000 ether;
-    uint256 public constant BPS_DENOMINATOR          = 10_000;
-    uint256 public constant MAX_PROTOCOL_FEE_BPS     = 200;
-    uint256 public constant HIJACK_FAIL_PENALTY_BPS  = 200;
-    uint256 public constant HIJACK_STALL_PENALTY_BPS = 500;
-    uint256 public constant LEAGUE_DISPUTE_DEADLINE  = 7 days;
-    uint256 public constant MIN_TIMER = 10 seconds;
+    uint256 internal constant MAX_PRICE                = 500_000_000 ether;
+    uint256 internal constant BPS_DENOMINATOR          = 10_000;
+    uint256 internal constant HIJACK_FAIL_PENALTY_BPS  = 200;
+    uint256 internal constant HIJACK_STALL_PENALTY_BPS = 500;
+    uint256 internal constant LEAGUE_DISPUTE_DEADLINE  = 7 days;
+    uint256 internal constant MIN_TIMER = 10 seconds;
 
     struct Deal {
         uint256  offerId;
@@ -95,15 +97,8 @@ contract DealEscrow is
 
     IPlayerRegistry public playerRegistry;
     IAddressRegistry public addressRegistry;
-    address public treasury;
-    uint256 public protocolFeeBps;
-    uint256 public consentWindow;
-    uint256 public medicalWindow;
-    uint256 public hijackWindow;
-    uint256 public disputeWindow;
-    uint256 public renegoWindow;
-    uint256 public fundingWindow;
-    uint256 public mutualCancelWindow;
+    mapping(uint8 => uint256) public timers;
+    // 0=consent 1=medical 2=hijack 3=dispute 4=renego 5=funding 6=mutualCancel
 
     mapping(uint256 => Deal)                                private _deals;
     mapping(uint256 => TransferTypes.AddOn[])               private _dealAddOns;
@@ -129,9 +124,7 @@ contract DealEscrow is
     event HijackBidRejected(uint256 indexed dealId, address indexed hijackClub);
     event MutualCancelProposed(uint256 indexed dealId, address indexed proposer);
     event MutualCancelConfirmed(uint256 indexed dealId);
-    event MutualCancelExpired(uint256 indexed dealId);
     event FundingReceived(uint256 indexed dealId, address indexed buyingClub, uint256 amount);
-    event SigningBonusRescued(uint256 indexed dealId, address indexed recipient, uint256 amount);
     event DealCompleted(uint256 indexed dealId, uint256 indexed playerId, address indexed newClub);
     event DealCancelled(uint256 indexed dealId, TransferTypes.CancelReason reason);
     event DealFrozen(uint256 indexed dealId);
@@ -141,12 +134,11 @@ contract DealEscrow is
     event AddOnTriggered(uint256 indexed dealId, uint256 indexed idx, uint256 amount, address recipient);
     event SigningBonusClaimed(uint256 indexed dealId, address indexed wallet, uint256 amount);
     event FundsClaimed(address indexed recipient, address indexed token, uint256 amount);
-    event TreasuryUpdated(address indexed newTreasury);
-    event ProtocolFeeUpdated(uint256 newBps);
 
     error ReentrantCall();
-    error InvalidInstallmentSchedule();
     error InvalidAddress();
+    error NothingToWithdraw();
+    error InsufficientProtocolBalance(uint256 requested, uint256 available);
     error InvalidAmount();
     error TokenNotApproved();
     error DealNotFound();
@@ -166,8 +158,6 @@ contract DealEscrow is
     error NothingToClaim();
     error NoSigningBonus();
     error SigningBonusAlreadyClaimed();
-    error SigningBonusNotExpired();
-    error NoSigningBonusToRescue();
     error AddOnNotFound();
     error AddOnAlreadyTriggered();
     error TransferWindowClosed();
@@ -176,7 +166,6 @@ contract DealEscrow is
     error MutualCancelNotProposed();
     error MutualCancelExpiredError();
     error CannotConfirmOwnProposal();
-    error ProtocolFeeTooHigh();
     error TimerTooShort();
 
     /// @custom:oz-upgrades-unsafe-allow constructor
@@ -198,13 +187,13 @@ contract DealEscrow is
         playerRegistry    = IPlayerRegistry(_playerRegistry);
         addressRegistry   = IAddressRegistry(_addressRegistry);
         treasury          = _treasury;
-        consentWindow     = 72 hours;
-        medicalWindow     = 72 hours;
-        hijackWindow      = 48 hours;
-        disputeWindow     = 72 hours;
-        renegoWindow      = 48 hours;
-        fundingWindow     = 48 hours;
-        mutualCancelWindow = 48 hours;
+        timers[0] = 72 hours;
+        timers[1] = 72 hours;
+        timers[2] = 48 hours;
+        timers[3] = 72 hours;
+        timers[4] = 48 hours;
+        timers[5] = 48 hours;
+        timers[6] = 48 hours;
         protocolFeeBps    = 50;
         _grantRole(DEFAULT_ADMIN_ROLE, _admin);
         _grantRole(ADMIN_ROLE,         _admin);
@@ -228,29 +217,34 @@ contract DealEscrow is
 
     // ─── Admin ────────────────────────────────────────────────────────────────
 
-    function setTreasury(address _treasury) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (_treasury == address(0)) revert InvalidAddress();
-        treasury = _treasury;
-        emit TreasuryUpdated(_treasury);
+    function setProtocolFee(uint256 bps) external onlyRole(ADMIN_ROLE) {
+        _setProtocolFee(bps);
     }
 
-    function setProtocolFee(uint256 bps) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (bps > MAX_PROTOCOL_FEE_BPS) revert ProtocolFeeTooHigh();
-        protocolFeeBps = bps;
-        emit ProtocolFeeUpdated(bps);
+    function scheduleProtocolTreasuryUpdate(address newTreasury) external onlyRole(ADMIN_ROLE) {
+        if (newTreasury == address(0)) revert InvalidAddress();
+        _scheduleProtocolTreasuryUpdate(newTreasury);
+    }
+
+    function executeProtocolTreasuryUpdate() external onlyRole(ADMIN_ROLE) {
+        _executeProtocolTreasuryUpdate();
+    }
+
+    function withdrawFees(address token, uint256 amount) external onlyRole(ADMIN_ROLE) nonReentrant {
+        if (amount == 0) revert NothingToWithdraw();
+        if (treasury == address(0)) revert InvalidAddress();
+        uint256 avail = _claimable[treasury][token];
+        if (amount > avail) revert InsufficientProtocolBalance(amount, avail);
+        _claimable[treasury][token] = avail - amount;
+        IERC20(token).safeTransfer(treasury, amount);
+        emit ProtocolFeesWithdrawn(treasury, token, amount);
     }
 
     // which: 0=consent 1=medical 2=hijack 3=dispute 4=renego 5=funding 6=mutualCancel
     function setTimer(uint8 which, uint256 d) external onlyRole(ADMIN_ROLE) {
         if (d < MIN_TIMER) revert TimerTooShort();
-        if      (which == 0) consentWindow      = d;
-        else if (which == 1) medicalWindow      = d;
-        else if (which == 2) hijackWindow       = d;
-        else if (which == 3) disputeWindow      = d;
-        else if (which == 4) renegoWindow       = d;
-        else if (which == 5) fundingWindow      = d;
-        else if (which == 6) mutualCancelWindow = d;
-        else revert InvalidAmount();
+        if (which > 6) revert InvalidAmount();
+        timers[which] = d;
     }
 
     function approveToken(address token) external onlyRole(ADMIN_ROLE) {
@@ -278,17 +272,9 @@ contract DealEscrow is
         _dealIdCounter++;
         dealId = _dealIdCounter;
 
-        // I validate installment schedule before storing
-        uint256 instCount = p.installmentAmounts.length;
-        if (instCount == 0 || instCount > 8) revert InvalidInstallmentSchedule();
-        if (p.installmentDueDates.length != instCount) revert InvalidInstallmentSchedule();
-        uint256 instSum = 0;
-        for (uint256 i = 0; i < instCount; i++) {
-            if (p.installmentAmounts[i] == 0) revert InvalidInstallmentSchedule();
-            if (i > 0 && p.installmentDueDates[i] <= p.installmentDueDates[i-1]) revert InvalidInstallmentSchedule();
-            instSum += p.installmentAmounts[i];
-        }
-        if (instSum != p.transferFee) revert InvalidInstallmentSchedule();
+        uint256 instCount = FeeLib.validateInstallments(
+            p.installmentAmounts, p.installmentDueDates, p.transferFee
+        );
 
         _deals[dealId] = Deal({
             offerId:                   p.offerId,
@@ -477,7 +463,7 @@ contract DealEscrow is
         deal.signingBonusAmount  = newSigningBonus;
         deal.signingBonusClaimed = false;
         deal.state                  = TransferTypes.DealState.AWAITING_HIJACK_CONSENT;
-        deal.stateDeadline          = block.timestamp + consentWindow;
+        deal.stateDeadline          = block.timestamp + timers[0];
         deal.medicalHash            = bytes32(0);
         deal.medicalOutcome         = TransferTypes.MedicalOutcome.NONE;
         deal.hijackDeposit          = hijack.transferFee;
@@ -514,7 +500,7 @@ contract DealEscrow is
         }
         deal.transferFee   = newFee;
         deal.state         = TransferTypes.DealState.HIJACK_WINDOW;
-        deal.stateDeadline = block.timestamp + hijackWindow;
+        deal.stateDeadline = block.timestamp + timers[2];
         emit MedicalRenegotiationResolved(dealId, newFee);
     }
 
@@ -535,7 +521,7 @@ contract DealEscrow is
         if (msg.sender != deal.sellingClub && msg.sender != deal.buyingClub) revert WrongDealState();
         bool windowExpired = block.timestamp > deal.stateDeadline;
         if (!windowExpired) {
-            if (block.timestamp < (deal.stateDeadline - renegoWindow / 2)) revert WrongDealState();
+            if (block.timestamp < (deal.stateDeadline - timers[4] / 2)) revert WrongDealState();
         }
         deal.state         = TransferTypes.DealState.MEDICAL_DISPUTE;
         deal.stateDeadline = block.timestamp + LEAGUE_DISPUTE_DEADLINE;
@@ -570,7 +556,7 @@ contract DealEscrow is
         _installments[dealId][0].paid = true;
         deal.state         = TransferTypes.DealState.FUNDED;
         deal.fundedAt      = block.timestamp;
-        deal.stateDeadline = block.timestamp + disputeWindow;
+        deal.stateDeadline = block.timestamp + timers[3];
         emit FundingReceived(dealId, msg.sender, totalRequired);
     }
 
@@ -580,17 +566,6 @@ contract DealEscrow is
         return _installments[dealId][index];
     }
 
-    function getInstallmentMeta(uint256 dealId) external view returns (
-        address buyingClub,
-        address sellingClub,
-        address paymentToken,
-        uint8   installmentCount,
-        uint8   installmentsPaid,
-        uint8   state
-    ) {
-        Deal storage d = _deals[dealId];
-        return (d.buyingClub, d.sellingClub, d.paymentToken, d.installmentCount, d.installmentsPaid, uint8(d.state));
-    }
 
     function raiseDispute(uint256 dealId)
         external dealExists(dealId) notFrozen(dealId)
@@ -615,7 +590,7 @@ contract DealEscrow is
         if (msg.sender != deal.buyingClub && msg.sender != deal.sellingClub) revert WrongDealState();
         if (deal.mutualCancelProposer != address(0)) revert MutualCancelAlreadyProposed();
         deal.mutualCancelProposer = msg.sender;
-        deal.mutualCancelDeadline = block.timestamp + mutualCancelWindow;
+        deal.mutualCancelDeadline = block.timestamp + timers[6];
         emit MutualCancelProposed(dealId, msg.sender);
     }
 
@@ -668,7 +643,7 @@ contract DealEscrow is
         deal.state         = isHijack
             ? TransferTypes.DealState.AWAITING_HIJACK_MEDICAL
             : TransferTypes.DealState.AWAITING_TRANSFER_MEDICAL;
-        deal.stateDeadline  = block.timestamp + medicalWindow;
+        deal.stateDeadline  = block.timestamp + timers[1];
         deal.medicalHash    = bytes32(0);
         deal.medicalOutcome = TransferTypes.MedicalOutcome.NONE;
         emit PlayerConsented(dealId, deal.playerId);
@@ -716,10 +691,10 @@ contract DealEscrow is
         if (outcome == TransferTypes.MedicalOutcome.PASSED) {
             if (isHijack) {
                 deal.state         = TransferTypes.DealState.FUNDING_PENDING;
-                deal.stateDeadline = block.timestamp + fundingWindow;
+                deal.stateDeadline = block.timestamp + timers[5];
             } else {
                 deal.state         = TransferTypes.DealState.HIJACK_WINDOW;
-                deal.stateDeadline = block.timestamp + hijackWindow;
+                deal.stateDeadline = block.timestamp + timers[2];
             }
         } else if (outcome == TransferTypes.MedicalOutcome.FAILED) {
             if (isHijack && deal.hijackDeposit > 0) {
@@ -732,26 +707,11 @@ contract DealEscrow is
             _cancelDeal(dealId, TransferTypes.CancelReason.MEDICAL_FAILED);
         } else {
             deal.state         = TransferTypes.DealState.MEDICAL_RENEGOTIATION;
-            deal.stateDeadline = block.timestamp + renegoWindow;
+            deal.stateDeadline = block.timestamp + timers[4];
             emit MedicalRenegotiationStarted(dealId);
         }
     }
 
-    // ── Signing bonus rescue (league) ──────────────────────────────────────────
-    /// @notice After signingBonusExpiry, league can redirect unclaimed bonus to any address.
-    ///         Protects against lost/compromised player wallets on mainnet.
-    function rescueSigningBonus(uint256 dealId, address recipient)
-        external onlyRole(LEAGUE_ROLE) nonReentrant dealExists(dealId)
-    {
-        Deal storage deal = _deals[dealId];
-        if (deal.signingBonusAmount == 0)    revert NoSigningBonusToRescue();
-        if (deal.signingBonusClaimed)        revert SigningBonusAlreadyClaimed();
-        if (block.timestamp < deal.signingBonusExpiry) revert SigningBonusNotExpired();
-        if (recipient == address(0))         revert InvalidAddress();
-        deal.signingBonusClaimed = true;
-        _claimable[recipient][deal.paymentToken] += deal.signingBonusAmount;
-        emit SigningBonusRescued(dealId, recipient, deal.signingBonusAmount);
-    }
 
     function claimSigningBonus(uint256 dealId)
         external nonReentrant dealExists(dealId)
@@ -797,7 +757,7 @@ contract DealEscrow is
     {
         Deal storage deal  = _deals[dealId];
         deal.state         = TransferTypes.DealState.FUNDING_PENDING;
-        deal.stateDeadline = block.timestamp + fundingWindow;
+        deal.stateDeadline = block.timestamp + timers[5];
     }
 
     // op 1 = advance to hijack (original fee), op 2 = set newFee and advance to hijack
@@ -813,7 +773,7 @@ contract DealEscrow is
             deal.transferFee = newFee;
         }
         deal.state         = TransferTypes.DealState.HIJACK_WINDOW;
-        deal.stateDeadline = block.timestamp + hijackWindow;
+        deal.stateDeadline = block.timestamp + timers[2];
         emit MedicalDisputeResolved(dealId);
     }
 

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
+import "../base/ProtocolFeeBase.sol";
+
 import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
@@ -36,6 +38,7 @@ import "../interfaces/ITransferEscrow.sol";
  *   settlement paid -> player RELEASED
  */
 contract FreeTransferEscrow is
+    ProtocolFeeBase,
     Initializable,
     AccessControlUpgradeable,
     PausableUpgradeable,
@@ -62,7 +65,6 @@ contract FreeTransferEscrow is
 
     // ─── Constants ────────────────────────────────────────────────────────────
 
-    uint256 public constant MAX_PROTOCOL_FEE_BPS   = 200;
     uint256 public constant BPS_DENOMINATOR        = 10_000;
     uint256 public constant MAX_AGENT_BPS          = 300;
     uint256 public constant MIN_CONSENT_WINDOW     = 1 hours;
@@ -120,14 +122,12 @@ contract FreeTransferEscrow is
 
     // ─── State ────────────────────────────────────────────────────────────────
 
-    uint256 private _ftIdCounter;
+    uint256 public  _ftIdCounter;
 
     IPlayerRegistry public playerRegistry;
     IAddressRegistry public addressRegistry;
     ITransferEscrow public transferEscrow;
 
-    address public treasury;
-    uint256 public protocolFeeBps;
     uint256 public consentWindow;
     uint256 public medicalWindow;
     uint256 public depositBps;       // % of signing bonus locked as pre-contract deposit
@@ -135,19 +135,19 @@ contract FreeTransferEscrow is
     // playerId => ftId (active free transfer process)
     mapping(uint256 => uint256)           private _playerFT;
     // playerId => true if player is a free agent (in vault)
-    mapping(uint256 => bool)              private _freeAgentStatus;
+    mapping(uint256 => bool)              public  _freeAgentStatus;
     // ftId => FreeTransfer
-    mapping(uint256 => FreeTransfer)      private _fts;
+    mapping(uint256 => FreeTransfer)      public  _fts;
     // playerId => competing proposals (buying club => ftId)
-    mapping(uint256 => mapping(address => uint256)) private _proposals;
+    mapping(uint256 => mapping(address => uint256)) public  _proposals;
     // playerId => list of proposing clubs
     mapping(uint256 => address[])         private _proposers;
     // playerId => active pre-contract ftId (only one allowed at a time)
-    mapping(uint256 => uint256)           private _activePreContract;
+    mapping(uint256 => uint256)           public  _activePreContract;
     // mutual termination proposals
-    mapping(uint256 => MutualTermination) private _terminations;
+    mapping(uint256 => MutualTermination) public  _terminations;
 
-    mapping(address => mapping(address => uint256)) private _claimable;
+    mapping(address => mapping(address => uint256)) public  _claimable;
     mapping(address => bool)              private _approvedTokens;
 
     // ─── Events ───────────────────────────────────────────────────────────────
@@ -166,6 +166,8 @@ contract FreeTransferEscrow is
 
     error ReentrantCall();
     error InvalidAddress();
+    error NothingToWithdraw();
+    error InsufficientProtocolBalance(uint256 requested, uint256 available);
     error InvalidAmount();
     error TokenNotApproved();
     error NotPlayerWallet();
@@ -185,7 +187,6 @@ contract FreeTransferEscrow is
     error MedicalAlreadySubmitted();
     error TransferWindowClosed();
     error NothingToClaim();
-    error ProtocolFeeTooHigh();
     error TimerTooShort();
     error TerminationNotProposed();
     error TerminationAlreadyProposed();
@@ -234,14 +235,27 @@ contract FreeTransferEscrow is
 
     // ─── Admin ────────────────────────────────────────────────────────────────
 
-    function setTreasury(address _treasury) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (_treasury == address(0)) revert InvalidAddress();
-        treasury = _treasury;
+    function setProtocolFee(uint256 bps) external onlyRole(ADMIN_ROLE) {
+        _setProtocolFee(bps);
     }
 
-    function setProtocolFee(uint256 bps) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (bps > MAX_PROTOCOL_FEE_BPS) revert ProtocolFeeTooHigh();
-        protocolFeeBps = bps;
+    function scheduleProtocolTreasuryUpdate(address newTreasury) external onlyRole(ADMIN_ROLE) {
+        if (newTreasury == address(0)) revert InvalidAddress();
+        _scheduleProtocolTreasuryUpdate(newTreasury);
+    }
+
+    function executeProtocolTreasuryUpdate() external onlyRole(ADMIN_ROLE) {
+        _executeProtocolTreasuryUpdate();
+    }
+
+    function withdrawFees(address token, uint256 amount) external onlyRole(ADMIN_ROLE) nonReentrant {
+        if (amount == 0) revert NothingToWithdraw();
+        if (treasury == address(0)) revert InvalidAddress();
+        uint256 avail = _claimable[treasury][token];
+        if (amount > avail) revert InsufficientProtocolBalance(amount, avail);
+        _claimable[treasury][token] = avail - amount;
+        IERC20(token).safeTransfer(treasury, amount);
+        emit ProtocolFeesWithdrawn(treasury, token, amount);
     }
 
     function setConsentWindow(uint256 d) external onlyRole(ADMIN_ROLE) {
@@ -575,7 +589,6 @@ contract FreeTransferEscrow is
 
         if (outcome == MedicalOutcome.FAILED) {
             // Deposit returned - medical failure is not a breach
-            IPlayerRegistry.Player memory player = playerRegistry.getPlayer(ft.playerId);
             if (ft.deposit > 0) {
                 _claimable[ft.buyingClub][ft.paymentToken] += ft.deposit;
             }
@@ -650,31 +663,10 @@ contract FreeTransferEscrow is
 
     // ─── Views ────────────────────────────────────────────────────────────────
 
-    function getFreeTransfer(uint256 ftId) external view returns (FreeTransfer memory) {
-        return _fts[ftId];
-    }
 
-    function isFreeAgent(uint256 playerId) external view returns (bool) {
-        return _freeAgentStatus[playerId];
-    }
 
-    function getActivePreContract(uint256 playerId) external view returns (uint256) {
-        return _activePreContract[playerId];
-    }
 
-    function getProposal(uint256 playerId, address club) external view returns (uint256) {
-        return _proposals[playerId][club];
-    }
 
-    function getClaimable(address account, address token) external view returns (uint256) {
-        return _claimable[account][token];
-    }
 
-    function getTermination(uint256 playerId) external view returns (MutualTermination memory) {
-        return _terminations[playerId];
-    }
 
-    function totalFreeTransfers() external view returns (uint256) {
-        return _ftIdCounter;
-    }
 }

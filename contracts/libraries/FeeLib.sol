@@ -17,6 +17,7 @@ pragma solidity ^0.8.28;
  *      dust goes to the selling club as the last recipient.
  */
 library FeeLib {
+    error InvalidInstallmentSchedule();
     // I define the error here so callers get a clear revert reason
     error FeesExceed100Pct();
 
@@ -62,5 +63,23 @@ library FeeLib {
         sellerAgentAmt = (fee * sellerAgentBps) / 10_000; remaining -= sellerAgentAmt;
         buyerAgentAmt  = (fee * buyerAgentBps)  / 10_000; remaining -= buyerAgentAmt;
         sellerAmt      = remaining;
+    }
+
+    /// @dev Validates installment schedule and returns the count.
+    function validateInstallments(
+        uint256[] calldata amounts,
+        uint256[] calldata dueDates,
+        uint256 transferFee
+    ) external pure returns (uint256 count) {
+        count = amounts.length;
+        if (count == 0 || count > 8) revert InvalidInstallmentSchedule();
+        if (dueDates.length != count) revert InvalidInstallmentSchedule();
+        uint256 sum = 0;
+        for (uint256 i = 0; i < count; i++) {
+            if (amounts[i] == 0) revert InvalidInstallmentSchedule();
+            if (i > 0 && dueDates[i] <= dueDates[i - 1]) revert InvalidInstallmentSchedule();
+            sum += amounts[i];
+        }
+        if (sum != transferFee) revert InvalidInstallmentSchedule();
     }
 }

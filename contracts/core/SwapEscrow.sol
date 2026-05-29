@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
+import "../base/ProtocolFeeBase.sol";
+
 import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
@@ -35,6 +37,7 @@ import "../interfaces/ITransferEscrow.sol";
  *   Dispute window -> COMPLETED
  */
 contract SwapEscrow is
+    ProtocolFeeBase,
     Initializable,
     AccessControlUpgradeable,
     PausableUpgradeable,
@@ -61,7 +64,6 @@ contract SwapEscrow is
 
     // ---- Constants -----------------------------------------------------------
 
-    uint256 public constant MAX_PROTOCOL_FEE_BPS = 200;
     uint256 public constant MAX_AGENT_BPS        = 300;
     uint256 public constant BPS_DENOMINATOR      = 10_000;
     uint256 public constant MAX_PRICE            = 500_000_000 ether;
@@ -123,8 +125,6 @@ contract SwapEscrow is
     IAddressRegistry public addressRegistry;
     ITransferEscrow public transferEscrow;
 
-    address public treasury;
-    uint256 public protocolFeeBps;
     uint256 public consentWindow;
     uint256 public medicalWindow;
     uint256 public fundingWindow;
@@ -160,6 +160,8 @@ contract SwapEscrow is
     error ReentrantCall();
     error InvalidAddress();
     error InvalidAmount();
+    error NothingToWithdraw();
+    error InsufficientProtocolBalance(uint256 requested, uint256 available);
     error TokenNotApproved();
     error NotClubA();
     error NotClubB();
@@ -174,7 +176,6 @@ contract SwapEscrow is
     error MedicalAlreadySubmitted();
     error TransferWindowClosed();
     error NothingToClaim();
-    error ProtocolFeeTooHigh();
     error TimerTooShort();
     error PlayerHasActiveProcess();
     error CannotSwapSameClub();
@@ -227,14 +228,27 @@ contract SwapEscrow is
 
     // ---- Admin ---------------------------------------------------------------
 
-    function setTreasury(address t) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (t == address(0)) revert InvalidAddress();
-        treasury = t;
+    function setProtocolFee(uint256 bps) external onlyRole(ADMIN_ROLE) {
+        _setProtocolFee(bps);
     }
 
-    function setProtocolFee(uint256 bps) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (bps > MAX_PROTOCOL_FEE_BPS) revert ProtocolFeeTooHigh();
-        protocolFeeBps = bps;
+    function scheduleProtocolTreasuryUpdate(address newTreasury) external onlyRole(ADMIN_ROLE) {
+        if (newTreasury == address(0)) revert InvalidAddress();
+        _scheduleProtocolTreasuryUpdate(newTreasury);
+    }
+
+    function executeProtocolTreasuryUpdate() external onlyRole(ADMIN_ROLE) {
+        _executeProtocolTreasuryUpdate();
+    }
+
+    function withdrawFees(address token, uint256 amount) external onlyRole(ADMIN_ROLE) nonReentrant {
+        if (amount == 0) revert NothingToWithdraw();
+        if (treasury == address(0)) revert InvalidAddress();
+        uint256 avail = _claimable[treasury][token];
+        if (amount > avail) revert InsufficientProtocolBalance(amount, avail);
+        _claimable[treasury][token] = avail - amount;
+        IERC20(token).safeTransfer(treasury, amount);
+        emit ProtocolFeesWithdrawn(treasury, token, amount);
     }
 
     function setTimer(uint8 which, uint256 d) external onlyRole(ADMIN_ROLE) {
