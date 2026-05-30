@@ -3,13 +3,13 @@ pragma solidity ^0.8.28;
 
 import "../base/ProtocolFeeBase.sol";
 
-import "@openzeppelin/contracts/access/AccessControl.sol";
-import "@openzeppelin/contracts/utils/Pausable.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "../interfaces/IPlayerRegistry.sol";
-import "./TransferWindow.sol";
 import "../interfaces/ITransferWindow.sol";
 import "../interfaces/IAddressRegistry.sol";
 import "../utils/RegistryKeys.sol";
@@ -20,12 +20,32 @@ import "../utils/RegistryKeys.sol";
  * @notice Escrow contract for professional football player loan deals.
  *         Handles loan fee escrow, player ownership transfer to borrowing club,
  *         expiry return, recall clauses, and optional permanent purchase.
- * @dev Security-first: pull payments, strict state machine, reentrancy guards,
- *      whitelisted tokens only. Player ownership always has a defined home.
- *      Requires ESCROW_ROLE on PlayerRegistry — must be granted post-deployment by admin.
+ * @dev UUPS upgradeable. Security-first: pull payments, strict state machine,
+ *      custom reentrancy guard, whitelisted tokens only. Critical address
+ *      updates (playerRegistry, addressRegistry) are timelocked at 48 hours.
+ *      Storage gap of 40 slots reserved for future upgrades.
+ *      Requires ESCROW_ROLE on PlayerRegistry — must be granted post-deployment.
  */
-contract LoanEscrow is ProtocolFeeBase, AccessControl, Pausable, ReentrancyGuard {
+contract LoanEscrow is
+    ProtocolFeeBase,
+    Initializable,
+    AccessControlUpgradeable,
+    PausableUpgradeable,
+    UUPSUpgradeable
+{
     using SafeERC20 for IERC20;
+
+    // ─── Reentrancy Guard ─────────────────────────────────────────────────────
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED     = 2;
+    uint256 private _reentrancyStatus;
+
+    modifier nonReentrant() {
+        if (_reentrancyStatus == _ENTERED) revert ReentrantCall();
+        _reentrancyStatus = _ENTERED;
+        _;
+        _reentrancyStatus = _NOT_ENTERED;
+    }
 
     // ─── Roles ────────────────────────────────────────────────────────────────
     bytes32 public constant ADMIN_ROLE  = keccak256("ADMIN_ROLE");
@@ -33,12 +53,14 @@ contract LoanEscrow is ProtocolFeeBase, AccessControl, Pausable, ReentrancyGuard
     bytes32 public constant CLUB_ROLE   = keccak256("CLUB_ROLE");
 
     // ─── Constants ────────────────────────────────────────────────────────────
-    uint256 public constant DISPUTE_WINDOW    = 48 hours;
-    uint256 public constant MIN_LOAN_DURATION = 30 days;
-    uint256 public constant MAX_LOAN_DURATION = 365 days;
-    uint256 public constant MIN_RECALL_NOTICE = 14 days;
-    uint256 public constant MAX_PRICE         = 500_000_000 ether;
-    uint256 public constant MAX_LOAN_FEE      = 100_000_000 ether;
+    uint256 public constant DISPUTE_WINDOW       = 48 hours;
+    uint256 public constant MIN_LOAN_DURATION    = 30 days;
+    uint256 public constant MAX_LOAN_DURATION    = 365 days;
+    uint256 public constant MIN_RECALL_NOTICE    = 14 days;
+    uint256 public constant MAX_PRICE            = 500_000_000 ether;
+    uint256 public constant MAX_LOAN_FEE         = 100_000_000 ether;
+    // I timelock critical address changes to match treasury timelock in ProtocolFeeBase
+    uint256 public constant REGISTRY_UPDATE_DELAY = 48 hours;
 
     // ─── Loan State Machine ───────────────────────────────────────────────────
     enum LoanState {
@@ -70,20 +92,36 @@ contract LoanEscrow is ProtocolFeeBase, AccessControl, Pausable, ReentrancyGuard
         string    rejectionReason;
     }
 
-    // ─── State ────────────────────────────────────────────────────────────────
+    // I use a shared struct for both timelocked registry updates
+    struct PendingRegistryUpdate {
+        address newAddress;
+        uint256 scheduledAt;
+        bool    exists;
+    }
+
+    // ─── State Variables ──────────────────────────────────────────────────────
     uint256 private _loanIdCounter;
 
     // I store loan durations separately to avoid struct stack depth issues
     mapping(uint256 => uint256) private _loanDurations;
 
-    IPlayerRegistry public immutable playerRegistry;
-    IAddressRegistry public immutable addressRegistry;
+    IPlayerRegistry  public playerRegistry;
+    IAddressRegistry public addressRegistry;
+
+    // I timelock registry address changes — compromise of ADMIN_ROLE alone
+    // is insufficient to immediately redirect player/registry calls
+    PendingRegistryUpdate private _pendingPlayerRegistry;
+    PendingRegistryUpdate private _pendingAddressRegistry;
 
     mapping(uint256 => Loan)                        private _loans;
     mapping(address => mapping(address => uint256)) private _claimable;
     mapping(uint256 => uint256)                     private _activePlayerLoan;
     mapping(address => bool)                        private _approvedTokens;
     address[]                                       private _approvedTokenList;
+
+    // I reserve 40 storage slots for future upgrades — never remove or reorder
+    // variables above this line
+    uint256[40] private __gap;
 
     // ─── Events ───────────────────────────────────────────────────────────────
     event LoanCreated(uint256 indexed loanId, uint256 indexed playerId, address parentClub, address borrowingClub, uint256 loanFee);
@@ -98,6 +136,10 @@ contract LoanEscrow is ProtocolFeeBase, AccessControl, Pausable, ReentrancyGuard
     event FundsClaimed(address indexed recipient, address indexed token, uint256 amount);
     event TokenApproved(address indexed token);
     event TokenRevoked(address indexed token);
+    event PlayerRegistryUpdateScheduled(address indexed newAddress, uint256 executableAt);
+    event PlayerRegistryUpdated(address indexed oldAddress, address indexed newAddress);
+    event AddressRegistryUpdateScheduled(address indexed newAddress, uint256 executableAt);
+    event AddressRegistryUpdated(address indexed oldAddress, address indexed newAddress);
 
     // ─── Errors ───────────────────────────────────────────────────────────────
     error InvalidAddress();
@@ -128,23 +170,43 @@ contract LoanEscrow is ProtocolFeeBase, AccessControl, Pausable, ReentrancyGuard
     error PlayerNotListed();
     error ParentClubMismatch();
     error ParentClubNotRegistered();
-
     error NothingToWithdraw();
     error InsufficientProtocolBalance(uint256 requested, uint256 available);
-
+    error ReentrantCall();
+    error NoPendingRegistryUpdate();
+    error RegistryUpdateNotReady();
 
     // ─── Constructor ──────────────────────────────────────────────────────────
-    constructor(address _playerRegistry, address _addressRegistry) {
-        if (_playerRegistry == address(0)) revert InvalidAddress();
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() { _disableInitializers(); }
+
+    // ─── Initializer ──────────────────────────────────────────────────────────
+    function initialize(
+        address _playerRegistry,
+        address _addressRegistry,
+        address _treasury,
+        address _admin
+    ) external initializer {
+        if (_playerRegistry  == address(0)) revert InvalidAddress();
         if (_addressRegistry == address(0)) revert InvalidAddress();
+        if (_treasury        == address(0)) revert InvalidAddress();
+        if (_admin           == address(0)) revert InvalidAddress();
 
-        playerRegistry = IPlayerRegistry(_playerRegistry);
+        __AccessControl_init();
+        __Pausable_init();
+        _reentrancyStatus = _NOT_ENTERED;
+
+        playerRegistry  = IPlayerRegistry(_playerRegistry);
         addressRegistry = IAddressRegistry(_addressRegistry);
+        treasury        = _treasury;
+        protocolFeeBps  = 50;
 
-        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
-        _grantRole(ADMIN_ROLE, msg.sender);
-        _grantRole(LEAGUE_ROLE, msg.sender);
+        _grantRole(DEFAULT_ADMIN_ROLE, _admin);
+        _grantRole(ADMIN_ROLE,         _admin);
+        _grantRole(LEAGUE_ROLE,        _admin);
     }
+
+    function _authorizeUpgrade(address) internal override onlyRole(DEFAULT_ADMIN_ROLE) {}
 
     // ─── Modifiers ────────────────────────────────────────────────────────────
     modifier loanExists(uint256 loanId) {
@@ -181,6 +243,88 @@ contract LoanEscrow is ProtocolFeeBase, AccessControl, Pausable, ReentrancyGuard
         emit TokenRevoked(token);
     }
 
+    // ─── Timelocked Registry Updates ─────────────────────────────────────────
+
+    /**
+     * @notice Schedule a playerRegistry address update.
+     * @dev 48-hour timelock prevents an ADMIN_ROLE compromise from immediately
+     *      redirecting all player lookups to a malicious registry.
+     */
+    function schedulePlayerRegistryUpdate(address newAddress) external onlyRole(ADMIN_ROLE) {
+        if (newAddress == address(0)) revert InvalidAddress();
+        _pendingPlayerRegistry = PendingRegistryUpdate({
+            newAddress:  newAddress,
+            scheduledAt: block.timestamp,
+            exists:      true
+        });
+        emit PlayerRegistryUpdateScheduled(newAddress, block.timestamp + REGISTRY_UPDATE_DELAY);
+    }
+
+    function executePlayerRegistryUpdate() external onlyRole(ADMIN_ROLE) {
+        if (!_pendingPlayerRegistry.exists) revert NoPendingRegistryUpdate();
+        if (block.timestamp < _pendingPlayerRegistry.scheduledAt + REGISTRY_UPDATE_DELAY)
+            revert RegistryUpdateNotReady();
+        address old    = address(playerRegistry);
+        address newAddr = _pendingPlayerRegistry.newAddress;
+        delete _pendingPlayerRegistry;
+        playerRegistry = IPlayerRegistry(newAddr);
+        emit PlayerRegistryUpdated(old, newAddr);
+    }
+
+    /**
+     * @notice Schedule an addressRegistry update.
+     * @dev Same 48-hour timelock — addressRegistry resolves the transfer window,
+     *      so redirecting it could bypass all window checks.
+     */
+    function scheduleAddressRegistryUpdate(address newAddress) external onlyRole(ADMIN_ROLE) {
+        if (newAddress == address(0)) revert InvalidAddress();
+        _pendingAddressRegistry = PendingRegistryUpdate({
+            newAddress:  newAddress,
+            scheduledAt: block.timestamp,
+            exists:      true
+        });
+        emit AddressRegistryUpdateScheduled(newAddress, block.timestamp + REGISTRY_UPDATE_DELAY);
+    }
+
+    function executeAddressRegistryUpdate() external onlyRole(ADMIN_ROLE) {
+        if (!_pendingAddressRegistry.exists) revert NoPendingRegistryUpdate();
+        if (block.timestamp < _pendingAddressRegistry.scheduledAt + REGISTRY_UPDATE_DELAY)
+            revert RegistryUpdateNotReady();
+        address old     = address(addressRegistry);
+        address newAddr = _pendingAddressRegistry.newAddress;
+        delete _pendingAddressRegistry;
+        addressRegistry = IAddressRegistry(newAddr);
+        emit AddressRegistryUpdated(old, newAddr);
+    }
+
+    // ─── Admin ────────────────────────────────────────────────────────────────
+
+    function setProtocolFee(uint256 bps) external onlyRole(ADMIN_ROLE) {
+        _setProtocolFee(bps);
+    }
+
+    function scheduleProtocolTreasuryUpdate(address newTreasury) external onlyRole(ADMIN_ROLE) {
+        if (newTreasury == address(0)) revert InvalidAddress();
+        _scheduleProtocolTreasuryUpdate(newTreasury);
+    }
+
+    function executeProtocolTreasuryUpdate() external onlyRole(ADMIN_ROLE) {
+        _executeProtocolTreasuryUpdate();
+    }
+
+    function withdrawFees(address token, uint256 amount) external onlyRole(ADMIN_ROLE) nonReentrant {
+        if (amount == 0) revert NothingToWithdraw();
+        if (treasury == address(0)) revert InvalidAddress();
+        uint256 avail = _claimable[treasury][token];
+        if (amount > avail) revert InsufficientProtocolBalance(amount, avail);
+        _claimable[treasury][token] = avail - amount;
+        IERC20(token).safeTransfer(treasury, amount);
+        emit ProtocolFeesWithdrawn(treasury, token, amount);
+    }
+
+    function pause()   external onlyRole(ADMIN_ROLE) { _pause(); }
+    function unpause() external onlyRole(ADMIN_ROLE) { _unpause(); }
+
     // ─── Borrowing Club Functions ─────────────────────────────────────────────
 
     /**
@@ -206,24 +350,22 @@ contract LoanEscrow is ProtocolFeeBase, AccessControl, Pausable, ReentrancyGuard
         returns (uint256 loanId)
     {
         if (parentClub == address(0) || parentClub == msg.sender) revert InvalidAddress();
-        if (loanFee == 0 || loanFee > MAX_LOAN_FEE) revert InvalidAmount();
+        if (loanFee == 0 || loanFee > MAX_LOAN_FEE)              revert InvalidAmount();
         if (loanDuration < MIN_LOAN_DURATION || loanDuration > MAX_LOAN_DURATION) revert InvalidDuration();
         if (hasOptionToBuy && (optionPrice == 0 || optionPrice > MAX_PRICE)) revert InvalidOptionPrice();
-        if (!hasOptionToBuy && optionPrice != 0) revert InvalidOptionPrice();
-        if (_activePlayerLoan[playerId] != 0) revert LoanAlreadyActive();
-        if (!ITransferWindow(addressRegistry.get(RegistryKeys.TRANSFER_WINDOW)).isWindowOpen()) revert TransferWindowClosed();
+        if (!hasOptionToBuy && optionPrice != 0)                  revert InvalidOptionPrice();
+        if (_activePlayerLoan[playerId] != 0)                     revert LoanAlreadyActive();
+        if (!ITransferWindow(addressRegistry.get(RegistryKeys.TRANSFER_WINDOW)).isWindowOpen())
+            revert TransferWindowClosed();
 
-        // I verify parent club still holds CLUB_ROLE
         if (!playerRegistry.hasClubRole(parentClub)) revert ParentClubNotRegistered();
 
-        // I verify player is listed and belongs to the stated parent club
         IPlayerRegistry.Player memory player = playerRegistry.getPlayer(playerId);
-        if (!player.isListed) revert PlayerNotListed();
-        if (playerRegistry.currentClub(playerId) != parentClub) revert ParentClubMismatch();
+        if (!player.isListed)                                     revert PlayerNotListed();
+        if (playerRegistry.currentClub(playerId) != parentClub)   revert ParentClubMismatch();
 
         _loanIdCounter++;
         loanId = _loanIdCounter;
-
         _loanDurations[loanId] = loanDuration;
 
         _loans[loanId] = Loan({
@@ -246,6 +388,7 @@ contract LoanEscrow is ProtocolFeeBase, AccessControl, Pausable, ReentrancyGuard
 
         _activePlayerLoan[playerId] = loanId;
 
+        // I transfer funds last — CEI order
         IERC20(paymentToken).safeTransferFrom(msg.sender, address(this), loanFee);
 
         emit LoanCreated(loanId, playerId, parentClub, msg.sender, loanFee);
@@ -259,9 +402,8 @@ contract LoanEscrow is ProtocolFeeBase, AccessControl, Pausable, ReentrancyGuard
     {
         Loan storage loan = _loans[loanId];
         if (loan.borrowingClub != msg.sender) revert NotBorrowingClub();
-        if (loan.state != LoanState.PENDING) revert LoanNotPending();
+        if (loan.state != LoanState.PENDING)  revert LoanNotPending();
 
-        // effects
         loan.state = LoanState.CANCELLED;
         _activePlayerLoan[loan.playerId] = 0;
         _claimable[msg.sender][loan.paymentToken] += loan.loanFee;
@@ -273,8 +415,7 @@ contract LoanEscrow is ProtocolFeeBase, AccessControl, Pausable, ReentrancyGuard
 
     /**
      * @notice League approves the loan and transfers player to borrowing club.
-     * @dev I update all state before the external registry call — CEI pattern.
-     *      The registry call is the last action in this function.
+     * @dev CEI: all state settled before external registry call.
      */
     function approveLoan(uint256 loanId)
         external
@@ -286,13 +427,11 @@ contract LoanEscrow is ProtocolFeeBase, AccessControl, Pausable, ReentrancyGuard
         Loan storage loan = _loans[loanId];
         if (loan.state != LoanState.PENDING) revert LoanNotPending();
 
-        // effects — all state settled before external call
         loan.state      = LoanState.ACTIVE;
         loan.loanStart  = block.timestamp;
         loan.loanExpiry = block.timestamp + _loanDurations[loanId];
         loan.approvedAt = block.timestamp;
 
-        // interaction — external call last
         playerRegistry.escrowTransfer(loan.playerId, loan.parentClub, loan.borrowingClub);
 
         emit LoanApproved(loanId, msg.sender);
@@ -332,13 +471,13 @@ contract LoanEscrow is ProtocolFeeBase, AccessControl, Pausable, ReentrancyGuard
         loanExists(loanId)
     {
         Loan storage loan = _loans[loanId];
-        if (loan.parentClub != msg.sender) revert NotParentClub();
-        if (loan.state != LoanState.ACTIVE) revert LoanNotActive();
-        if (block.timestamp < loan.approvedAt + DISPUTE_WINDOW) revert DisputeWindowActive();
-        if (loan.loanFeeClaimed) revert LoanFeeAlreadyClaimed();
+        if (loan.parentClub != msg.sender)                          revert NotParentClub();
+        if (loan.state != LoanState.ACTIVE)                         revert LoanNotActive();
+        if (block.timestamp < loan.approvedAt + DISPUTE_WINDOW)     revert DisputeWindowActive();
+        if (loan.loanFeeClaimed)                                     revert LoanFeeAlreadyClaimed();
 
         loan.loanFeeClaimed = true;
-        uint256 loanFeeNet = loan.loanFee;
+        uint256 loanFeeNet  = loan.loanFee;
         if (treasury != address(0) && protocolFeeBps > 0) {
             uint256 protocolAmt = loanFeeNet * protocolFeeBps / 10_000;
             loanFeeNet -= protocolAmt;
@@ -356,9 +495,9 @@ contract LoanEscrow is ProtocolFeeBase, AccessControl, Pausable, ReentrancyGuard
         loanExists(loanId)
     {
         Loan storage loan = _loans[loanId];
-        if (loan.parentClub != msg.sender) revert NotParentClub();
-        if (loan.state != LoanState.ACTIVE) revert LoanNotActive();
-        if (loan.recallRequestedAt != 0) revert RecallAlreadyRequested();
+        if (loan.parentClub != msg.sender)    revert NotParentClub();
+        if (loan.state != LoanState.ACTIVE)   revert LoanNotActive();
+        if (loan.recallRequestedAt != 0)      revert RecallAlreadyRequested();
 
         loan.recallRequestedAt = block.timestamp;
 
@@ -376,16 +515,14 @@ contract LoanEscrow is ProtocolFeeBase, AccessControl, Pausable, ReentrancyGuard
         loanExists(loanId)
     {
         Loan storage loan = _loans[loanId];
-        if (loan.parentClub != msg.sender) revert NotParentClub();
-        if (loan.state != LoanState.ACTIVE) revert LoanNotActive();
-        if (loan.recallRequestedAt == 0) revert LoanNotActive();
+        if (loan.parentClub != msg.sender)   revert NotParentClub();
+        if (loan.state != LoanState.ACTIVE)  revert LoanNotActive();
+        if (loan.recallRequestedAt == 0)     revert LoanNotActive();
         if (block.timestamp < loan.recallRequestedAt + MIN_RECALL_NOTICE) revert RecallNoticeNotMet();
 
-        // effects
         loan.state = LoanState.RECALLED;
         _activePlayerLoan[loan.playerId] = 0;
 
-        // interaction
         playerRegistry.escrowTransfer(loan.playerId, loan.borrowingClub, loan.parentClub);
 
         emit LoanRecalled(loanId);
@@ -395,9 +532,8 @@ contract LoanEscrow is ProtocolFeeBase, AccessControl, Pausable, ReentrancyGuard
 
     /**
      * @notice Settles an expired loan and returns player to parent club.
-     * @dev I restrict callers to parentClub, borrowingClub, or LEAGUE_ROLE only.
-     *      This prevents third-party griefing by triggering expiry at an
-     *      inconvenient moment for either club.
+     * @dev I restrict callers to parentClub, borrowingClub, or LEAGUE_ROLE only
+     *      to prevent third-party griefing.
      */
     function settleLoanExpiry(uint256 loanId)
         external
@@ -406,20 +542,17 @@ contract LoanEscrow is ProtocolFeeBase, AccessControl, Pausable, ReentrancyGuard
         loanExists(loanId)
     {
         Loan storage loan = _loans[loanId];
-        if (loan.state != LoanState.ACTIVE) revert LoanNotActive();
-        if (block.timestamp < loan.loanExpiry) revert LoanStillActive();
+        if (loan.state != LoanState.ACTIVE)         revert LoanNotActive();
+        if (block.timestamp < loan.loanExpiry)       revert LoanStillActive();
 
-        // I restrict who can trigger expiry settlement
-        bool authorised = msg.sender == loan.parentClub ||
+        bool authorised = msg.sender == loan.parentClub    ||
                           msg.sender == loan.borrowingClub ||
                           hasRole(LEAGUE_ROLE, msg.sender);
         if (!authorised) revert NotAuthorised();
 
-        // effects
         loan.state = LoanState.EXPIRED;
         _activePlayerLoan[loan.playerId] = 0;
 
-        // interaction
         playerRegistry.escrowTransfer(loan.playerId, loan.borrowingClub, loan.parentClub);
 
         emit LoanExpired(loanId);
@@ -429,10 +562,10 @@ contract LoanEscrow is ProtocolFeeBase, AccessControl, Pausable, ReentrancyGuard
 
     /**
      * @notice Borrowing club exercises the option to buy before loan expiry.
-     * @dev Player is already at the borrowing club from approveLoan — no ownership
-     *      change is needed here. The loan is marked COMPLETED and the parent club
-     *      receives the option price via pull withdrawal.
-     *      CEI: state and claimable updated before the safeTransferFrom interaction.
+     * @dev Player is already at the borrowing club from approveLoan — no NFT move needed.
+     *      CEI: state and claimable updated before safeTransferFrom to ensure
+     *      a transfer revert does not leave a claimable balance backed by no tokens.
+     *      Protocol fee deducted only after funds are confirmed received.
      */
     function exerciseOption(uint256 loanId)
         external
@@ -442,19 +575,18 @@ contract LoanEscrow is ProtocolFeeBase, AccessControl, Pausable, ReentrancyGuard
     {
         Loan storage loan = _loans[loanId];
         if (loan.borrowingClub != msg.sender) revert NotBorrowingClub();
-        if (loan.state != LoanState.ACTIVE) revert LoanNotActive();
-        if (!loan.hasOptionToBuy) revert NoOptionToBuy();
+        if (loan.state != LoanState.ACTIVE)   revert LoanNotActive();
+        if (!loan.hasOptionToBuy)             revert NoOptionToBuy();
         if (block.timestamp >= loan.loanExpiry) revert OptionExpired();
 
-        // effects — mark state as completed and clear active loan before token transfer
+        // I mark COMPLETED and clear active loan before pulling funds
         loan.state = LoanState.COMPLETED;
         _activePlayerLoan[loan.playerId] = 0;
 
-        // interaction — pull funds BEFORE crediting claimable so a revert here
-        // does not leave the parent club with a claimable balance backed by no tokens
+        // I pull funds before crediting claimable — a revert here rolls back
+        // the state change above, leaving no phantom claimable balance
         IERC20(loan.paymentToken).safeTransferFrom(msg.sender, address(this), loan.optionPrice);
 
-        // I credit parent club only after funds are confirmed received, less protocol cut
         uint256 optionNet = loan.optionPrice;
         if (treasury != address(0) && protocolFeeBps > 0) {
             uint256 protocolAmt = optionNet * protocolFeeBps / 10_000;
@@ -463,57 +595,29 @@ contract LoanEscrow is ProtocolFeeBase, AccessControl, Pausable, ReentrancyGuard
         }
         _claimable[loan.parentClub][loan.paymentToken] += optionNet;
 
-        // Note: player ownership is already at borrowingClub from approveLoan.
-        // COMPLETED state means no expiry or recall can move it back — ownership
-        // is permanently settled at borrowingClub without a registry call needed here.
-
         emit OptionExercised(loanId, loan.optionPrice);
     }
 
     // ─── Pull Withdrawal ──────────────────────────────────────────────────────
 
+    /**
+     * @notice Withdraw claimable balance for a token.
+     * @dev Deliberately not gated on whenNotPaused — users must always be able
+     *      to withdraw their own funds regardless of contract pause state.
+     */
     function withdrawClaimable(address token)
         external
         nonReentrant
     {
-        // I do not gate on approved tokens — revoked tokens must still be withdrawable
         uint256 amount = _claimable[msg.sender][token];
         if (amount == 0) revert NothingToClaim();
-
         _claimable[msg.sender][token] = 0;
         IERC20(token).safeTransfer(msg.sender, amount);
-
         emit FundsClaimed(msg.sender, token, amount);
     }
 
-    // ─── Admin Functions ──────────────────────────────────────────────────────
-    function setProtocolFee(uint256 bps) external onlyRole(ADMIN_ROLE) {
-        _setProtocolFee(bps);
-    }
-
-    function scheduleProtocolTreasuryUpdate(address newTreasury) external onlyRole(ADMIN_ROLE) {
-        if (newTreasury == address(0)) revert InvalidAddress();
-        _scheduleProtocolTreasuryUpdate(newTreasury);
-    }
-
-    function executeProtocolTreasuryUpdate() external onlyRole(ADMIN_ROLE) {
-        _executeProtocolTreasuryUpdate();
-    }
-
-    function withdrawFees(address token, uint256 amount) external onlyRole(ADMIN_ROLE) nonReentrant {
-        if (amount == 0) revert NothingToWithdraw();
-        if (treasury == address(0)) revert InvalidAddress();
-        uint256 avail = _claimable[treasury][token];
-        if (amount > avail) revert InsufficientProtocolBalance(amount, avail);
-        _claimable[treasury][token] = avail - amount;
-        IERC20(token).safeTransfer(treasury, amount);
-        emit ProtocolFeesWithdrawn(treasury, token, amount);
-    }
-
-    function pause() external onlyRole(ADMIN_ROLE) { _pause(); }
-    function unpause() external onlyRole(ADMIN_ROLE) { _unpause(); }
-
     // ─── Views ────────────────────────────────────────────────────────────────
+
     function getLoan(uint256 loanId) external view loanExists(loanId) returns (Loan memory) {
         return _loans[loanId];
     }

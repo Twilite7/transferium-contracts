@@ -36,11 +36,16 @@ async function deployAll() {
   const addressReg = await AddressRegistryF.deploy(admin.address);
   await addressReg.seed(ethers.keccak256(ethers.toUtf8Bytes("TRANSFER_WINDOW")), await transferWindow.getAddress());
 
-  const LoanEscrowF = await ethers.getContractFactory("LoanEscrow");
-  const loanEscrow = await LoanEscrowF.deploy(
+  const LoanEscrowF  = await ethers.getContractFactory("LoanEscrow");
+  const loanImpl     = await LoanEscrowF.deploy();
+  const loanInit     = loanImpl.interface.encodeFunctionData("initialize", [
     await registry.getAddress(),
-    await addressReg.getAddress()
-  );
+    await addressReg.getAddress(),
+    admin.address,
+    admin.address,
+  ]);
+  const loanProxy    = await Proxy.deploy(await loanImpl.getAddress(), loanInit);
+  const loanEscrow   = LoanEscrowF.attach(await loanProxy.getAddress());
 
   // ─── UUPS proxy contracts ──────────────────────────────────────────────────
   const FeeLibF    = await ethers.getContractFactory("FeeLib");
