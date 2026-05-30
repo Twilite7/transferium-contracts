@@ -104,7 +104,7 @@ async function deployAll() {
   return {
     ethers,
     admin, registrar, clubA, clubB, clubC, other,
-    token, registry, transferWindow, escrow, dealEscrow, loanEscrow,
+    token, registry, transferWindow, escrow, dealEscrow, loanEscrow, addressReg,
     CLUB_ROLE, REGISTRAR_ROLE, ESCROW_ROLE, LEAGUE_ROLE,
   };
 }
@@ -115,14 +115,15 @@ async function setupListedPlayer(
   registry: any,
   club: any,
   registrar: any,
-  weeklySalary = ethers.parseUnits("50000", 6) // €50k/week default
+  weeklySalary = ethers.parseUnits("50000", 6), // €50k/week default
+  salt = "1"
 ): Promise<bigint> {
   const now    = await getChainTime(ethers);
   const expiry = now + 365 * 24 * 3600;
 
   const tx = await registry.connect(club).registerPlayer(
     "Kylian Mbappe", "ST", "French", expiry, weeklySalary,
-    ethers.id("player-1") // fifaId
+    ethers.id(`player-${salt}`) // fifaId — unique per salt
   );
   const receipt = await tx.wait();
   const event   = receipt.logs
@@ -134,13 +135,13 @@ async function setupListedPlayer(
   await registry.connect(registrar).markPlayerVerified(playerId, registrar.address);
 
   // I set medical clearance
-  const medHash = ethers.keccak256(ethers.toUtf8Bytes("medical-report-001"));
+  const medHash = ethers.keccak256(ethers.toUtf8Bytes(`medical-report-${salt}`));
   await registry.connect(club).setMedicalClearance(playerId, medHash);
 
   // I submit legal documents
-  const regHash  = ethers.keccak256(ethers.toUtf8Bytes("registration-contract"));
-  const idHash   = ethers.keccak256(ethers.toUtf8Bytes("passport-001"));
-  const tmsHash  = ethers.keccak256(ethers.toUtf8Bytes("fifa-tms-ref"));
+  const regHash  = ethers.keccak256(ethers.toUtf8Bytes(`registration-contract-${salt}`));
+  const idHash   = ethers.keccak256(ethers.toUtf8Bytes(`passport-${salt}`));
+  const tmsHash  = ethers.keccak256(ethers.toUtf8Bytes(`fifa-tms-ref-${salt}`));
   await registry.connect(club).submitLegalDocuments(playerId, regHash, tmsHash, ethers.ZeroHash);
 
   // I verify legal documents
@@ -961,3 +962,206 @@ describe("Transferium Protocol v2", function () {
 
   });
 });
+
+  describe("SwapEscrow", function () {
+
+    async function deployWithSwap() {
+      const base = await deployAll();
+      const { ethers, admin, clubA, clubB, registrar, registry, token } = base as any;
+
+      const Proxy       = await ethers.getContractFactory("TransferiumProxy");
+      const SwapEscrowF = await ethers.getContractFactory("SwapEscrow");
+      const swapImpl    = await SwapEscrowF.deploy();
+      const swapInit    = swapImpl.interface.encodeFunctionData("initialize", [
+        await registry.getAddress(),
+        await base.addressReg.getAddress(),
+        await base.escrow.getAddress(),
+        admin.address,
+        admin.address,
+      ]);
+      const swapProxy  = await Proxy.deploy(await swapImpl.getAddress(), swapInit);
+      const swapEscrow = SwapEscrowF.attach(await swapProxy.getAddress());
+
+      const ESCROW_ROLE = await registry.ESCROW_ROLE();
+      const CLUB_ROLE   = await swapEscrow.CLUB_ROLE();
+      await registry.grantRole(ESCROW_ROLE, await swapEscrow.getAddress());
+      await swapEscrow.grantRole(CLUB_ROLE, clubA.address);
+      await swapEscrow.grantRole(CLUB_ROLE, clubB.address);
+      await swapEscrow.connect(admin).setProtocolFee(0);
+      await swapEscrow.approveToken(await token.getAddress());
+
+      // Register + fully verify one player at each club, with player wallets set
+      const playerA = await setupListedPlayer(ethers, registry, clubA, registrar, ethers.parseUnits("50000", 6), "swapA");
+      const playerB = await setupListedPlayer(ethers, registry, clubB, registrar, ethers.parseUnits("50000", 6), "swapB");
+
+      // Create fresh wallets for player consent
+      const walletA = ethers.Wallet.createRandom().connect(ethers.provider);
+      const walletB = ethers.Wallet.createRandom().connect(ethers.provider);
+      await clubA.sendTransaction({ to: walletA.address, value: ethers.parseEther("1") });
+      await clubB.sendTransaction({ to: walletB.address, value: ethers.parseEther("1") });
+      await registry.connect(clubA).setPlayerWallet(playerA, walletA.address);
+      await registry.connect(clubB).setPlayerWallet(playerB, walletB.address);
+
+      await openTransferWindow(ethers, base.transferWindow);
+
+      return { ...base, swapEscrow, playerA, playerB, walletA, walletB };
+    }
+
+    async function proposeAndAccept(ctx: any) {
+      const { ethers, swapEscrow, clubA, clubB, playerA, playerB, token } = ctx;
+      await swapEscrow.connect(clubA).proposeSwap(
+        playerA, playerB, await token.getAddress(), 0n, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress
+      );
+      await swapEscrow.connect(clubB).acceptSwap(1n);
+    }
+
+    async function consentBoth(ctx: any) {
+      const { swapEscrow, walletA, walletB } = ctx;
+      await swapEscrow.connect(walletA).consentToSwap(1n);
+      await swapEscrow.connect(walletB).consentToSwap(1n);
+    }
+
+    it("proposeSwap creates swap in PROPOSED state", async function () {
+      const ctx = await deployWithSwap();
+      const { ethers, swapEscrow, clubA, playerA, playerB, token } = ctx;
+      const tx = await swapEscrow.connect(clubA).proposeSwap(
+        playerA, playerB, await token.getAddress(), 0n, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress
+      );
+      await expect(tx).to.emit(swapEscrow, "SwapProposed");
+      const swap = await swapEscrow.getSwap(1n);
+      expect(swap.state).to.equal(1n); // PROPOSED
+      expect(swap.playerA).to.equal(playerA);
+      expect(swap.playerB).to.equal(playerB);
+    });
+
+    it("Club B accepts swap → ACCEPTED state", async function () {
+      const ctx = await deployWithSwap();
+      const { ethers, swapEscrow, clubA, clubB, playerA, playerB, token } = ctx;
+      await swapEscrow.connect(clubA).proposeSwap(playerA, playerB, await token.getAddress(), 0n, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress);
+      await expect(swapEscrow.connect(clubB).acceptSwap(1n)).to.emit(swapEscrow, "SwapAccepted");
+      expect((await swapEscrow.getSwap(1n)).state).to.equal(2n); // ACCEPTED
+    });
+
+    it("Club B rejects swap → CANCELLED", async function () {
+      const ctx = await deployWithSwap();
+      const { ethers, swapEscrow, clubA, clubB, playerA, playerB, token } = ctx;
+      await swapEscrow.connect(clubA).proposeSwap(playerA, playerB, await token.getAddress(), 0n, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress);
+      await expect(swapEscrow.connect(clubB).rejectSwap(1n)).to.emit(swapEscrow, "SwapCancelled");
+      expect((await swapEscrow.getSwap(1n)).state).to.equal(10n); // CANCELLED
+    });
+
+    it("Club A withdraws proposal → CANCELLED", async function () {
+      const ctx = await deployWithSwap();
+      const { ethers, swapEscrow, clubA, playerA, playerB, token } = ctx;
+      await swapEscrow.connect(clubA).proposeSwap(playerA, playerB, await token.getAddress(), 0n, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress);
+      await expect(swapEscrow.connect(clubA).withdrawProposal(1n)).to.emit(swapEscrow, "SwapCancelled");
+    });
+
+    it("pure swap full flow: propose → accept → consent x2 → medical x2 → NFTs swapped", async function () {
+      const ctx = await deployWithSwap();
+      const { ethers, swapEscrow, clubA, clubB, playerA, playerB, registry } = ctx;
+
+      await proposeAndAccept(ctx);
+      await consentBoth(ctx);
+
+      const hash = ethers.keccak256(ethers.toUtf8Bytes("medical-ok"));
+      await swapEscrow.connect(clubA).submitMedicalAonB(1n, 1n, hash); // PASSED=1
+      await expect(
+        swapEscrow.connect(clubB).submitMedicalBonA(1n, 1n, hash)
+      ).to.emit(swapEscrow, "SwapCompleted");
+
+      expect(await registry.currentClub(playerA)).to.equal(clubB.address);
+      expect(await registry.currentClub(playerB)).to.equal(clubA.address);
+    });
+
+    it("medical failure (Club A on Player B) cancels swap", async function () {
+      const ctx = await deployWithSwap();
+      const { ethers, swapEscrow, clubA } = ctx;
+
+      await proposeAndAccept(ctx);
+      await consentBoth(ctx);
+
+      const hash = ethers.keccak256(ethers.toUtf8Bytes("fail"));
+      await expect(
+        swapEscrow.connect(clubA).submitMedicalAonB(1n, 2n, hash) // FAILED=2
+      ).to.emit(swapEscrow, "SwapCancelled");
+      expect((await swapEscrow.getSwap(1n)).state).to.equal(10n);
+    });
+
+    it("swap with top-up: Club B funds, Club A claimable after dispute window", async function () {
+      const ctx = await deployWithSwap();
+      const { ethers, swapEscrow, clubA, clubB, playerA, playerB, token, walletA, walletB, registry } = ctx;
+      const tokenAddr = await token.getAddress();
+      const TOP_UP    = ethers.parseUnits("500000", 6);
+
+      await token.mint(clubB.address, TOP_UP);
+      await token.connect(clubB).approve(await swapEscrow.getAddress(), TOP_UP);
+
+      await swapEscrow.connect(clubA).proposeSwap(playerA, playerB, tokenAddr, TOP_UP, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress);
+      await swapEscrow.connect(clubB).acceptSwap(1n);
+      await swapEscrow.connect(walletA).consentToSwap(1n);
+      await swapEscrow.connect(walletB).consentToSwap(1n);
+
+      const hash = ethers.keccak256(ethers.toUtf8Bytes("medical-ok"));
+      await swapEscrow.connect(clubA).submitMedicalAonB(1n, 1n, hash);
+      await swapEscrow.connect(clubB).submitMedicalBonA(1n, 1n, hash);
+
+      // State is now BOTH_MEDICALS_DONE — Club B must fund
+      await swapEscrow.connect(clubB).fundSwap(1n);
+      expect((await swapEscrow.getSwap(1n)).state).to.equal(7n); // FUNDED
+
+      const swap = await swapEscrow.getSwap(1n);
+      await ethers.provider.send("evm_setNextBlockTimestamp", [Number(swap.disputeDeadline) + 1]);
+      await ethers.provider.send("evm_mine", []);
+
+      await expect(swapEscrow.processExpiry(1n)).to.emit(swapEscrow, "SwapCompleted");
+      expect(await swapEscrow.getClaimable(clubA.address, tokenAddr)).to.equal(TOP_UP);
+    });
+
+    it("mutual cancel proposed and confirmed → CANCELLED", async function () {
+      const ctx = await deployWithSwap();
+      const { swapEscrow, clubA, clubB } = ctx;
+
+      await proposeAndAccept(ctx);
+      await swapEscrow.connect(clubA).proposeMutualCancel(1n);
+      await expect(
+        swapEscrow.connect(clubB).confirmMutualCancel(1n)
+      ).to.emit(swapEscrow, "MutualCancelConfirmed");
+      expect((await swapEscrow.getSwap(1n)).state).to.equal(10n);
+    });
+
+    it("processExpiry cancels PROPOSED swap after consent window expires", async function () {
+      const ctx = await deployWithSwap();
+      const { ethers, swapEscrow, clubA, playerA, playerB, token } = ctx;
+
+      await swapEscrow.connect(clubA).proposeSwap(playerA, playerB, await token.getAddress(), 0n, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress);
+      const swap = await swapEscrow.getSwap(1n);
+      await ethers.provider.send("evm_setNextBlockTimestamp", [Number(swap.stateDeadline) + 1]);
+      await ethers.provider.send("evm_mine", []);
+      await expect(swapEscrow.processExpiry(1n)).to.emit(swapEscrow, "SwapCancelled");
+    });
+
+    it("reverts proposeSwap when transfer window is closed", async function () {
+      const ctx = await deployWithSwap();
+      const { ethers, swapEscrow, clubA, playerA, playerB, token, transferWindow } = ctx;
+
+      const win = await transferWindow.getActiveWindow();
+      await ethers.provider.send("evm_setNextBlockTimestamp", [Number(win.closesAt) + 1]);
+      await ethers.provider.send("evm_mine", []);
+
+      await expect(
+        swapEscrow.connect(clubA).proposeSwap(playerA, playerB, await token.getAddress(), 0n, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress)
+      ).to.be.revertedWithCustomError(swapEscrow, "TransferWindowClosed");
+    });
+
+    it("league force cancels swap", async function () {
+      const ctx = await deployWithSwap();
+      const { ethers, swapEscrow, clubA, admin, playerA, playerB, token } = ctx;
+
+      await swapEscrow.connect(clubA).proposeSwap(playerA, playerB, await token.getAddress(), 0n, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress);
+      await expect(
+        swapEscrow.connect(admin).forceCancel(1n)
+      ).to.emit(swapEscrow, "SwapCancelled");
+    });
+
+  });

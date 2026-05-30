@@ -75,9 +75,9 @@ contract SwapEscrow is
         NONE,
         PROPOSED,                  // Club A proposed, waiting for Club B
         ACCEPTED,                  // Club B accepted, waiting for consents
-        PLAYER_A_CONSENTED,        // Player A consented, waiting for Player B
+        ONE_PLAYER_CONSENTED,      // one player consented, waiting for the other
         BOTH_CONSENTED,            // Both consented, waiting for medicals
-        CLUB_A_MEDICAL_DONE,       // Club A submitted medical on Player B
+        ONE_MEDICAL_DONE,          // one medical submitted, waiting for the other
         BOTH_MEDICALS_DONE,        // Both medicals done, waiting for funding
         FUNDED,                    // Top-up funded, dispute window active
         DISPUTE,                   // Dispute raised
@@ -184,6 +184,7 @@ contract SwapEscrow is
     error MutualCancelExpired();
     error CannotConfirmOwnCancel();
     error DealIsFrozen();
+    error FeesExceed100Pct();
 
     // ---- Initializer ---------------------------------------------------------
 
@@ -268,6 +269,11 @@ contract SwapEscrow is
 
     function revokeToken(address token) external onlyRole(ADMIN_ROLE) {
         _approvedTokens[token] = false;
+    }
+
+    function setTransferEscrow(address _transferEscrow) external onlyRole(ADMIN_ROLE) {
+        if (_transferEscrow == address(0)) revert InvalidAddress();
+        transferEscrow = ITransferEscrow(_transferEscrow);
     }
 
     function pause()   external onlyRole(ADMIN_ROLE) { _pause(); }
@@ -401,6 +407,9 @@ contract SwapEscrow is
      * @notice Player consents to the swap.
      * @dev Either player can consent in any order.
      *      Both must consent before medicals can proceed.
+     *      Transfer window is intentionally NOT checked here — mid-flow
+     *      participants should not be penalised if the league closes the
+     *      window after Club B accepted.
      */
     function consentToSwap(uint256 swapId)
         external whenNotPaused nonReentrant
@@ -408,7 +417,7 @@ contract SwapEscrow is
         Swap storage s = _swaps[swapId];
         if (s.createdAt == 0)                  revert SwapNotFound();
         if (s.state != SwapState.ACCEPTED &&
-            s.state != SwapState.PLAYER_A_CONSENTED) revert WrongState();
+            s.state != SwapState.ONE_PLAYER_CONSENTED) revert WrongState();
         if (block.timestamp > s.stateDeadline) revert ConsentWindowExpired();
 
         IPlayerRegistry.Player memory pA = playerRegistry.getPlayer(s.playerA);
@@ -432,7 +441,7 @@ contract SwapEscrow is
             s.state         = SwapState.BOTH_CONSENTED;
             s.stateDeadline = block.timestamp + medicalWindow;
         } else {
-            s.state = SwapState.PLAYER_A_CONSENTED;
+            s.state = SwapState.ONE_PLAYER_CONSENTED;
         }
     }
 
@@ -447,7 +456,7 @@ contract SwapEscrow is
         Swap storage s = _swaps[swapId];
         if (s.createdAt == 0)                  revert SwapNotFound();
         if (s.state != SwapState.BOTH_CONSENTED &&
-            s.state != SwapState.CLUB_A_MEDICAL_DONE) revert WrongState();
+            s.state != SwapState.ONE_MEDICAL_DONE) revert WrongState();
         if (s.clubA != msg.sender)             revert NotClubA();
         if (block.timestamp > s.stateDeadline) revert MedicalWindowExpired();
         if (s.medicalHashAonB != bytes32(0))   revert MedicalAlreadySubmitted();
@@ -463,11 +472,11 @@ contract SwapEscrow is
             return;
         }
 
-        if (s.state == SwapState.CLUB_A_MEDICAL_DONE) {
+        if (s.state == SwapState.ONE_MEDICAL_DONE) {
             // Club B already submitted — both done
             _advanceToFunding(swapId);
         } else {
-            s.state = SwapState.CLUB_A_MEDICAL_DONE;
+            s.state = SwapState.ONE_MEDICAL_DONE;
         }
     }
 
@@ -480,7 +489,7 @@ contract SwapEscrow is
         Swap storage s = _swaps[swapId];
         if (s.createdAt == 0)                  revert SwapNotFound();
         if (s.state != SwapState.BOTH_CONSENTED &&
-            s.state != SwapState.CLUB_A_MEDICAL_DONE) revert WrongState();
+            s.state != SwapState.ONE_MEDICAL_DONE) revert WrongState();
         if (s.clubB != msg.sender)             revert NotClubB();
         if (block.timestamp > s.stateDeadline) revert MedicalWindowExpired();
         if (s.medicalHashBonA != bytes32(0))   revert MedicalAlreadySubmitted();
@@ -496,12 +505,12 @@ contract SwapEscrow is
             return;
         }
 
-        if (s.state == SwapState.CLUB_A_MEDICAL_DONE) {
+        if (s.state == SwapState.ONE_MEDICAL_DONE) {
             // Club A already submitted — both done
             _advanceToFunding(swapId);
         } else {
             // Club B submitted first — wait for Club A
-            s.state = SwapState.CLUB_A_MEDICAL_DONE; // reuse state — both track via hashes
+            s.state = SwapState.ONE_MEDICAL_DONE; // reuse state — both track via hashes
         }
     }
 
@@ -528,20 +537,20 @@ contract SwapEscrow is
         if (block.timestamp > s.stateDeadline)       revert FundingWindowExpired();
         if (!ITransferWindow(addressRegistry.get(RegistryKeys.TRANSFER_WINDOW)).isWindowOpen())           revert TransferWindowClosed();
 
-        IERC20(s.paymentToken).safeTransferFrom(msg.sender, address(this), s.topUpAmount);
-
-        s.funded         = true;
-        s.fundedAt       = block.timestamp;
-        s.state          = SwapState.FUNDED;
+        // I update state before the external call (CEI order)
+        s.funded          = true;
+        s.fundedAt        = block.timestamp;
+        s.state           = SwapState.FUNDED;
         s.disputeDeadline = block.timestamp + disputeWindow;
-        s.stateDeadline  = s.disputeDeadline;
+        s.stateDeadline   = s.disputeDeadline;
 
+        IERC20(s.paymentToken).safeTransferFrom(msg.sender, address(this), s.topUpAmount);
         emit SwapFunded(swapId, s.topUpAmount);
     }
 
     // ---- Dispute Window ------------------------------------------------------
 
-    function raiseDispute(uint256 swapId) external
+    function raiseDispute(uint256 swapId) external whenNotPaused
     {
         Swap storage s = _swaps[swapId];
         if (s.createdAt == 0)              revert SwapNotFound();
@@ -575,7 +584,7 @@ contract SwapEscrow is
 
     // ---- Mutual Cancel -------------------------------------------------------
 
-    function proposeMutualCancel(uint256 swapId) external whenNotPaused
+    function proposeMutualCancel(uint256 swapId) external whenNotPaused nonReentrant
     {
         Swap storage s = _swaps[swapId];
         if (s.createdAt == 0)              revert SwapNotFound();
@@ -615,10 +624,10 @@ contract SwapEscrow is
         if (s.state == SwapState.PROPOSED) {
             _cancelSwap(swapId, "Club B did not respond in time");
         } else if (s.state == SwapState.ACCEPTED ||
-                   s.state == SwapState.PLAYER_A_CONSENTED) {
+                   s.state == SwapState.ONE_PLAYER_CONSENTED) {
             _cancelSwap(swapId, "Consent window expired");
         } else if (s.state == SwapState.BOTH_CONSENTED ||
-                   s.state == SwapState.CLUB_A_MEDICAL_DONE) {
+                   s.state == SwapState.ONE_MEDICAL_DONE) {
             _cancelSwap(swapId, "Medical window expired");
         } else if (s.state == SwapState.BOTH_MEDICALS_DONE) {
             _cancelSwap(swapId, "Funding window expired");
@@ -646,6 +655,8 @@ contract SwapEscrow is
 
         // Distribute top-up fees if any
         if (s.topUpAmount > 0) {
+            if (protocolFeeBps + s.clubAAgentBps + s.clubBAgentBps > BPS_DENOMINATOR)
+                revert FeesExceed100Pct();
             uint256 remaining = s.topUpAmount;
 
             if (protocolFeeBps > 0 && treasury != address(0)) {
