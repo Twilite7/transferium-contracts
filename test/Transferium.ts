@@ -838,6 +838,213 @@ describe("Transferium Protocol v2", function () {
         .to.be.revertedWithCustomError(loanEscrow, "NotAuthorised");
     });
 
+    it("createLoan reverts when transfer window closed", async function () {
+      const { ethers, registry, loanEscrow, token, clubA, clubB, registrar } = await deployAll();
+      const playerId = await setupListedPlayer(ethers, registry, clubA, registrar, undefined, "loan-closed");
+      const loanFee  = ethers.parseUnits("1000000", 6);
+      await token.connect(clubB).approve(await loanEscrow.getAddress(), loanFee);
+      await expect(
+        loanEscrow.connect(clubB).createLoan(
+          playerId, clubA.address, await token.getAddress(), loanFee, 90 * 24 * 3600, false, 0
+        )
+      ).to.be.revertedWithCustomError(loanEscrow, "TransferWindowClosed");
+    });
+
+    it("createLoan reverts when player is not listed", async function () {
+      const { ethers, registry, transferWindow, loanEscrow, token, clubA, clubB, registrar } = await deployAll();
+      await openTransferWindow(ethers, transferWindow);
+      // register but do NOT list the player
+      const salt = "loan-unlisted";
+      const tx = await registry.connect(clubA).registerPlayer(
+        "Unlisted Player", "CM", "Spanish",
+        Math.floor(Date.now() / 1000) + 365 * 24 * 3600,
+        ethers.parseUnits("20000", 6),
+        ethers.id(salt)
+      );
+      const receipt = await tx.wait();
+      const event   = receipt.logs
+        .map((l: any) => { try { return registry.interface.parseLog(l); } catch { return null; } })
+        .find((e: any) => e?.name === "PlayerRegistered");
+      const playerId = event.args.playerId;
+      const loanFee  = ethers.parseUnits("500000", 6);
+      await token.connect(clubB).approve(await loanEscrow.getAddress(), loanFee);
+      await expect(
+        loanEscrow.connect(clubB).createLoan(
+          playerId, clubA.address, await token.getAddress(), loanFee, 90 * 24 * 3600, false, 0
+        )
+      ).to.be.revertedWithCustomError(loanEscrow, "PlayerNotListed");
+    });
+
+    it("createLoan reverts when borrowing club == parent club", async function () {
+      const { ethers, registry, transferWindow, loanEscrow, token, clubA, registrar } = await deployAll();
+      const playerId = await setupListedPlayer(ethers, registry, clubA, registrar, undefined, "loan-self");
+      await openTransferWindow(ethers, transferWindow);
+      const loanFee  = ethers.parseUnits("500000", 6);
+      await token.connect(clubA).approve(await loanEscrow.getAddress(), loanFee);
+      await expect(
+        loanEscrow.connect(clubA).createLoan(
+          playerId, clubA.address, await token.getAddress(), loanFee, 90 * 24 * 3600, false, 0
+        )
+      ).to.be.revertedWithCustomError(loanEscrow, "InvalidAddress");
+    });
+
+    it("cancelLoan before approval refunds borrowing club", async function () {
+      const { ethers, registry, transferWindow, loanEscrow, token, clubA, clubB, registrar } = await deployAll();
+      const playerId = await setupListedPlayer(ethers, registry, clubA, registrar, undefined, "loan-cancel");
+      await openTransferWindow(ethers, transferWindow);
+      const loanFee  = ethers.parseUnits("1000000", 6);
+      await token.connect(clubB).approve(await loanEscrow.getAddress(), loanFee);
+      const tx      = await loanEscrow.connect(clubB).createLoan(
+        playerId, clubA.address, await token.getAddress(), loanFee, 90 * 24 * 3600, false, 0
+      );
+      const receipt  = await tx.wait();
+      const loanId   = receipt.logs
+        .map((l: any) => { try { return loanEscrow.interface.parseLog(l); } catch { return null; } })
+        .find((e: any) => e?.name === "LoanCreated").args.loanId;
+
+      await expect(loanEscrow.connect(clubB).cancelLoan(loanId))
+        .to.emit(loanEscrow, "LoanCancelled");
+      expect(await loanEscrow.getClaimable(clubB.address, await token.getAddress()))
+        .to.equal(loanFee);
+    });
+
+    it("rejectLoan refunds borrowing club", async function () {
+      const { ethers, registry, transferWindow, loanEscrow, token, clubA, clubB, registrar, admin } = await deployAll();
+      const playerId = await setupListedPlayer(ethers, registry, clubA, registrar, undefined, "loan-reject");
+      await openTransferWindow(ethers, transferWindow);
+      const loanFee  = ethers.parseUnits("1000000", 6);
+      await token.connect(clubB).approve(await loanEscrow.getAddress(), loanFee);
+      const tx      = await loanEscrow.connect(clubB).createLoan(
+        playerId, clubA.address, await token.getAddress(), loanFee, 90 * 24 * 3600, false, 0
+      );
+      const receipt  = await tx.wait();
+      const loanId   = receipt.logs
+        .map((l: any) => { try { return loanEscrow.interface.parseLog(l); } catch { return null; } })
+        .find((e: any) => e?.name === "LoanCreated").args.loanId;
+
+      await expect(loanEscrow.connect(admin).rejectLoan(loanId, "Failed integrity check"))
+        .to.emit(loanEscrow, "LoanRejected");
+      expect(await loanEscrow.getClaimable(clubB.address, await token.getAddress()))
+        .to.equal(loanFee);
+    });
+
+    it("claimLoanFee reverts during dispute window", async function () {
+      const { ethers, registry, transferWindow, loanEscrow, token, clubA, clubB, registrar } = await deployAll();
+      const playerId = await setupListedPlayer(ethers, registry, clubA, registrar, undefined, "loan-dispute");
+      await openTransferWindow(ethers, transferWindow);
+      const loanFee  = ethers.parseUnits("1000000", 6);
+      await token.connect(clubB).approve(await loanEscrow.getAddress(), loanFee);
+      const tx      = await loanEscrow.connect(clubB).createLoan(
+        playerId, clubA.address, await token.getAddress(), loanFee, 90 * 24 * 3600, false, 0
+      );
+      const receipt  = await tx.wait();
+      const loanId   = receipt.logs
+        .map((l: any) => { try { return loanEscrow.interface.parseLog(l); } catch { return null; } })
+        .find((e: any) => e?.name === "LoanCreated").args.loanId;
+      await loanEscrow.approveLoan(loanId);
+      await expect(loanEscrow.connect(clubA).claimLoanFee(loanId))
+        .to.be.revertedWithCustomError(loanEscrow, "DisputeWindowActive");
+    });
+
+    it("claimLoanFee cannot be claimed twice", async function () {
+      const { ethers, registry, transferWindow, loanEscrow, token, clubA, clubB, registrar } = await deployAll();
+      const playerId = await setupListedPlayer(ethers, registry, clubA, registrar, undefined, "loan-double");
+      await openTransferWindow(ethers, transferWindow);
+      const loanFee  = ethers.parseUnits("1000000", 6);
+      await token.connect(clubB).approve(await loanEscrow.getAddress(), loanFee);
+      const tx      = await loanEscrow.connect(clubB).createLoan(
+        playerId, clubA.address, await token.getAddress(), loanFee, 90 * 24 * 3600, false, 0
+      );
+      const receipt  = await tx.wait();
+      const loanId   = receipt.logs
+        .map((l: any) => { try { return loanEscrow.interface.parseLog(l); } catch { return null; } })
+        .find((e: any) => e?.name === "LoanCreated").args.loanId;
+      await loanEscrow.approveLoan(loanId);
+      await ethers.provider.send("evm_increaseTime", [48 * 3600 + 1]);
+      await ethers.provider.send("evm_mine", []);
+      await loanEscrow.connect(clubA).claimLoanFee(loanId);
+      await expect(loanEscrow.connect(clubA).claimLoanFee(loanId))
+        .to.be.revertedWithCustomError(loanEscrow, "LoanFeeAlreadyClaimed");
+    });
+
+    it("exerciseOption reverts after loan expiry", async function () {
+      const { ethers, registry, transferWindow, loanEscrow, token, clubA, clubB, registrar } = await deployAll();
+      const playerId    = await setupListedPlayer(ethers, registry, clubA, registrar, undefined, "loan-optexp");
+      await openTransferWindow(ethers, transferWindow);
+      const loanFee     = ethers.parseUnits("1000000", 6);
+      const optionPrice = ethers.parseUnits("30000000", 6);
+      const duration    = 30 * 24 * 3600;
+      await token.connect(clubB).approve(await loanEscrow.getAddress(), loanFee);
+      const tx      = await loanEscrow.connect(clubB).createLoan(
+        playerId, clubA.address, await token.getAddress(), loanFee, duration, true, optionPrice
+      );
+      const receipt  = await tx.wait();
+      const loanId   = receipt.logs
+        .map((l: any) => { try { return loanEscrow.interface.parseLog(l); } catch { return null; } })
+        .find((e: any) => e?.name === "LoanCreated").args.loanId;
+      await loanEscrow.approveLoan(loanId);
+      await ethers.provider.send("evm_increaseTime", [duration + 1]);
+      await ethers.provider.send("evm_mine", []);
+      await token.connect(clubB).approve(await loanEscrow.getAddress(), optionPrice);
+      await expect(loanEscrow.connect(clubB).exerciseOption(loanId))
+        .to.be.revertedWithCustomError(loanEscrow, "OptionExpired");
+    });
+
+    it("protocol fee deducted from loan fee on claim", async function () {
+      const { ethers, registry, transferWindow, loanEscrow, token, clubA, clubB, registrar, admin } = await deployAll();
+      const playerId = await setupListedPlayer(ethers, registry, clubA, registrar, undefined, "loan-fee");
+      await openTransferWindow(ethers, transferWindow);
+      const PROTO_BPS = 200n; // 2%
+      await loanEscrow.connect(admin).setProtocolFee(PROTO_BPS);
+      const loanFee   = ethers.parseUnits("1000000", 6);
+      await token.connect(clubB).approve(await loanEscrow.getAddress(), loanFee);
+      const tx      = await loanEscrow.connect(clubB).createLoan(
+        playerId, clubA.address, await token.getAddress(), loanFee, 90 * 24 * 3600, false, 0
+      );
+      const receipt  = await tx.wait();
+      const loanId   = receipt.logs
+        .map((l: any) => { try { return loanEscrow.interface.parseLog(l); } catch { return null; } })
+        .find((e: any) => e?.name === "LoanCreated").args.loanId;
+      await loanEscrow.approveLoan(loanId);
+      await ethers.provider.send("evm_increaseTime", [48 * 3600 + 1]);
+      await ethers.provider.send("evm_mine", []);
+      await loanEscrow.connect(clubA).claimLoanFee(loanId);
+
+      const tokenAddr    = await token.getAddress();
+      const protocolAmt  = loanFee * PROTO_BPS / 10000n;
+      expect(await loanEscrow.getClaimable(clubA.address, tokenAddr))
+        .to.equal(loanFee - protocolAmt);
+      expect(await loanEscrow.getClaimable(admin.address, tokenAddr))
+        .to.equal(protocolAmt);
+    });
+
+    it("withdrawClaimable transfers tokens to caller", async function () {
+      const { ethers, registry, transferWindow, loanEscrow, token, clubA, clubB, registrar } = await deployAll();
+      const playerId = await setupListedPlayer(ethers, registry, clubA, registrar, undefined, "loan-withdraw");
+      await openTransferWindow(ethers, transferWindow);
+      const loanFee  = ethers.parseUnits("1000000", 6);
+      await token.connect(clubB).approve(await loanEscrow.getAddress(), loanFee);
+      const tx      = await loanEscrow.connect(clubB).createLoan(
+        playerId, clubA.address, await token.getAddress(), loanFee, 90 * 24 * 3600, false, 0
+      );
+      const receipt  = await tx.wait();
+      const loanId   = receipt.logs
+        .map((l: any) => { try { return loanEscrow.interface.parseLog(l); } catch { return null; } })
+        .find((e: any) => e?.name === "LoanCreated").args.loanId;
+      await loanEscrow.approveLoan(loanId);
+      await ethers.provider.send("evm_increaseTime", [48 * 3600 + 1]);
+      await ethers.provider.send("evm_mine", []);
+      await loanEscrow.connect(clubA).claimLoanFee(loanId);
+
+      const tokenAddr = await token.getAddress();
+      const claimable = await loanEscrow.getClaimable(clubA.address, tokenAddr);
+      const before    = await token.balanceOf(clubA.address);
+      await loanEscrow.connect(clubA).withdrawClaimable(tokenAddr);
+      expect(await token.balanceOf(clubA.address)).to.equal(before + claimable);
+      expect(await loanEscrow.getClaimable(clubA.address, tokenAddr)).to.equal(0n);
+    });
+
+
     describe("TransferWindow — upgraded", function () {
 
       it("schedules STANDARD window with correct type", async function () {
@@ -1727,3 +1934,4 @@ describe("Transferium Protocol v2", function () {
     });
 
   });
+
