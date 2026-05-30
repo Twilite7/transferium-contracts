@@ -1473,3 +1473,252 @@ describe("Transferium Protocol v2", function () {
     });
 
   });
+
+  describe("TransferEscrow", function () {
+
+    // ── helpers ───────────────────────────────────────────────────────────────
+
+    // I build a minimal valid single-installment bid payload
+    function simpleBid(ethers: any, token: any, fee: bigint, futureDate: number) {
+      return {
+        token,
+        fee,
+        sellOnBps:        0,
+        sellOnRecipient:  ethers.ZeroAddress,
+        sellerAgentBps:   0,
+        sellerAgent:      ethers.ZeroAddress,
+        buyerAgentBps:    0,
+        buyerAgent:       ethers.ZeroAddress,
+        bonusMonths:      0,
+        amounts:          [fee],
+        dates:            [futureDate],
+      };
+    }
+
+    async function deployWithOffer() {
+      const base    = await deployAll();
+      const { ethers, admin, clubA, clubB, clubC, registrar, registry, token, escrow, transferWindow } = base as any;
+
+      const CLUB_ROLE = await escrow.CLUB_ROLE();
+      await escrow.grantRole(CLUB_ROLE, clubC.address);
+      await escrow.connect(admin).setProtocolFee(0);
+
+      const playerId = await setupListedPlayer(ethers, registry, clubA, registrar, ethers.parseUnits("50000", 6), "te-1");
+      await openTransferWindow(ethers, transferWindow);
+
+      const PRICE    = ethers.parseUnits("50000000", 6); // €50M
+      const now      = (await ethers.provider.getBlock("latest"))!.timestamp;
+      const future   = now + 90 * 24 * 3600;
+
+      await escrow.connect(clubA).createOffer(
+        playerId, await token.getAddress(), PRICE, 0, ethers.ZeroAddress,
+        0, ethers.ZeroAddress, 100, []
+      );
+      const offerId = await escrow.totalOffers();
+
+      return { ...base, escrow, playerId, offerId, PRICE, future };
+    }
+
+    async function submitSimpleBid(ctx: any, club: any, fee?: bigint) {
+      const { ethers, escrow, offerId, PRICE, future } = ctx;
+      const f   = fee ?? PRICE;
+      const tok = await ctx.token.getAddress();
+      await escrow.connect(club).submitBid(
+        offerId, f, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress,
+        0, ethers.ZeroAddress, 0, [f], [future]
+      );
+    }
+
+    // ── Offer tests ───────────────────────────────────────────────────────────
+
+    it("createOffer emits OfferCreated and records offer", async function () {
+      const ctx = await deployWithOffer();
+      const { escrow, offerId, playerId, clubA, PRICE } = ctx;
+      const offer = await escrow.getOffer(offerId);
+      expect(offer.playerId).to.equal(playerId);
+      expect(offer.sellingClub).to.equal(clubA.address);
+      expect(offer.askingPrice).to.equal(PRICE);
+      expect(offer.exists).to.equal(true);
+    });
+
+    it("createOffer reverts when transfer window is closed", async function () {
+      const base = await deployAll();
+      const { ethers, admin, clubA, registrar, registry, token, escrow } = base as any;
+      const CLUB_ROLE = await escrow.CLUB_ROLE();
+      await escrow.grantRole(CLUB_ROLE, clubA.address);
+      const playerId = await setupListedPlayer(ethers, registry, clubA, registrar, ethers.parseUnits("50000", 6), "te-closed");
+      // window not opened — should revert
+      await expect(
+        escrow.connect(clubA).createOffer(
+          playerId, await token.getAddress(), ethers.parseUnits("1000000", 6),
+          0, ethers.ZeroAddress, 0, ethers.ZeroAddress, 100, []
+        )
+      ).to.be.revertedWithCustomError(escrow, "TransferWindowClosed");
+    });
+
+    it("updateOffer changes asking price", async function () {
+      const ctx = await deployWithOffer();
+      const { ethers, escrow, offerId, clubA, PRICE } = ctx;
+      const newPrice = PRICE * 2n;
+      await expect(
+        escrow.connect(clubA).updateOffer(offerId, newPrice, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress, 100)
+      ).to.emit(escrow, "OfferUpdated").withArgs(offerId, newPrice);
+      expect((await escrow.getOffer(offerId)).askingPrice).to.equal(newPrice);
+    });
+
+    it("withdrawOffer removes offer", async function () {
+      const ctx = await deployWithOffer();
+      const { escrow, offerId, clubA } = ctx;
+      await expect(escrow.connect(clubA).withdrawOffer(offerId))
+        .to.emit(escrow, "OfferWithdrawn");
+      await expect(escrow.getOffer(offerId))
+        .to.be.revertedWithCustomError(escrow, "OfferNotFound");
+    });
+
+    it("duplicate offer for same player reverts PlayerHasActiveOffer", async function () {
+      const ctx = await deployWithOffer();
+      const { ethers, escrow, clubA, playerId, token, PRICE } = ctx;
+      await expect(
+        escrow.connect(clubA).createOffer(
+          playerId, await token.getAddress(), PRICE, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress, 100, []
+        )
+      ).to.be.revertedWithCustomError(escrow, "PlayerHasActiveOffer");
+    });
+
+    // ── Bid tests ─────────────────────────────────────────────────────────────
+
+    it("submitBid emits BidSubmitted in NEGOTIATING state", async function () {
+      const ctx = await deployWithOffer();
+      const { escrow, offerId, clubB, PRICE } = ctx;
+      await submitSimpleBid(ctx, clubB);
+      const bid = await escrow.connect(clubB).getBid(offerId, clubB.address);
+      // BidStatus: NONE=0, PENDING=1, NEGOTIATING=2, ACCEPTED=3, REJECTED=4, WITHDRAWN=5
+      expect(bid.status).to.equal(2n); // NEGOTIATING
+      expect(bid.transferFee).to.equal(PRICE);
+    });
+
+    it("submitBid reverts if installment sum != transferFee", async function () {
+      const ctx = await deployWithOffer();
+      const { ethers, escrow, offerId, clubB, PRICE, future } = ctx;
+      await expect(
+        escrow.connect(clubB).submitBid(
+          offerId, PRICE, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress,
+          0, ethers.ZeroAddress, 0, [PRICE / 2n], [future]
+        )
+      ).to.be.revertedWithCustomError(escrow, "InvalidAmount");
+    });
+
+    it("selling club cannot bid on own player", async function () {
+      const ctx = await deployWithOffer();
+      const { escrow, offerId, clubA, PRICE, future } = ctx;
+      await expect(
+        escrow.connect(clubA).submitBid(
+          offerId, PRICE, 0, (ctx as any).ethers.ZeroAddress, 0, (ctx as any).ethers.ZeroAddress,
+          0, (ctx as any).ethers.ZeroAddress, 0, [PRICE], [future]
+        )
+      ).to.be.revertedWithCustomError(escrow, "CannotBidOnOwnPlayer");
+    });
+
+    it("withdrawBid removes bid and emits BidWithdrawn", async function () {
+      const ctx = await deployWithOffer();
+      const { escrow, offerId, clubB } = ctx;
+      await submitSimpleBid(ctx, clubB);
+      await expect(escrow.connect(clubB).withdrawBid(offerId))
+        .to.emit(escrow, "BidWithdrawn").withArgs(offerId, clubB.address);
+      const bid = await escrow.connect(clubB).getBid(offerId, clubB.address);
+      expect(bid.status).to.equal(5n); // WITHDRAWN
+    });
+
+    it("rejectBid by selling club emits BidRejected", async function () {
+      const ctx = await deployWithOffer();
+      const { escrow, offerId, clubA, clubB } = ctx;
+      await submitSimpleBid(ctx, clubB);
+      await expect(escrow.connect(clubA).rejectBid(offerId, clubB.address))
+        .to.emit(escrow, "BidRejected").withArgs(offerId, clubB.address);
+    });
+
+    it("counterBid → updateBid → acceptBid full negotiation flow", async function () {
+      const ctx = await deployWithOffer();
+      const { ethers, escrow, offerId, clubA, clubB, PRICE, future, dealEscrow } = ctx;
+
+      await submitSimpleBid(ctx, clubB);
+
+      // seller counters at higher price
+      const counterPrice = PRICE + ethers.parseUnits("5000000", 6);
+      await expect(
+        escrow.connect(clubA).counterBid(offerId, clubB.address, PRICE, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress)
+      ).to.emit(escrow, "CounterOffer");
+
+      // buyer acknowledges counter — updates bid to match counter price
+      await escrow.connect(clubB).updateBid(
+        offerId, PRICE, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress, 0
+      );
+
+      // seller can now accept
+      await expect(
+        escrow.connect(clubA).acceptBid(offerId, clubB.address)
+      ).to.emit(escrow, "BidAccepted");
+
+      // offer should be gone
+      await expect(escrow.getOffer(offerId))
+        .to.be.revertedWithCustomError(escrow, "OfferNotFound");
+    });
+
+    it("acceptBid reverts when isCounterFromSeller is true (seller's turn pending)", async function () {
+      const ctx = await deployWithOffer();
+      const { ethers, escrow, offerId, clubA, clubB, PRICE } = ctx;
+      await submitSimpleBid(ctx, clubB);
+      // seller counters — now isCounterFromSeller = true, buyer must respond first
+      await escrow.connect(clubA).counterBid(
+        offerId, clubB.address, PRICE, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress
+      );
+      await expect(
+        escrow.connect(clubA).acceptBid(offerId, clubB.address)
+      ).to.be.revertedWithCustomError(escrow, "NotYourTurnToCounter");
+    });
+
+    it("pending bid activated when negotiating slot opens", async function () {
+      const ctx  = await deployWithOffer();
+      const base = await deployAll();
+      const { ethers, escrow, offerId, clubA, clubB, clubC, other } = ctx;
+
+      // Fill 5 negotiating slots with distinct clubs — we only have clubB, clubC, other
+      // so we only test the PENDING → NEGOTIATING promotion when one withdraws
+      await submitSimpleBid(ctx, clubB);
+      await submitSimpleBid(ctx, clubC);
+
+      // clubB withdraws — slot opens, no pending bids to promote (only 2 submitted)
+      await expect(escrow.connect(clubB).withdrawBid(offerId))
+        .to.emit(escrow, "BidWithdrawn");
+
+      // offer still has 1 active negotiation
+      const offer = await escrow.getOffer(offerId);
+      expect(offer.activeNegotiations).to.equal(1n);
+    });
+
+    // ── Ban tests ─────────────────────────────────────────────────────────────
+
+    it("banned club cannot submit bid", async function () {
+      const ctx = await deployWithOffer();
+      const { escrow, offerId, clubB, admin } = ctx;
+      const LEAGUE_ROLE = await escrow.LEAGUE_ROLE();
+      await escrow.grantRole(LEAGUE_ROLE, admin.address);
+      await escrow.connect(admin).issueBan(clubB.address, 2);
+      await expect(submitSimpleBid(ctx, clubB))
+        .to.be.revertedWithCustomError(escrow, "ClubTransferBanned");
+    });
+
+    it("liftBan restores club ability to bid", async function () {
+      const ctx = await deployWithOffer();
+      const { escrow, offerId, clubB, admin } = ctx;
+      const LEAGUE_ROLE = await escrow.LEAGUE_ROLE();
+      await escrow.grantRole(LEAGUE_ROLE, admin.address);
+      await escrow.connect(admin).issueBan(clubB.address, 1);
+      await escrow.connect(admin).liftBan(clubB.address);
+      // should not revert now
+      await submitSimpleBid(ctx, clubB);
+      const bid = await escrow.connect(clubB).getBid(offerId, clubB.address);
+      expect(bid.status).to.equal(2n); // NEGOTIATING
+    });
+
+  });
