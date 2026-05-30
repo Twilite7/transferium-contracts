@@ -1165,3 +1165,311 @@ describe("Transferium Protocol v2", function () {
     });
 
   });
+
+  describe("FreeTransferEscrow", function () {
+
+    async function deployWithFTE() {
+      const base = await deployAll();
+      const { ethers, admin, clubA, clubB, registrar, registry, token, addressReg, transferWindow } = base as any;
+
+      const Proxy = await ethers.getContractFactory("TransferiumProxy");
+      const FTEF  = await ethers.getContractFactory("FreeTransferEscrow");
+      const fteImpl = await FTEF.deploy();
+      const fteInit = fteImpl.interface.encodeFunctionData("initialize", [
+        await registry.getAddress(),
+        await addressReg.getAddress(),
+        await base.escrow.getAddress(),
+        admin.address,
+        admin.address,
+      ]);
+      const fteProxy = await Proxy.deploy(await fteImpl.getAddress(), fteInit);
+      const fte      = FTEF.attach(await fteProxy.getAddress());
+
+      const ESCROW_ROLE = await registry.ESCROW_ROLE();
+      const CLUB_ROLE   = await fte.CLUB_ROLE();
+      await registry.grantRole(ESCROW_ROLE, await fte.getAddress());
+      await fte.grantRole(CLUB_ROLE, clubA.address);
+      await fte.grantRole(CLUB_ROLE, clubB.address);
+      await fte.connect(admin).setProtocolFee(0);
+      await fte.approveToken(await token.getAddress());
+
+      // Player with contract already expired — for releaseExpiredContract tests
+      const now    = await (async () => { const b = await ethers.provider.getBlock("latest"); return b.timestamp; })();
+      const expiry = now - 1; // already expired
+      const tx = await registry.connect(clubA).registerPlayer(
+        "Free Agent", "ST", "French", expiry, ethers.parseUnits("10000", 6),
+        ethers.id("fte-player-1")
+      );
+      const receipt = await tx.wait();
+      const event   = receipt.logs
+        .map((l: any) => { try { return registry.interface.parseLog(l); } catch { return null; } })
+        .find((e: any) => e?.name === "PlayerRegistered");
+      const freePlayerId = event.args.playerId;
+
+      await registry.connect(registrar).markPlayerVerified(freePlayerId, registrar.address);
+      const medHash = ethers.keccak256(ethers.toUtf8Bytes("med-fte-1"));
+      await registry.connect(clubA).setMedicalClearance(freePlayerId, medHash);
+      const regHash = ethers.keccak256(ethers.toUtf8Bytes("reg-fte-1"));
+      const tmsHash = ethers.keccak256(ethers.toUtf8Bytes("tms-fte-1"));
+      await registry.connect(clubA).submitLegalDocuments(freePlayerId, regHash, tmsHash, ethers.ZeroHash);
+      await registry.connect(registrar).setLegalDocsVerified(freePlayerId, registrar.address);
+
+      // Player wallet for consent flows
+      const playerWallet = ethers.Wallet.createRandom().connect(ethers.provider);
+      await clubA.sendTransaction({ to: playerWallet.address, value: ethers.parseEther("1") });
+      await registry.connect(clubA).setPlayerWallet(freePlayerId, playerWallet.address);
+
+      await openTransferWindow(ethers, transferWindow);
+
+      return { ...base, fte, freePlayerId, playerWallet };
+    }
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    async function releasePlayer(ctx: any) {
+      const { fte, clubA, freePlayerId } = ctx;
+      await fte.connect(clubA).releaseExpiredContract(freePlayerId);
+    }
+
+    async function proposeAndSign(ctx: any, signingBonus = 0n) {
+      const { ethers, fte, clubB, freePlayerId, playerWallet, token } = ctx;
+      await fte.connect(clubB).proposePreContract(
+        freePlayerId, await token.getAddress(), signingBonus, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress
+      );
+      const ftId = await fte._ftIdCounter();
+      await fte.connect(playerWallet).signPreContract(ftId);
+      return ftId;
+    }
+
+    // ── tests ─────────────────────────────────────────────────────────────────
+
+    it("releaseExpiredContract marks player as free agent", async function () {
+      const ctx = await deployWithFTE();
+      const { fte, clubA, freePlayerId } = ctx;
+      await expect(fte.connect(clubA).releaseExpiredContract(freePlayerId))
+        .to.emit(fte, "PlayerReleased");
+      expect(await fte._freeAgentStatus(freePlayerId)).to.equal(true);
+    });
+
+    it("releaseExpiredContract reverts if contract not expired", async function () {
+      const ctx = await deployWithFTE();
+      const { ethers, fte, clubA, registry, registrar } = ctx;
+      // Register a player with a future expiry
+      const now    = (await ethers.provider.getBlock("latest"))!.timestamp;
+      const tx     = await registry.connect(clubA).registerPlayer(
+        "Future Player", "GK", "Spanish", now + 365 * 24 * 3600, 0n,
+        ethers.id("fte-future-1")
+      );
+      const receipt = await tx.wait();
+      const pid = registry.interface.parseLog(
+        receipt.logs.find((l: any) => { try { return registry.interface.parseLog(l)?.name === "PlayerRegistered"; } catch { return false; } })
+      )!.args.playerId;
+      await expect(fte.connect(clubA).releaseExpiredContract(pid))
+        .to.be.revertedWithCustomError(fte, "ContractNotExpired");
+    });
+
+    it("proposePreContract creates PRE_CONTRACT_PROPOSED entry", async function () {
+      const ctx = await deployWithFTE();
+      const { ethers, fte, clubB, freePlayerId, token } = ctx;
+      await releasePlayer(ctx);
+      await expect(
+        fte.connect(clubB).proposePreContract(
+          freePlayerId, await token.getAddress(), 0n, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress
+        )
+      ).to.emit(fte, "PreContractProposed");
+      const ftId = await fte._ftIdCounter();
+      const ft   = await fte._fts(ftId);
+      expect(ft.state).to.equal(2n); // PRE_CONTRACT_PROPOSED
+      expect(ft.buyingClub).to.equal(clubB.address);
+    });
+
+    it("signPreContract moves to PRE_CONTRACT_SIGNED", async function () {
+      const ctx = await deployWithFTE();
+      const { fte, freePlayerId, playerWallet, token, ethers, clubB } = ctx;
+      await releasePlayer(ctx);
+      await fte.connect(clubB).proposePreContract(
+        freePlayerId, await token.getAddress(), 0n, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress
+      );
+      const ftId = await fte._ftIdCounter();
+      await expect(fte.connect(playerWallet).signPreContract(ftId))
+        .to.emit(fte, "PreContractSigned");
+      expect((await fte._fts(ftId)).state).to.equal(3n); // PRE_CONTRACT_SIGNED
+    });
+
+    it("club withdraws proposal before signing → CANCELLED, no penalty", async function () {
+      const ctx = await deployWithFTE();
+      const { ethers, fte, clubB, freePlayerId, token } = ctx;
+      await releasePlayer(ctx);
+      await fte.connect(clubB).proposePreContract(
+        freePlayerId, await token.getAddress(), 0n, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress
+      );
+      const ftId = await fte._ftIdCounter();
+      await expect(fte.connect(clubB).withdrawPreContract(ftId))
+        .to.emit(fte, "PreContractCancelled");
+      expect((await fte._fts(ftId)).state).to.equal(7n); // CANCELLED
+    });
+
+    it("club withdraws after signing → deposit forfeited to player", async function () {
+      const ctx = await deployWithFTE();
+      const { ethers, fte, clubB, freePlayerId, token, playerWallet } = ctx;
+      const BONUS = ethers.parseUnits("1000000", 6);
+      await token.mint(clubB.address, BONUS);
+      await token.connect(clubB).approve(await fte.getAddress(), BONUS);
+
+      await releasePlayer(ctx);
+      const ftId = await proposeAndSign(ctx, BONUS);
+
+      // lock deposit (10% of bonus)
+      await fte.connect(clubB).lockDeposit(ftId);
+
+      await expect(fte.connect(clubB).withdrawPreContract(ftId))
+        .to.emit(fte, "PreContractCancelled");
+
+      // deposit claimable by player wallet
+      const deposit = BONUS * 1000n / 10000n; // depositBps = 1000
+      expect(await fte._claimable(playerWallet.address, await token.getAddress()))
+        .to.equal(deposit);
+    });
+
+    it("medical PASSED → FreeTransferCompleted, NFT at buying club", async function () {
+      const ctx = await deployWithFTE();
+      const { ethers, fte, clubB, freePlayerId, token, registry } = ctx;
+      await releasePlayer(ctx);
+      const ftId = await proposeAndSign(ctx, 0n);
+      // no deposit needed for zero signing bonus — lockDeposit is a no-op
+      await fte.connect(clubB).lockDeposit(ftId);
+
+      const hash = ethers.keccak256(ethers.toUtf8Bytes("medical-pass"));
+      await expect(fte.connect(clubB).submitMedical(ftId, 1n, hash)) // PASSED=1
+        .to.emit(fte, "FreeTransferCompleted");
+      expect(await registry.currentClub(freePlayerId)).to.equal(clubB.address);
+    });
+
+    it("medical FAILED → CANCELLED, deposit returned to buying club", async function () {
+      const ctx = await deployWithFTE();
+      const { ethers, fte, clubB, freePlayerId, token } = ctx;
+      const BONUS = ethers.parseUnits("500000", 6);
+      await token.mint(clubB.address, BONUS);
+      await token.connect(clubB).approve(await fte.getAddress(), BONUS);
+
+      await releasePlayer(ctx);
+      const ftId = await proposeAndSign(ctx, BONUS);
+      await fte.connect(clubB).lockDeposit(ftId);
+
+      const hash = ethers.keccak256(ethers.toUtf8Bytes("medical-fail"));
+      await expect(fte.connect(clubB).submitMedical(ftId, 2n, hash)) // FAILED=2
+        .to.emit(fte, "PreContractCancelled");
+      expect((await fte._fts(ftId)).state).to.equal(7n); // CANCELLED
+
+      const deposit = BONUS * 1000n / 10000n;
+      expect(await fte._claimable(clubB.address, await token.getAddress()))
+        .to.equal(deposit);
+    });
+
+    it("signing bonus split: protocol fee + agent fee + player receives remainder", async function () {
+      const ctx = await deployWithFTE();
+      const { ethers, fte, clubB, freePlayerId, token, playerWallet, admin } = ctx;
+      const BONUS      = ethers.parseUnits("1000000", 6); // €1M
+      const AGENT_BPS  = 200n; // 2%
+      const PROTO_BPS  = 100n; // 1% — set non-zero for this test
+
+      await fte.connect(admin).setProtocolFee(PROTO_BPS);
+      await token.mint(clubB.address, BONUS * 2n);
+      await token.connect(clubB).approve(await fte.getAddress(), BONUS * 2n);
+
+      await releasePlayer(ctx);
+
+      const agentWallet = ethers.Wallet.createRandom().connect(ethers.provider);
+      await fte.connect(clubB).proposePreContract(
+        freePlayerId, await token.getAddress(), BONUS, AGENT_BPS, agentWallet.address, 0, ethers.ZeroAddress
+      );
+      const ftId = await fte._ftIdCounter();
+      await fte.connect(playerWallet).signPreContract(ftId);
+      await fte.connect(clubB).lockDeposit(ftId);
+
+      const hash = ethers.keccak256(ethers.toUtf8Bytes("medical-pass-2"));
+      await fte.connect(clubB).submitMedical(ftId, 1n, hash);
+
+      const tokenAddr   = await token.getAddress();
+      const protocolFee = BONUS * PROTO_BPS / 10000n;
+      const agentFee    = BONUS * AGENT_BPS / 10000n;
+      const playerShare = BONUS - protocolFee - agentFee;
+
+      expect(await fte._claimable(agentWallet.address, tokenAddr)).to.equal(agentFee);
+      expect(await fte._claimable(playerWallet.address, tokenAddr)).to.equal(playerShare);
+    });
+
+    it("mutual termination: propose → confirm → player is free agent", async function () {
+      const ctx = await deployWithFTE();
+      const { ethers, fte, clubA, freePlayerId, token, playerWallet } = ctx;
+      const SETTLEMENT = ethers.parseUnits("200000", 6);
+      await token.mint(clubA.address, SETTLEMENT);
+      await token.connect(clubA).approve(await fte.getAddress(), SETTLEMENT);
+
+      await expect(
+        fte.connect(clubA).proposeMutualTermination(freePlayerId, await token.getAddress(), SETTLEMENT)
+      ).to.emit(fte, "MutualTerminationProposed");
+
+      await expect(
+        fte.connect(playerWallet).confirmMutualTermination(freePlayerId)
+      ).to.emit(fte, "MutualTerminationConfirmed");
+
+      expect(await fte._freeAgentStatus(freePlayerId)).to.equal(true);
+      expect(await fte._claimable(playerWallet.address, await token.getAddress()))
+        .to.equal(SETTLEMENT);
+    });
+
+    it("mutual termination: club withdraws proposal → settlement refunded", async function () {
+      const ctx = await deployWithFTE();
+      const { ethers, fte, clubA, freePlayerId, token } = ctx;
+      const SETTLEMENT = ethers.parseUnits("100000", 6);
+      await token.mint(clubA.address, SETTLEMENT);
+      await token.connect(clubA).approve(await fte.getAddress(), SETTLEMENT);
+
+      await fte.connect(clubA).proposeMutualTermination(freePlayerId, await token.getAddress(), SETTLEMENT);
+      await fte.connect(clubA).withdrawMutualTermination(freePlayerId);
+
+      expect(await fte._claimable(clubA.address, await token.getAddress()))
+        .to.equal(SETTLEMENT);
+    });
+
+    it("submitMedical reverts when transfer window closed", async function () {
+      const ctx = await deployWithFTE();
+      const { ethers, fte, clubB, freePlayerId, token, transferWindow } = ctx;
+      await releasePlayer(ctx);
+      const ftId = await proposeAndSign(ctx, 0n);
+      await fte.connect(clubB).lockDeposit(ftId);
+
+      const win = await transferWindow.getActiveWindow();
+      await ethers.provider.send("evm_setNextBlockTimestamp", [Number(win.closesAt) + 1]);
+      await ethers.provider.send("evm_mine", []);
+
+      const hash = ethers.keccak256(ethers.toUtf8Bytes("late-medical"));
+      await expect(fte.connect(clubB).submitMedical(ftId, 1n, hash))
+        .to.be.revertedWithCustomError(fte, "TransferWindowClosed");
+    });
+
+    it("multiple clubs can propose; only one can sign", async function () {
+      const ctx = await deployWithFTE();
+      const { ethers, fte, clubA, clubB, freePlayerId, token, playerWallet } = ctx;
+      await releasePlayer(ctx);
+
+      // clubA also proposes
+      await fte.connect(clubA).proposePreContract(
+        freePlayerId, await token.getAddress(), 0n, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress
+      );
+      await fte.connect(clubB).proposePreContract(
+        freePlayerId, await token.getAddress(), 0n, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress
+      );
+
+      // Player signs with clubB (ftId=2 since clubA proposed first = ftId 1)
+      const ftIdB = await fte._ftIdCounter(); // clubB's ftId
+      await fte.connect(playerWallet).signPreContract(ftIdB);
+
+      // clubA tries to sign — should revert as pre-contract already active
+      const ftIdA = ftIdB - 1n;
+      await expect(fte.connect(playerWallet).signPreContract(ftIdA))
+        .to.be.revertedWithCustomError(fte, "PreContractAlreadyActive");
+    });
+
+  });
