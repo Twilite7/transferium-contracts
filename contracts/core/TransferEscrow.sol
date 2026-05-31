@@ -139,7 +139,6 @@ contract TransferEscrow is
     IAddressRegistry public addressRegistry;
     IDealEscrow     public dealEscrow;
 
-    mapping(address => uint256) public protocolFeesAccumulated;
     uint256 public consentWindow;
 
     mapping(uint256 => Offer)                           private _offers;
@@ -176,8 +175,6 @@ contract TransferEscrow is
     // ─── Errors ───────────────────────────────────────────────────────────────
 
     error InvalidAddress();
-    error NothingToWithdraw();
-    error InsufficientProtocolBalance(uint256 requested, uint256 available);
     error InvalidAmount();
     error InvalidBps();
     error TokenNotApproved();
@@ -301,15 +298,6 @@ contract TransferEscrow is
         _executeProtocolTreasuryUpdate();
     }
 
-    function withdrawFees(address token, uint256 amount) external onlyRole(ADMIN_ROLE) nonReentrant {
-        if (amount == 0) revert NothingToWithdraw();
-        if (treasury == address(0)) revert InvalidAddress();
-        uint256 avail = protocolFeesAccumulated[token];
-        if (amount > avail) revert InsufficientProtocolBalance(amount, avail);
-        protocolFeesAccumulated[token] = avail - amount;
-        IERC20(token).safeTransfer(treasury, amount);
-        emit ProtocolFeesWithdrawn(treasury, token, amount);
-    }
 
     function setConsentWindow(uint256 duration) external onlyRole(ADMIN_ROLE) {
         if (duration < MIN_CONSENT_WINDOW) revert TimerTooShort();
