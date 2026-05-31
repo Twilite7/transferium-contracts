@@ -77,6 +77,16 @@ async function deployAll() {
   const teProxy = await Proxy.deploy(await teImpl.getAddress(), teInit);
   const escrow  = TransferEscrowF.attach(await teProxy.getAddress());
 
+  const InstallmentEscrowF = await ethers.getContractFactory("InstallmentEscrow");
+  const instImpl  = await InstallmentEscrowF.deploy();
+  const instInit  = instImpl.interface.encodeFunctionData("initialize", [
+    await dealEscrow.getAddress(),
+    admin.address,
+    admin.address,
+  ]);
+  const instProxy        = await Proxy.deploy(await instImpl.getAddress(), instInit);
+  const installmentEscrow = InstallmentEscrowF.attach(await instProxy.getAddress());
+
   // ─── Roles ────────────────────────────────────────────────────────────────
   const CLUB_ROLE            = await registry.CLUB_ROLE();
   const REGISTRAR_ROLE       = await registry.REGISTRAR_ROLE();
@@ -93,6 +103,7 @@ async function deployAll() {
   await registry.grantRole(ESCROW_ROLE, await dealEscrow.getAddress());
   await registry.grantRole(ESCROW_ROLE, await loanEscrow.getAddress());
   await dealEscrow.grantRole(TRANSFER_ESCROW_ROLE, await escrow.getAddress());
+  await dealEscrow.grantRole(TRANSFER_ESCROW_ROLE, await installmentEscrow.getAddress());
   await escrow.grantRole(CLUB_ROLE, clubA.address);
   await escrow.grantRole(CLUB_ROLE, clubB.address);
   await loanEscrow.grantRole(CLUB_ROLE, clubA.address);
@@ -109,7 +120,7 @@ async function deployAll() {
   return {
     ethers,
     admin, registrar, clubA, clubB, clubC, other,
-    token, registry, transferWindow, escrow, dealEscrow, loanEscrow, addressReg,
+    token, registry, transferWindow, escrow, dealEscrow, loanEscrow, installmentEscrow, addressReg,
     CLUB_ROLE, REGISTRAR_ROLE, ESCROW_ROLE, LEAGUE_ROLE,
   };
 }
@@ -1173,7 +1184,6 @@ describe("Transferium Protocol v2", function () {
     });
 
   });
-});
 
   describe("SwapEscrow", function () {
 
@@ -1448,7 +1458,7 @@ describe("Transferium Protocol v2", function () {
       await fte.connect(clubB).proposePreContract(
         freePlayerId, await token.getAddress(), signingBonus, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress
       );
-      const ftId = await fte._ftIdCounter();
+      const ftId = await fte.totalFreeTransfers();
       await fte.connect(playerWallet).signPreContract(ftId);
       return ftId;
     }
@@ -1460,7 +1470,7 @@ describe("Transferium Protocol v2", function () {
       const { fte, clubA, freePlayerId } = ctx;
       await expect(fte.connect(clubA).releaseExpiredContract(freePlayerId))
         .to.emit(fte, "PlayerReleased");
-      expect(await fte._freeAgentStatus(freePlayerId)).to.equal(true);
+      expect(await fte.getFreeAgentStatus(freePlayerId)).to.equal(true);
     });
 
     it("releaseExpiredContract reverts if contract not expired", async function () {
@@ -1489,8 +1499,8 @@ describe("Transferium Protocol v2", function () {
           freePlayerId, await token.getAddress(), 0n, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress
         )
       ).to.emit(fte, "PreContractProposed");
-      const ftId = await fte._ftIdCounter();
-      const ft   = await fte._fts(ftId);
+      const ftId = await fte.totalFreeTransfers();
+      const ft   = await fte.getFT(ftId);
       expect(ft.state).to.equal(2n); // PRE_CONTRACT_PROPOSED
       expect(ft.buyingClub).to.equal(clubB.address);
     });
@@ -1502,10 +1512,10 @@ describe("Transferium Protocol v2", function () {
       await fte.connect(clubB).proposePreContract(
         freePlayerId, await token.getAddress(), 0n, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress
       );
-      const ftId = await fte._ftIdCounter();
+      const ftId = await fte.totalFreeTransfers();
       await expect(fte.connect(playerWallet).signPreContract(ftId))
         .to.emit(fte, "PreContractSigned");
-      expect((await fte._fts(ftId)).state).to.equal(3n); // PRE_CONTRACT_SIGNED
+      expect((await fte.getFT(ftId)).state).to.equal(3n); // PRE_CONTRACT_SIGNED
     });
 
     it("club withdraws proposal before signing → CANCELLED, no penalty", async function () {
@@ -1515,10 +1525,10 @@ describe("Transferium Protocol v2", function () {
       await fte.connect(clubB).proposePreContract(
         freePlayerId, await token.getAddress(), 0n, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress
       );
-      const ftId = await fte._ftIdCounter();
+      const ftId = await fte.totalFreeTransfers();
       await expect(fte.connect(clubB).withdrawPreContract(ftId))
         .to.emit(fte, "PreContractCancelled");
-      expect((await fte._fts(ftId)).state).to.equal(7n); // CANCELLED
+      expect((await fte.getFT(ftId)).state).to.equal(7n); // CANCELLED
     });
 
     it("club withdraws after signing → deposit forfeited to player", async function () {
@@ -1539,7 +1549,7 @@ describe("Transferium Protocol v2", function () {
 
       // deposit claimable by player wallet
       const deposit = BONUS * 1000n / 10000n; // depositBps = 1000
-      expect(await fte._claimable(playerWallet.address, await token.getAddress()))
+      expect(await fte.getClaimable(playerWallet.address, await token.getAddress()))
         .to.equal(deposit);
     });
 
@@ -1571,10 +1581,10 @@ describe("Transferium Protocol v2", function () {
       const hash = ethers.keccak256(ethers.toUtf8Bytes("medical-fail"));
       await expect(fte.connect(clubB).submitMedical(ftId, 2n, hash)) // FAILED=2
         .to.emit(fte, "PreContractCancelled");
-      expect((await fte._fts(ftId)).state).to.equal(7n); // CANCELLED
+      expect((await fte.getFT(ftId)).state).to.equal(7n); // CANCELLED
 
       const deposit = BONUS * 1000n / 10000n;
-      expect(await fte._claimable(clubB.address, await token.getAddress()))
+      expect(await fte.getClaimable(clubB.address, await token.getAddress()))
         .to.equal(deposit);
     });
 
@@ -1595,7 +1605,7 @@ describe("Transferium Protocol v2", function () {
       await fte.connect(clubB).proposePreContract(
         freePlayerId, await token.getAddress(), BONUS, AGENT_BPS, agentWallet.address, 0, ethers.ZeroAddress
       );
-      const ftId = await fte._ftIdCounter();
+      const ftId = await fte.totalFreeTransfers();
       await fte.connect(playerWallet).signPreContract(ftId);
       await fte.connect(clubB).lockDeposit(ftId);
 
@@ -1607,8 +1617,8 @@ describe("Transferium Protocol v2", function () {
       const agentFee    = BONUS * AGENT_BPS / 10000n;
       const playerShare = BONUS - protocolFee - agentFee;
 
-      expect(await fte._claimable(agentWallet.address, tokenAddr)).to.equal(agentFee);
-      expect(await fte._claimable(playerWallet.address, tokenAddr)).to.equal(playerShare);
+      expect(await fte.getClaimable(agentWallet.address, tokenAddr)).to.equal(agentFee);
+      expect(await fte.getClaimable(playerWallet.address, tokenAddr)).to.equal(playerShare);
     });
 
     it("mutual termination: propose → confirm → player is free agent", async function () {
@@ -1626,8 +1636,8 @@ describe("Transferium Protocol v2", function () {
         fte.connect(playerWallet).confirmMutualTermination(freePlayerId)
       ).to.emit(fte, "MutualTerminationConfirmed");
 
-      expect(await fte._freeAgentStatus(freePlayerId)).to.equal(true);
-      expect(await fte._claimable(playerWallet.address, await token.getAddress()))
+      expect(await fte.getFreeAgentStatus(freePlayerId)).to.equal(true);
+      expect(await fte.getClaimable(playerWallet.address, await token.getAddress()))
         .to.equal(SETTLEMENT);
     });
 
@@ -1641,7 +1651,7 @@ describe("Transferium Protocol v2", function () {
       await fte.connect(clubA).proposeMutualTermination(freePlayerId, await token.getAddress(), SETTLEMENT);
       await fte.connect(clubA).withdrawMutualTermination(freePlayerId);
 
-      expect(await fte._claimable(clubA.address, await token.getAddress()))
+      expect(await fte.getClaimable(clubA.address, await token.getAddress()))
         .to.equal(SETTLEMENT);
     });
 
@@ -1675,7 +1685,7 @@ describe("Transferium Protocol v2", function () {
       );
 
       // Player signs with clubB (ftId=2 since clubA proposed first = ftId 1)
-      const ftIdB = await fte._ftIdCounter(); // clubB's ftId
+      const ftIdB = await fte.totalFreeTransfers(); // clubB's ftId
       await fte.connect(playerWallet).signPreContract(ftIdB);
 
       // clubA tries to sign — should revert as pre-contract already active
@@ -1935,3 +1945,240 @@ describe("Transferium Protocol v2", function () {
 
   });
 
+
+  describe("InstallmentEscrow", function () {
+
+    async function setupCompletedDeal(ctx: any) {
+      const { ethers, escrow, dealEscrow, token, clubA, clubB, other,
+              registry, transferWindow, registrar, admin } = ctx;
+
+      const salt     = "ie-" + Math.random().toString(36).slice(2, 8);
+      const playerId = await setupListedPlayer(ethers, registry, clubA, registrar, undefined, salt);
+      await registry.connect(clubA).setPlayerWallet(playerId, other.address);
+
+      const fee  = ethers.parseUnits("10000000", 6);
+      const half = fee / 2n;
+
+      await openTransferWindow(ethers, transferWindow);
+
+      const nowAfter = BigInt((await ethers.provider.getBlock("latest"))!.timestamp);
+      const date0    = nowAfter + 3600n;               // index 0: due in 1h (fundDeal ignores this)
+      const date1    = nowAfter + 7200n;               // index 1: due in 2h — past due after 48h advance
+
+      const offerTx = await escrow.connect(clubA).createOffer(
+        playerId, await token.getAddress(), fee,
+        0, ethers.ZeroAddress, 0, ethers.ZeroAddress, 500, []
+      );
+      const offerId = (await offerTx.wait()).logs
+        .map((l: any) => { try { return escrow.interface.parseLog(l); } catch { return null; } })
+        .find((e: any) => e?.name === "OfferCreated").args.offerId;
+
+      await escrow.connect(clubB).submitBid(
+        offerId, fee,
+        0, ethers.ZeroAddress, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress, 0,
+        [half, half], [date0, date1]
+      );
+
+      const acceptTx = await escrow.connect(clubA).acceptBid(offerId, clubB.address);
+      const dealId = (await acceptTx.wait()).logs
+        .map((l: any) => { try { return dealEscrow.interface.parseLog(l); } catch { return null; } })
+        .find((e: any) => e?.name === "DealCreated").args.dealId;
+
+      await dealEscrow.connect(other).consentToTransfer(dealId);
+      const medHash = ethers.keccak256(ethers.toUtf8Bytes("med-" + salt));
+      await dealEscrow.connect(clubB).submitMedical(dealId, 1, medHash);
+
+      await ethers.provider.send("evm_increaseTime", [48 * 3600 + 1]);
+      await ethers.provider.send("evm_mine", []);
+      await escrow.processExpiry(dealId);
+
+      await token.connect(clubB).approve(await dealEscrow.getAddress(), half);
+      await dealEscrow.connect(clubB).fundDeal(dealId);
+      await dealEscrow.connect(admin).forceComplete(dealId);
+
+      return { dealId, half, fee, date1 };
+    }
+
+    async function setupCompletedDealFarDates(ctx: any) {
+      const { ethers, escrow, dealEscrow, token, clubA, clubB, other,
+              registry, transferWindow, registrar, admin } = ctx;
+
+      const salt     = "ie-far-" + Math.random().toString(36).slice(2, 8);
+      const playerId = await setupListedPlayer(ethers, registry, clubA, registrar, undefined, salt);
+      await registry.connect(clubA).setPlayerWallet(playerId, other.address);
+
+      const fee  = ethers.parseUnits("10000000", 6);
+      const half = fee / 2n;
+
+      await openTransferWindow(ethers, transferWindow);
+
+      const nowAfter = BigInt((await ethers.provider.getBlock("latest"))!.timestamp);
+      const date1 = nowAfter + BigInt(365 * 24 * 3600);
+      const date2 = nowAfter + BigInt(2 * 365 * 24 * 3600);
+
+      const offerTx = await escrow.connect(clubA).createOffer(
+        playerId, await token.getAddress(), fee,
+        0, ethers.ZeroAddress, 0, ethers.ZeroAddress, 500, []
+      );
+      const offerId = (await offerTx.wait()).logs
+        .map((l: any) => { try { return escrow.interface.parseLog(l); } catch { return null; } })
+        .find((e: any) => e?.name === "OfferCreated").args.offerId;
+
+      await escrow.connect(clubB).submitBid(
+        offerId, fee,
+        0, ethers.ZeroAddress, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress, 0,
+        [half, half], [date1, date2]
+      );
+
+      const acceptTx = await escrow.connect(clubA).acceptBid(offerId, clubB.address);
+      const dealId = (await acceptTx.wait()).logs
+        .map((l: any) => { try { return dealEscrow.interface.parseLog(l); } catch { return null; } })
+        .find((e: any) => e?.name === "DealCreated").args.dealId;
+
+      await dealEscrow.connect(other).consentToTransfer(dealId);
+      const medHash = ethers.keccak256(ethers.toUtf8Bytes("med-" + salt));
+      await dealEscrow.connect(clubB).submitMedical(dealId, 1, medHash);
+
+      await ethers.provider.send("evm_increaseTime", [48 * 3600 + 1]);
+      await ethers.provider.send("evm_mine", []);
+      await escrow.processExpiry(dealId);
+
+      await token.connect(clubB).approve(await dealEscrow.getAddress(), half);
+      await dealEscrow.connect(clubB).fundDeal(dealId);
+      await dealEscrow.connect(admin).forceComplete(dealId);
+
+      return { dealId, half, fee };
+    }
+
+    it("payInstallment: credits selling club after due date", async function () {
+      const ctx: any = await deployAll();
+      const { installmentEscrow, token, clubA, clubB } = ctx;
+      const { dealId, half } = await setupCompletedDeal(ctx);
+
+      const tokenAddr = await token.getAddress();
+      const protoBps  = await installmentEscrow.protocolFeeBps();
+      const protoAmt  = half * protoBps / 10000n;
+
+      await token.connect(clubB).approve(await installmentEscrow.getAddress(), half);
+      await expect(installmentEscrow.connect(clubB).payInstallment(dealId, 1))
+        .to.emit(installmentEscrow, "InstallmentPaid");
+
+      expect(await installmentEscrow.claimable(clubA.address, tokenAddr))
+        .to.equal(half - protoAmt);
+    });
+
+    it("payInstallment: reverts if not buying club", async function () {
+      const ctx: any = await deployAll();
+      const { installmentEscrow, token, clubA } = ctx;
+      const { dealId, half } = await setupCompletedDeal(ctx);
+
+      await token.connect(clubA).approve(await installmentEscrow.getAddress(), half);
+      await expect(installmentEscrow.connect(clubA).payInstallment(dealId, 1))
+        .to.be.revertedWithCustomError(installmentEscrow, "NotBuyingClub");
+    });
+
+    it("payInstallment: reverts if index 0", async function () {
+      const ctx: any = await deployAll();
+      const { installmentEscrow, token, clubB } = ctx;
+      const { dealId, half } = await setupCompletedDeal(ctx);
+
+      await token.connect(clubB).approve(await installmentEscrow.getAddress(), half);
+      await expect(installmentEscrow.connect(clubB).payInstallment(dealId, 0))
+        .to.be.revertedWithCustomError(installmentEscrow, "InvalidIndex");
+    });
+
+    it("payInstallment: reverts if index >= installmentCount", async function () {
+      const ctx: any = await deployAll();
+      const { installmentEscrow, token, clubB } = ctx;
+      const { dealId, half } = await setupCompletedDeal(ctx);
+
+      await token.connect(clubB).approve(await installmentEscrow.getAddress(), half);
+      await expect(installmentEscrow.connect(clubB).payInstallment(dealId, 2))
+        .to.be.revertedWithCustomError(installmentEscrow, "InvalidIndex");
+    });
+
+    it("payInstallment: reverts if not yet due", async function () {
+      const ctx: any = await deployAll();
+      const { installmentEscrow, token, clubB } = ctx;
+      const { dealId, half } = await setupCompletedDealFarDates(ctx);
+
+      await token.connect(clubB).approve(await installmentEscrow.getAddress(), half);
+      await expect(installmentEscrow.connect(clubB).payInstallment(dealId, 1))
+        .to.be.revertedWithCustomError(installmentEscrow, "InstallmentNotDue");
+    });
+
+    it("payInstallment: reverts on double payment", async function () {
+      const ctx: any = await deployAll();
+      const { installmentEscrow, token, clubB } = ctx;
+      const { dealId, half } = await setupCompletedDeal(ctx);
+
+      await token.connect(clubB).approve(await installmentEscrow.getAddress(), half * 2n);
+      await installmentEscrow.connect(clubB).payInstallment(dealId, 1);
+      await expect(installmentEscrow.connect(clubB).payInstallment(dealId, 1))
+        .to.be.revertedWithCustomError(installmentEscrow, "InstallmentAlreadyPaid");
+    });
+
+    it("payInstallment: protocol fee deducted correctly", async function () {
+      const ctx: any = await deployAll();
+      const { installmentEscrow, token, clubA, clubB, admin } = ctx;
+      const { dealId, half } = await setupCompletedDeal(ctx);
+
+      const PROTO_BPS = 200n;
+      await installmentEscrow.connect(admin).setProtocolFee(PROTO_BPS);
+      const tokenAddr = await token.getAddress();
+
+      await token.connect(clubB).approve(await installmentEscrow.getAddress(), half);
+      await installmentEscrow.connect(clubB).payInstallment(dealId, 1);
+
+      const protoAmt = half * PROTO_BPS / 10000n;
+      expect(await installmentEscrow.claimable(clubA.address, tokenAddr)).to.equal(half - protoAmt);
+      expect(await installmentEscrow.claimable(admin.address, tokenAddr)).to.equal(protoAmt);
+    });
+
+    it("flagOverdue: emits InstallmentOverdue when past due date", async function () {
+      const ctx: any = await deployAll();
+      const { installmentEscrow, admin } = ctx;
+      const { dealId } = await setupCompletedDeal(ctx);
+
+      await expect(installmentEscrow.connect(admin).flagOverdue(dealId, 1))
+        .to.emit(installmentEscrow, "InstallmentOverdue");
+    });
+
+    it("flagOverdue: reverts if installment not yet overdue", async function () {
+      const ctx: any = await deployAll();
+      const { installmentEscrow, admin } = ctx;
+      const { dealId } = await setupCompletedDealFarDates(ctx);
+
+      await expect(installmentEscrow.connect(admin).flagOverdue(dealId, 1))
+        .to.be.revertedWithCustomError(installmentEscrow, "InstallmentNotOverdue");
+    });
+
+    it("claim: transfers tokens to caller and zeroes balance", async function () {
+      const ctx: any = await deployAll();
+      const { installmentEscrow, token, clubA, clubB } = ctx;
+      const { dealId, half } = await setupCompletedDeal(ctx);
+
+      const tokenAddr = await token.getAddress();
+      const protoBps  = await installmentEscrow.protocolFeeBps();
+      const protoAmt  = half * protoBps / 10000n;
+      const sellerAmt = half - protoAmt;
+
+      await token.connect(clubB).approve(await installmentEscrow.getAddress(), half);
+      await installmentEscrow.connect(clubB).payInstallment(dealId, 1);
+
+      const before = await token.balanceOf(clubA.address);
+      await installmentEscrow.connect(clubA).claim(tokenAddr);
+      expect(await token.balanceOf(clubA.address)).to.equal(before + sellerAmt);
+      expect(await installmentEscrow.claimable(clubA.address, tokenAddr)).to.equal(0n);
+    });
+
+    it("claim: reverts with NothingToClaim if balance is zero", async function () {
+      const ctx: any = await deployAll();
+      const { installmentEscrow, token, clubA } = ctx as any;
+      await expect(installmentEscrow.connect(clubA).claim(await token.getAddress()))
+        .to.be.revertedWithCustomError(installmentEscrow, "NothingToClaim");
+    });
+
+  });
+
+});
