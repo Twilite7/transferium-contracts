@@ -151,6 +151,11 @@ contract TransferEscrow is
     address[]                                           private _approvedTokenList;
     mapping(address => TransferBan)                     private _transferBans;
 
+    // ─── Storage gap ──────────────────────────────────────────────────────────
+    // I reserve 50 slots for future upgrades — never remove or reorder variables
+    // above this line.
+    uint256[50] private __gap;
+
     // ─── Events ───────────────────────────────────────────────────────────────
 
     event OfferCreated(uint256 indexed offerId, uint256 indexed playerId, address indexed sellingClub, uint256 askingPrice);
@@ -183,6 +188,7 @@ contract TransferEscrow is
     error TransferWindowClosed();
     error PlayerHasActiveOffer();
     error PlayerHasActiveDeal();
+    error PlayerNotVerified();
     error OfferNotFound();
     error BidNotFound();
     error WrongDealState();
@@ -381,6 +387,11 @@ contract TransferEscrow is
         // I check DealEscrow for active deal — it owns _playerDeal after split
         if (dealEscrow.getPlayerDeal(playerId) != 0)          revert PlayerHasActiveDeal();
         if (playerRegistry.currentClub(playerId) != msg.sender) revert NotSellingClub();
+
+        // I require verification before a transfer offer — consistent with
+        // SwapEscrow.proposeSwap which checks isVerified on both players.
+        IPlayerRegistry.Player memory player_ = playerRegistry.getPlayer(playerId);
+        if (!player_.isVerified) revert PlayerNotVerified();
 
         if (askingPrice == 0 || askingPrice > MAX_PRICE)       revert InvalidAmount();
         if (sellOnBps > MAX_SELL_ON_BPS)                        revert InvalidBps();
@@ -653,7 +664,9 @@ contract TransferEscrow is
         address newSellerAgent,
         uint256 newBuyerAgentBps,
         address newBuyerAgent,
-        uint256 newSalaryGuaranteeMonths
+        uint256 newSalaryGuaranteeMonths,
+        uint256[] calldata newInstallmentAmounts,
+        uint256[] calldata newInstallmentDueDates
     )
         external whenNotPaused nonReentrant offerExists(offerId)
     {
@@ -682,6 +695,26 @@ contract TransferEscrow is
         bid.roundNumber++;
         bid.isCounterFromSeller   = false;
         bid.updatedAt             = block.timestamp;
+
+        // I require a fresh installment schedule whenever the fee changes.
+        // Without this, acceptBid always reverts because FeeLib.validateInstallments
+        // checks sum(installments) == transferFee against the stale old arrays.
+        if (newInstallmentAmounts.length == 0 || newInstallmentAmounts.length > 8) revert InvalidAmount();
+        if (newInstallmentDueDates.length != newInstallmentAmounts.length)          revert InvalidAmount();
+        uint256 _instSum2 = 0;
+        for (uint256 i = 0; i < newInstallmentAmounts.length; i++) {
+            if (newInstallmentAmounts[i] == 0) revert InvalidAmount();
+            if (i == 0 && newInstallmentDueDates[0] < block.timestamp) revert InvalidAmount();
+            if (i > 0 && newInstallmentDueDates[i] <= newInstallmentDueDates[i-1]) revert InvalidAmount();
+            _instSum2 += newInstallmentAmounts[i];
+        }
+        if (_instSum2 != newTransferFee) revert InvalidAmount();
+        delete bid.installmentAmounts;
+        delete bid.installmentDueDates;
+        for (uint256 i = 0; i < newInstallmentAmounts.length; i++) {
+            bid.installmentAmounts.push(newInstallmentAmounts[i]);
+            bid.installmentDueDates.push(newInstallmentDueDates[i]);
+        }
 
         emit BidUpdated(offerId, msg.sender, newTransferFee);
     }
@@ -777,6 +810,10 @@ contract TransferEscrow is
 
         if (buyerAgentBps > MAX_AGENT_BPS)                 revert InvalidBps();
         if (buyerAgentBps > 0 && buyerAgent == address(0)) revert InvalidAddress();
+        // I cap months — same guard as submitBid; an uncapped value produces an
+        // unfundable signingBonusAmount that permanently stalls the deal in
+        // FUNDING_PENDING until expiry (DoS without loss of funds).
+        if (signingBonusMonths > MAX_SIGNING_BONUS_MONTHS) revert InvalidAmount();
 
         // I send funds directly to DealEscrow — it holds all hijack funds.
         // Previous hijacker is refunded internally via DealEscrow._claimable.

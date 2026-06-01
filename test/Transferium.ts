@@ -1873,7 +1873,8 @@ describe("Transferium Protocol v2", function () {
 
       // buyer acknowledges counter — updates bid to match counter price
       await escrow.connect(clubB).updateBid(
-        offerId, PRICE, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress, 0
+        offerId, PRICE, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress, 0,
+        [PRICE], [future]
       );
 
       // seller can now accept
