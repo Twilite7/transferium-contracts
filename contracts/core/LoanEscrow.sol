@@ -396,10 +396,11 @@ contract LoanEscrow is
 
     function cancelLoan(uint256 loanId)
         external
-        whenNotPaused
         nonReentrant
         loanExists(loanId)
     {
+        // I deliberately omit whenNotPaused — borrowing club must always be able
+        // to recover their deposited loanFee, consistent with withdrawClaimable.
         Loan storage loan = _loans[loanId];
         if (loan.borrowingClub != msg.sender) revert NotBorrowingClub();
         if (loan.state != LoanState.PENDING)  revert LoanNotPending();
@@ -510,10 +511,11 @@ contract LoanEscrow is
      */
     function executeRecall(uint256 loanId)
         external
-        whenNotPaused
         nonReentrant
         loanExists(loanId)
     {
+        // I deliberately omit whenNotPaused — a completed notice period must be
+        // executable regardless of pause state so the player is not stranded.
         Loan storage loan = _loans[loanId];
         if (loan.parentClub != msg.sender)   revert NotParentClub();
         if (loan.state != LoanState.ACTIVE)  revert LoanNotActive();
@@ -537,10 +539,11 @@ contract LoanEscrow is
      */
     function settleLoanExpiry(uint256 loanId)
         external
-        whenNotPaused
         nonReentrant
         loanExists(loanId)
     {
+        // I deliberately omit whenNotPaused — an expired loan must always be
+        // settleable so the player is not stranded at the borrowing club.
         Loan storage loan = _loans[loanId];
         if (loan.state != LoanState.ACTIVE)         revert LoanNotActive();
         if (block.timestamp < loan.loanExpiry)       revert LoanStillActive();
