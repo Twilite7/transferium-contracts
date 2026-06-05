@@ -73,12 +73,6 @@ interface IDealEscrow {
     function extCancel(uint256 dealId, uint8 reason) external;
 
     /**
-     * @notice Apply hijack stall penalty and cancel.
-     * @dev TRANSFER_ESCROW_ROLE only. Penalty credited to sellingClub internally.
-     */
-    function extHijackStallAndCancel(uint256 dealId) external;
-
-    /**
      * @notice Advance HIJACK_WINDOW deal to FUNDING_PENDING.
      * @dev TRANSFER_ESCROW_ROLE only.
      */
@@ -107,15 +101,6 @@ interface IDealEscrow {
 
     // ─── Installment support ──────────────────────────────────────────────────
     function getInstallment(uint256 dealId, uint8 index) external view returns (TransferTypes.Installment memory);
-    function creditInstallment(uint256 dealId, uint8 index, uint256 amount) external;
-    function getInstallmentMeta(uint256 dealId) external view returns (
-        address buyingClub,
-        address sellingClub,
-        address paymentToken,
-        uint8   installmentCount,
-        uint8   installmentsPaid,
-        uint8   state
-    );
     /**
      * @notice Advance a MEDICAL_DISPUTE deal to HIJACK_WINDOW.
      * @dev newFee = 0 keeps original fee, non-zero overrides it.
@@ -128,4 +113,7 @@ interface IDealEscrow {
      *      TRANSFER_ESCROW_ROLE only.
      */
     function extWalkAwayPenalty(uint256 dealId) external;
+    function extRescueBonus(uint256 dealId, address dest) external;
+    function extWithdrawAddOn(uint256 dealId, address buyer, uint256 amount) external;
+    function getAddOnDeposit(uint256 dealId, address token) external view returns (uint256);
 }

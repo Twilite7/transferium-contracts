@@ -94,16 +94,24 @@ async function deployAll() {
   const LEAGUE_ROLE          = await escrow.LEAGUE_ROLE();
   const TRANSFER_ESCROW_ROLE = await dealEscrow.TRANSFER_ESCROW_ROLE();
 
-  await registry.grantRole(CLUB_ROLE, clubA.address);
-  await registry.grantRole(CLUB_ROLE, clubB.address);
+  // REGISTRAR_ROLE must exist before registerClub can reference the registrar
   await registry.grantRole(REGISTRAR_ROLE, registrar.address);
+  // Use registerClub (not raw grantRole) so _clubRegistrar[club] is set.
+  // Without this, VerificationManager.requestVerification reverts on getClubRegistrar.
+  await registry.registerClub(clubA.address, "Club A FC", registrar.address);
+  await registry.registerClub(clubB.address, "Club B FC", registrar.address);
+
   const VERIFICATION_ROLE = await registry.VERIFICATION_ROLE();
+  // NOTE: granting VERIFICATION_ROLE directly to registrar is a test-only shortcut
+  // used by setupListedPlayer. Production flows must go through VerificationManager.
   await registry.grantRole(VERIFICATION_ROLE, registrar.address);
-  await registry.grantRole(ESCROW_ROLE, await escrow.getAddress());
+
+  // TransferEscrow reads from PlayerRegistry but never calls escrowTransfer — no ESCROW_ROLE needed.
   await registry.grantRole(ESCROW_ROLE, await dealEscrow.getAddress());
   await registry.grantRole(ESCROW_ROLE, await loanEscrow.getAddress());
+
   await dealEscrow.grantRole(TRANSFER_ESCROW_ROLE, await escrow.getAddress());
-  await dealEscrow.grantRole(TRANSFER_ESCROW_ROLE, await installmentEscrow.getAddress());
+  // InstallmentEscrow only calls view functions on DealEscrow; TRANSFER_ESCROW_ROLE not needed.
   await escrow.grantRole(CLUB_ROLE, clubA.address);
   await escrow.grantRole(CLUB_ROLE, clubB.address);
   await loanEscrow.grantRole(CLUB_ROLE, clubA.address);
@@ -117,10 +125,21 @@ async function deployAll() {
   await token.mint(clubB.address, ethers.parseUnits("1000000000", 6));
   await token.mint(clubA.address, ethers.parseUnits("1000000000", 6));
 
+  // Deploy TerminationManager and wire it so PlayerRegistry.escrowTransfer
+  // correctly calls clearTermination when a player changes clubs.
+  const TerminationManagerF = await ethers.getContractFactory("TerminationManager");
+  const terminationMgr = await TerminationManagerF.deploy(await registry.getAddress());
+  // TerminationManager calls burnPlayer which requires ESCROW_ROLE
+  await registry.grantRole(ESCROW_ROLE, await terminationMgr.getAddress());
+  // TerminationManager.forceTerminate checks playerRegistry.hasRole(LEAGUE_ROLE, msg.sender)
+  await registry.grantRole(await registry.LEAGUE_ROLE(), admin.address);
+  await registry.connect(admin).setTerminationManager(await terminationMgr.getAddress());
+
   return {
     ethers,
     admin, registrar, clubA, clubB, clubC, other,
     token, registry, transferWindow, escrow, dealEscrow, loanEscrow, installmentEscrow, addressReg,
+    terminationMgr,
     CLUB_ROLE, REGISTRAR_ROLE, ESCROW_ROLE, LEAGUE_ROLE,
   };
 }
@@ -178,48 +197,6 @@ async function openTransferWindow(ethers: any, transferWindow: any): Promise<voi
   await ethers.provider.send("evm_increaseTime", [11]);
   await ethers.provider.send("evm_mine", []);
   await transferWindow.advanceActiveWindow();
-}
-
-async function createBasicDeal(
-  ethers: any,
-  escrow: any,
-  token: any,
-  playerId: bigint,
-  sellingClub: any,
-  buyingClub: any,
-  signingBonusMonths = 0
-): Promise<bigint> {
-  const fee = ethers.parseUnits("50000000", 6);
-
-  // I compute salary guarantee if needed
-  const player = await (await ethers.getContractAt(
-    ["function getPlayer(uint256) external view returns (tuple(uint256,string,string,string,uint256,uint256,address,bool,bool,bool,bytes32,uint256,uint256,uint256))"],
-    await (await ethers.getContractFactory("PlayerRegistry")).attach
-  ));
-
-  // I approve fee + potential guarantee
-  const guaranteeAmount = signingBonusMonths > 0
-    ? ethers.parseUnits("50000", 6) * BigInt(4) * BigInt(signingBonusMonths)
-    : BigInt(0);
-
-  await token.connect(buyingClub).approve(await escrow.getAddress(), fee + guaranteeAmount);
-
-  const tx = await escrow.connect(buyingClub).createDeal(
-    playerId,
-    sellingClub.address,
-    await token.getAddress(),
-    fee,
-    signingBonusMonths,
-    0, ethers.ZeroAddress,
-    0, ethers.ZeroAddress,
-    0, ethers.ZeroAddress,
-    []
-  );
-  const receipt = await tx.wait();
-  const event   = receipt.logs
-    .map((log: any) => { try { return escrow.interface.parseLog(log); } catch { return null; } })
-    .find((e: any) => e?.name === "DealCreated");
-  return event.args.dealId;
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -286,7 +263,7 @@ describe("Transferium Protocol v2", function () {
       await expect(registry.connect(registrar).markPlayerVerified(event.args.playerId, registrar.address)).to.emit(registry, "PlayerVerified");
     });
 
-    it("reverts listing without medical clearance", async function () {
+    it("listPlayer requires only isVerified — medical clearance alone does not block listing", async function () {
       const { ethers, registry, clubA, registrar } = await deployAll();
       const now = await getChainTime(ethers);
       const tx      = await registry.connect(clubA).registerPlayer("Test", "CM", "English", now + 365 * 24 * 3600, 0, ethers.id("player-1"));
@@ -299,7 +276,7 @@ describe("Transferium Protocol v2", function () {
       ).to.emit(registry, "PlayerListed");
     });
 
-    it("reverts listing without legal docs verified", async function () {
+    it("listPlayer requires only isVerified — unverified legal docs alone do not block listing", async function () {
       const { ethers, registry, clubA, registrar } = await deployAll();
       const now = await getChainTime(ethers);
       const tx      = await registry.connect(clubA).registerPlayer("Test", "CM", "English", now + 365 * 24 * 3600, 0, ethers.id("player-1"));
@@ -486,7 +463,10 @@ describe("Transferium Protocol v2", function () {
     offerId: bigint, buyingClub: any, extra: any = {}
   ): Promise<bigint> {
     // Default: single lump-sum installment due immediately
-    const fee = extra.fee ?? BigInt(0);
+    // extra.fee is required — BigInt(0) would make installmentAmounts = [0n]
+  // which causes submitBid to revert with InvalidAmount
+  if (!extra.fee) throw new Error('doAccept: extra.fee must be supplied and non-zero');
+  const fee = extra.fee;
     const installmentAmounts  = extra.installmentAmounts  ?? [fee];
     const installmentDueDates = extra.installmentDueDates ?? [Math.floor(Date.now()/1000) + 60];
     await escrow.connect(buyingClub).submitBid(
@@ -745,6 +725,84 @@ describe("Transferium Protocol v2", function () {
       expect(await dealEscrow.getClaimable(other.address, await token.getAddress()))
         .to.equal(guaranteeAmount);
     });
+
+    it("rescueSigningBonus: league rescues unclaimed bonus after 90-day expiry", async function () {
+      const { ethers, registry, transferWindow, escrow, dealEscrow, token, clubA, clubB, other, registrar, admin } = await deployAll();
+      const weeklySalary = ethers.parseUnits("50000", 6);
+      const playerId     = await setupListedPlayer(ethers, registry, clubA, registrar, weeklySalary);
+      await registry.connect(clubA).setPlayerWallet(playerId, other.address);
+      const fee = ethers.parseUnits("50000000", 6);
+      const signingBonusMonths = 3;
+      const guaranteeAmt = weeklySalary * BigInt(4) * BigInt(signingBonusMonths);
+      const dealId = await doFundedDeal(
+        ethers, escrow, dealEscrow, token, registry, transferWindow,
+        clubA, clubB, other, playerId, fee, { signingBonusMonths }
+      );
+      await dealEscrow.connect(admin).forceComplete(dealId);
+      await ethers.provider.send("evm_increaseTime", [91 * 24 * 3600]);
+      await ethers.provider.send("evm_mine", []);
+      await expect(escrow.connect(admin).rescueSigningBonus(dealId))
+        .to.emit(dealEscrow, "SigningBonusRescued");
+      expect(await dealEscrow.getClaimable(admin.address, await token.getAddress()))
+        .to.equal(guaranteeAmt);
+    });
+
+    it("rescueSigningBonus: reverts before 90-day expiry", async function () {
+      const { ethers, registry, transferWindow, escrow, dealEscrow, token, clubA, clubB, other, registrar, admin } = await deployAll();
+      const weeklySalary = ethers.parseUnits("50000", 6);
+      const playerId     = await setupListedPlayer(ethers, registry, clubA, registrar, weeklySalary);
+      await registry.connect(clubA).setPlayerWallet(playerId, other.address);
+      const fee = ethers.parseUnits("50000000", 6);
+      const dealId = await doFundedDeal(
+        ethers, escrow, dealEscrow, token, registry, transferWindow,
+        clubA, clubB, other, playerId, fee, { signingBonusMonths: 1 }
+      );
+      await dealEscrow.connect(admin).forceComplete(dealId);
+      await expect(escrow.connect(admin).rescueSigningBonus(dealId))
+        .to.be.revertedWithCustomError(dealEscrow, "SigningBonusNotExpired");
+    });
+
+    it("withdrawAddOnDeposit: buying club reclaims excess after triggering", async function () {
+      const { ethers, registry, transferWindow, escrow, dealEscrow, token, clubA, clubB, other, registrar, admin } = await deployAll();
+      const playerId = await setupListedPlayer(ethers, registry, clubA, registrar, ethers.parseUnits("50000", 6));
+      await registry.connect(clubA).setPlayerWallet(playerId, other.address);
+      const fee = ethers.parseUnits("50000000", 6);
+      const addOnAmt = ethers.parseUnits("2000000", 6);
+      const addOns = [{ description: "15+ league goals", amount: addOnAmt, toPlayer: true, triggered: false }];
+      const dealId = await doFundedDeal(
+        ethers, escrow, dealEscrow, token, registry, transferWindow,
+        clubA, clubB, other, playerId, fee, { addOns }
+      );
+      await dealEscrow.connect(admin).forceComplete(dealId);
+      const tokenAddr = await token.getAddress();
+      const overDeposit = addOnAmt * 2n;
+      await token.connect(clubB).approve(await dealEscrow.getAddress(), overDeposit);
+      await dealEscrow.connect(clubB).depositAddOnFunds(dealId, overDeposit);
+      await dealEscrow.connect(admin).triggerAddOn(dealId, 0);
+      await expect(escrow.connect(clubB).withdrawAddOnDeposit(dealId, addOnAmt))
+        .to.emit(dealEscrow, "AddOnDepositWithdrawn");
+      expect(await dealEscrow.getClaimable(clubB.address, tokenAddr)).to.equal(addOnAmt);
+      expect(await dealEscrow.getAddOnDeposit(dealId, tokenAddr)).to.equal(0n);
+    });
+
+    it("withdrawAddOnDeposit: reverts when caller is not buying club", async function () {
+      const { ethers, registry, transferWindow, escrow, dealEscrow, token, clubA, clubB, other, registrar, admin } = await deployAll();
+      const playerId = await setupListedPlayer(ethers, registry, clubA, registrar, ethers.parseUnits("50000", 6));
+      await registry.connect(clubA).setPlayerWallet(playerId, other.address);
+      const fee = ethers.parseUnits("50000000", 6);
+      const addOnAmt = ethers.parseUnits("1000000", 6);
+      const addOns = [{ description: "Goals bonus", amount: addOnAmt, toPlayer: false, triggered: false }];
+      const dealId = await doFundedDeal(
+        ethers, escrow, dealEscrow, token, registry, transferWindow,
+        clubA, clubB, other, playerId, fee, { addOns }
+      );
+      await dealEscrow.connect(admin).forceComplete(dealId);
+      await token.connect(clubB).approve(await dealEscrow.getAddress(), addOnAmt);
+      await dealEscrow.connect(clubB).depositAddOnFunds(dealId, addOnAmt);
+      await expect(escrow.connect(clubA).withdrawAddOnDeposit(dealId, addOnAmt))
+        .to.be.revertedWithCustomError(escrow, "NotBuyingClub");
+    });
+
   });
 
   describe("LoanEscrow", function () {
@@ -1384,6 +1442,28 @@ describe("Transferium Protocol v2", function () {
       await expect(
         swapEscrow.connect(admin).forceCancel(1n)
       ).to.emit(swapEscrow, "SwapCancelled");
+    });
+
+    it("scheduleTransferEscrowUpdate: executeTransferEscrowUpdate reverts immediately", async function () {
+      const ctx = await deployWithSwap();
+      const { ethers, swapEscrow, admin } = ctx;
+      const newAddr = ethers.Wallet.createRandom().address;
+      await swapEscrow.connect(admin).scheduleTransferEscrowUpdate(newAddr);
+      await expect(swapEscrow.connect(admin).executeTransferEscrowUpdate())
+        .to.be.revertedWithCustomError(swapEscrow, "TransferEscrowUpdateNotReady");
+    });
+
+    it("scheduleTransferEscrowUpdate: executes after 48-hour delay", async function () {
+      const ctx = await deployWithSwap();
+      const { ethers, swapEscrow, admin } = ctx;
+      const newAddr = ethers.Wallet.createRandom().address;
+      await swapEscrow.connect(admin).scheduleTransferEscrowUpdate(newAddr);
+      await ethers.provider.send("evm_increaseTime", [48 * 3600 + 1]);
+      await ethers.provider.send("evm_mine", []);
+      await expect(swapEscrow.connect(admin).executeTransferEscrowUpdate())
+        .to.emit(swapEscrow, "TransferEscrowUpdated");
+      expect((await swapEscrow.transferEscrow()).toLowerCase())
+        .to.equal(newAddr.toLowerCase());
     });
 
   });
@@ -2180,6 +2260,243 @@ describe("Transferium Protocol v2", function () {
         .to.be.revertedWithCustomError(installmentEscrow, "NothingToClaim");
     });
 
+  });
+
+
+  // ─── VerificationManager ─────────────────────────────────────────────────
+
+  describe("VerificationManager", function () {
+
+    async function deployWithVM() {
+      const base = await deployAll();
+      const { ethers, admin, registrar, registry } = base as any;
+
+      const VMF = await ethers.getContractFactory("VerificationManager");
+      const vm  = await VMF.deploy(await registry.getAddress(), admin.address);
+
+      // In production only VerificationManager holds VERIFICATION_ROLE.
+      // Revoke the test shortcut granted to raw registrar so this suite
+      // exercises the real access-control boundary.
+      const VERIFICATION_ROLE = await registry.VERIFICATION_ROLE();
+      await registry.connect(admin).revokeRole(VERIFICATION_ROLE, registrar.address);
+      await registry.grantRole(VERIFICATION_ROLE, await vm.getAddress());
+
+      return { ...base, vm };
+    }
+
+    it("full flow: requestVerification → verifyMedical → verifyLegal → verifyPlayer", async function () {
+      const { ethers, vm, registry, clubA, registrar } = await deployWithVM();
+      const now = (await ethers.provider.getBlock("latest"))!.timestamp;
+
+      const tx = await registry.connect(clubA).registerPlayer(
+        "VM Player", "GK", "French", now + 365 * 24 * 3600, 0n, ethers.id("vm-1")
+      );
+      const receipt = await tx.wait();
+      const pid = receipt.logs
+        .map((l: any) => { try { return registry.interface.parseLog(l); } catch { return null; } })
+        .find((e: any) => e?.name === "PlayerRegistered").args.playerId;
+
+      const medH = ethers.keccak256(ethers.toUtf8Bytes("vm-med-1"));
+      await registry.connect(clubA).setMedicalClearance(pid, medH);
+      const regH = ethers.keccak256(ethers.toUtf8Bytes("vm-reg-1"));
+      const tmsH = ethers.keccak256(ethers.toUtf8Bytes("vm-tms-1"));
+      await registry.connect(clubA).submitLegalDocuments(pid, regH, tmsH, ethers.ZeroHash);
+      await registry.connect(clubA).setPlayerWallet(pid, ethers.Wallet.createRandom().address);
+      await registry.connect(registrar).setVerificationFee(0);
+
+      await expect(vm.connect(clubA).requestVerification(pid))
+        .to.emit(vm, "VerificationRequested");
+
+      await vm.connect(registrar).verifyMedicalClearance(pid);
+      await vm.connect(registrar).verifyLegalDocuments(pid);
+
+      await expect(vm.connect(registrar).verifyPlayer(pid))
+        .to.emit(vm, "VerificationApproved");
+
+      expect((await registry.getPlayer(pid)).isVerified).to.equal(true);
+    });
+
+    it("rejectVerification clears the active gate so club can retry", async function () {
+      const { ethers, vm, registry, clubA, registrar } = await deployWithVM();
+      const now = (await ethers.provider.getBlock("latest"))!.timestamp;
+
+      const tx = await registry.connect(clubA).registerPlayer(
+        "Reject VM", "ST", "Spanish", now + 365 * 24 * 3600, 0n, ethers.id("vm-rej-1")
+      );
+      const receipt = await tx.wait();
+      const pid = receipt.logs
+        .map((l: any) => { try { return registry.interface.parseLog(l); } catch { return null; } })
+        .find((e: any) => e?.name === "PlayerRegistered").args.playerId;
+
+      const medH = ethers.keccak256(ethers.toUtf8Bytes("vm-med-rej"));
+      await registry.connect(clubA).setMedicalClearance(pid, medH);
+      const regH = ethers.keccak256(ethers.toUtf8Bytes("vm-reg-rej"));
+      const tmsH = ethers.keccak256(ethers.toUtf8Bytes("vm-tms-rej"));
+      await registry.connect(clubA).submitLegalDocuments(pid, regH, tmsH, ethers.ZeroHash);
+      await registry.connect(clubA).setPlayerWallet(pid, ethers.Wallet.createRandom().address);
+      await registry.connect(registrar).setVerificationFee(0);
+
+      await vm.connect(clubA).requestVerification(pid);
+
+      await expect(vm.connect(registrar).rejectVerification(pid))
+        .to.emit(vm, "VerificationRejected");
+
+      expect(await registry.verificationActive(pid)).to.equal(false);
+      expect((await registry.getPlayer(pid)).isVerified).to.equal(false);
+    });
+
+    it("claimVerificationRefund succeeds after 72-hour timeout with no registrar action", async function () {
+      const { ethers, vm, registry, clubA, registrar } = await deployWithVM();
+      const now = (await ethers.provider.getBlock("latest"))!.timestamp;
+
+      const tx = await registry.connect(clubA).registerPlayer(
+        "Timeout VM", "CM", "German", now + 365 * 24 * 3600, 0n, ethers.id("vm-timeout-1")
+      );
+      const receipt = await tx.wait();
+      const pid = receipt.logs
+        .map((l: any) => { try { return registry.interface.parseLog(l); } catch { return null; } })
+        .find((e: any) => e?.name === "PlayerRegistered").args.playerId;
+
+      const medH = ethers.keccak256(ethers.toUtf8Bytes("vm-med-t"));
+      await registry.connect(clubA).setMedicalClearance(pid, medH);
+      const regH = ethers.keccak256(ethers.toUtf8Bytes("vm-reg-t"));
+      const tmsH = ethers.keccak256(ethers.toUtf8Bytes("vm-tms-t"));
+      await registry.connect(clubA).submitLegalDocuments(pid, regH, tmsH, ethers.ZeroHash);
+      await registry.connect(clubA).setPlayerWallet(pid, ethers.Wallet.createRandom().address);
+      await registry.connect(registrar).setVerificationFee(0);
+
+      await vm.connect(clubA).requestVerification(pid);
+
+      await ethers.provider.send("evm_increaseTime", [72 * 3600 + 1]);
+      await ethers.provider.send("evm_mine", []);
+
+      await expect(vm.connect(clubA).claimVerificationRefund(pid))
+        .to.emit(vm, "VerificationRefundClaimed");
+
+      expect(await registry.verificationActive(pid)).to.equal(false);
+    });
+  });
+
+  // ─── TerminationManager ───────────────────────────────────────────────────
+
+  describe("TerminationManager", function () {
+
+    async function setupPlayerForTermination(ctx: any, salt: string) {
+      const { ethers, registry, clubA, registrar } = ctx as any;
+      const now = (await ethers.provider.getBlock("latest"))!.timestamp;
+      const tx = await registry.connect(clubA).registerPlayer(
+        "Term Player", "ST", "French", now + 365 * 24 * 3600, 0n, ethers.id(salt)
+      );
+      const receipt = await tx.wait();
+      const pid = receipt.logs
+        .map((l: any) => { try { return registry.interface.parseLog(l); } catch { return null; } })
+        .find((e: any) => e?.name === "PlayerRegistered").args.playerId;
+      await registry.connect(registrar).markPlayerVerified(pid, registrar.address);
+      const wallet = ethers.Wallet.createRandom().connect(ethers.provider);
+      await (ctx as any).clubA.sendTransaction({ to: wallet.address, value: ethers.parseEther("1") });
+      await registry.connect(clubA).setPlayerWallet(pid, wallet.address);
+      return { pid, wallet };
+    }
+
+    it("mutual termination: propose → confirm → NFT burned", async function () {
+      const ctx = await deployAll();
+      const { registry, terminationMgr } = ctx as any;
+      const { pid, wallet } = await setupPlayerForTermination(ctx, "tm-mutual-1");
+
+      await expect((ctx as any).terminationMgr.connect((ctx as any).clubA).proposeMutualTermination(pid))
+        .to.emit(terminationMgr, "MutualTerminationProposed");
+
+      await expect(terminationMgr.connect(wallet).confirmMutualTermination(pid))
+        .to.emit(terminationMgr, "MutualTerminationConfirmed");
+
+      await expect(registry.ownerOf(pid)).to.be.revertedWithCustomError(registry, "ERC721NonexistentToken");
+    });
+
+    it("withdrawMutualTermination: club withdraws its own proposal", async function () {
+      const ctx = await deployAll();
+      const { clubA, terminationMgr } = ctx as any;
+      const { pid } = await setupPlayerForTermination(ctx, "tm-withdraw-1");
+
+      await terminationMgr.connect(clubA).proposeMutualTermination(pid);
+      await expect(terminationMgr.connect(clubA).withdrawMutualTermination(pid))
+        .to.emit(terminationMgr, "MutualTerminationWithdrawn");
+
+      expect((await terminationMgr.getProposal(pid)).state).to.equal(0n); // None
+    });
+
+    it("unilateral: dispute window passes undisputed → anyone executes → NFT burned", async function () {
+      const ctx = await deployAll();
+      const { ethers, registry, clubA, terminationMgr } = ctx as any;
+      const { pid } = await setupPlayerForTermination(ctx, "tm-unilateral-1");
+
+      await terminationMgr.connect(clubA).proposeUnilateralTermination(pid, "Serious misconduct");
+
+      await ethers.provider.send("evm_increaseTime", [7 * 24 * 3600 + 1]);
+      await ethers.provider.send("evm_mine", []);
+
+      await expect(terminationMgr.executeTermination(pid))
+        .to.emit(terminationMgr, "TerminationExecuted");
+
+      await expect(registry.ownerOf(pid)).to.be.revertedWithCustomError(registry, "ERC721NonexistentToken");
+    });
+
+    it("unilateral: opposing party disputes → league force terminates", async function () {
+      const ctx = await deployAll();
+      const { registry, admin, terminationMgr } = ctx as any;
+      const { pid, wallet } = await setupPlayerForTermination(ctx, "tm-dispute-1");
+
+      await (ctx as any).terminationMgr.connect((ctx as any).clubA).proposeUnilateralTermination(pid, "Breach");
+
+      await expect(terminationMgr.connect(wallet).disputeTermination(pid))
+        .to.emit(terminationMgr, "TerminationDisputed");
+
+      await expect(terminationMgr.connect(admin).forceTerminate(pid))
+        .to.emit(terminationMgr, "TerminationForced");
+
+      await expect(registry.ownerOf(pid)).to.be.revertedWithCustomError(registry, "ERC721NonexistentToken");
+    });
+
+    it("clearTermination: proposal voided when player is transferred via escrow", async function () {
+      const ctx = await deployAll();
+      const { ethers, registry, clubA, clubB, terminationMgr,
+              transferWindow, escrow, dealEscrow, token, admin } = ctx as any;
+      const { pid, wallet } = await setupPlayerForTermination(ctx, "tm-clear-1");
+
+      // Give player full clearances so listPlayer and createOffer succeed
+      const medH = ethers.keccak256(ethers.toUtf8Bytes("tm-clear-med"));
+      await registry.connect(clubA).setMedicalClearance(pid, medH);
+      const regH = ethers.keccak256(ethers.toUtf8Bytes("tm-clear-reg"));
+      const tmsH = ethers.keccak256(ethers.toUtf8Bytes("tm-clear-tms"));
+      await registry.connect(clubA).submitLegalDocuments(pid, regH, tmsH, ethers.ZeroHash);
+
+      await terminationMgr.connect(clubA).proposeMutualTermination(pid);
+      expect((await terminationMgr.getProposal(pid)).state).to.equal(1n); // Proposed
+
+      // Initiate a transfer — escrowTransfer must call clearTermination
+      await registry.connect(clubA).listPlayer(pid, ethers.parseUnits("1000000", 6));
+      await openTransferWindow(ethers, transferWindow);
+      const fee = ethers.parseUnits("1000000", 6);
+      await escrow.connect(clubA).createOffer(pid, await token.getAddress(), fee, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress, 100, []);
+      const offerId = await escrow.totalOffers();
+      const now = (await ethers.provider.getBlock("latest"))!.timestamp;
+      await escrow.connect(clubB).submitBid(offerId, fee, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress, 0, ethers.ZeroAddress, 0, [fee], [now + 3600]);
+      const acceptTx  = await escrow.connect(clubA).acceptBid(offerId, clubB.address);
+      const dealId    = (await acceptTx.wait()).logs
+        .map((l: any) => { try { return dealEscrow.interface.parseLog(l); } catch { return null; } })
+        .find((e: any) => e?.name === "DealCreated").args.dealId;
+
+      await dealEscrow.connect(wallet).consentToTransfer(dealId);
+      await dealEscrow.connect(clubB).submitMedical(dealId, 1, ethers.keccak256(ethers.toUtf8Bytes("med2")));
+      await ethers.provider.send("evm_increaseTime", [48 * 3600 + 1]);
+      await ethers.provider.send("evm_mine", []);
+      await escrow.processExpiry(dealId);
+      await token.connect(clubB).approve(await dealEscrow.getAddress(), fee);
+      await dealEscrow.connect(clubB).fundDeal(dealId);
+      await dealEscrow.connect(admin).forceComplete(dealId);
+
+      // Proposal must be cleared
+      expect((await terminationMgr.getProposal(pid)).state).to.equal(0n); // None
+    });
   });
 
 });

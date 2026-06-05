@@ -67,7 +67,8 @@ contract SwapEscrow is
     uint256 public constant MAX_AGENT_BPS        = 300;
     uint256 public constant BPS_DENOMINATOR      = 10_000;
     uint256 public constant MAX_PRICE            = 500_000_000 ether;
-    uint256 public constant MIN_WINDOW           = 1 hours;
+    uint256 public constant MIN_WINDOW                   = 1 hours;
+    uint256 public constant TRANSFER_ESCROW_UPDATE_DELAY = 48 hours;
 
     // ---- Enums ---------------------------------------------------------------
 
@@ -131,6 +132,9 @@ contract SwapEscrow is
     uint256 public disputeWindow;
     uint256 public mutualCancelWindow;
 
+    address private _pendingTransferEscrow;
+    uint256 private _pendingTransferEscrowAt;
+
     mapping(uint256 => Swap)    private _swaps;
     // playerA or playerB => swapId (one active swap per player)
     mapping(uint256 => uint256) private _playerSwap;
@@ -139,6 +143,11 @@ contract SwapEscrow is
 
     mapping(address => mapping(address => uint256)) private _claimable;
     mapping(address => bool) private _approvedTokens;
+
+    // ─── Storage gap ──────────────────────────────────────────────────────────
+    // I reserve 50 slots for future upgrades — never remove or reorder variables
+    // above this line.
+    uint256[50] private __gap;
 
     // ---- Events --------------------------------------------------------------
 
@@ -154,6 +163,8 @@ contract SwapEscrow is
     event MutualCancelProposed(uint256 indexed swapId, address indexed proposer);
     event MutualCancelConfirmed(uint256 indexed swapId);
     event FundsClaimed(address indexed recipient, address indexed token, uint256 amount);
+    event TransferEscrowUpdateScheduled(address indexed newAddress, uint256 executableAt);
+    event TransferEscrowUpdated(address indexed oldAddress, address indexed newAddress);
 
     // ---- Errors --------------------------------------------------------------
 
@@ -185,6 +196,8 @@ contract SwapEscrow is
     error CannotConfirmOwnCancel();
     error DealIsFrozen();
     error FeesExceed100Pct();
+    error NoPendingTransferEscrowUpdate();
+    error TransferEscrowUpdateNotReady();
 
     // ---- Initializer ---------------------------------------------------------
 
@@ -271,9 +284,21 @@ contract SwapEscrow is
         _approvedTokens[token] = false;
     }
 
-    function setTransferEscrow(address _transferEscrow) external onlyRole(ADMIN_ROLE) {
-        if (_transferEscrow == address(0)) revert InvalidAddress();
-        transferEscrow = ITransferEscrow(_transferEscrow);
+    function scheduleTransferEscrowUpdate(address newAddr) external onlyRole(ADMIN_ROLE) {
+        if (newAddr == address(0)) revert InvalidAddress();
+        _pendingTransferEscrow   = newAddr;
+        _pendingTransferEscrowAt = block.timestamp + TRANSFER_ESCROW_UPDATE_DELAY;
+        emit TransferEscrowUpdateScheduled(newAddr, _pendingTransferEscrowAt);
+    }
+
+    function executeTransferEscrowUpdate() external onlyRole(ADMIN_ROLE) {
+        if (_pendingTransferEscrow == address(0))       revert NoPendingTransferEscrowUpdate();
+        if (block.timestamp < _pendingTransferEscrowAt) revert TransferEscrowUpdateNotReady();
+        address old    = address(transferEscrow);
+        transferEscrow = ITransferEscrow(_pendingTransferEscrow);
+        _pendingTransferEscrow   = address(0);
+        _pendingTransferEscrowAt = 0;
+        emit TransferEscrowUpdated(old, address(transferEscrow));
     }
 
     function pause()   external onlyRole(ADMIN_ROLE) { _pause(); }
@@ -326,6 +351,9 @@ contract SwapEscrow is
         IPlayerRegistry.Player memory pB = playerRegistry.getPlayer(playerB);
         if (!pA.isVerified || !pA.medicalClearance) revert WrongState();
         if (!pB.isVerified || !pB.medicalClearance) revert WrongState();
+        // I require both wallets set — consent stage is permanently blocked without them
+        if (pA.playerWallet == address(0)) revert PlayerWalletNotSet();
+        if (pB.playerWallet == address(0)) revert PlayerWalletNotSet();
 
         _swapIdCounter++;
         swapId = _swapIdCounter;

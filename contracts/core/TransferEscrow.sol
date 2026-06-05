@@ -176,6 +176,8 @@ contract TransferEscrow is
     event TreasuryUpdated(address indexed newTreasury);
     event MutualCancelExpired(uint256 indexed dealId);
     event DealCancelled(uint256 indexed dealId, uint8 reason);
+    event SigningBonusRescued(uint256 indexed dealId, address indexed to, uint256 amount);
+    event AddOnDepositWithdrawn(uint256 indexed dealId, address indexed club, uint256 amount);
 
     // ─── Errors ───────────────────────────────────────────────────────────────
 
@@ -211,6 +213,7 @@ contract TransferEscrow is
     error CannotHijackOwnDeal();
     error BidNotHighEnough(uint256 minimum, uint256 submitted);
     error DealIsFrozen();
+    error NotBuyingClub();
 
     // ─── Initializer ──────────────────────────────────────────────────────────
 
@@ -907,7 +910,7 @@ contract TransferEscrow is
         } else if (state == AWAITING_TRANSFER_MEDICAL) {
             dealEscrow.extCancel(dealId, uint8(TransferTypes.CancelReason.MEDICAL_WINDOW_EXPIRED));
         } else if (state == AWAITING_HIJACK_MEDICAL) {
-            dealEscrow.extHijackStallAndCancel(dealId);
+            dealEscrow.extCancel(dealId, uint8(TransferTypes.CancelReason.HIJACK_MEDICAL_STALL));
         } else if (state == MEDICAL_RENEGOTIATION) {
             dealEscrow.extCancel(dealId, uint8(TransferTypes.CancelReason.RENEGO_NO_RESOLUTION));
         } else if (state == MEDICAL_DISPUTE) {
@@ -946,6 +949,38 @@ contract TransferEscrow is
 
         dealEscrow.extClearMutualCancel(dealId);
         emit MutualCancelExpired(dealId);
+    }
+
+    /**
+     * @notice League rescues an unclaimed signing bonus after the 90-day expiry.
+     * @dev All validation lives in DealEscrow.extRescueBonus so that the custom
+     *      errors (SigningBonusNotExpired etc.) remain on DealEscrow's ABI.
+     */
+    function rescueSigningBonus(uint256 dealId)
+        external onlyRole(LEAGUE_ROLE) nonReentrant
+    {
+        IDealEscrow.DealView memory dv = dealEscrow.getDealView(dealId);
+        if (!dv.exists) revert DealNotFound();
+        address dest = (treasury != address(0)) ? treasury : dv.sellingClub;
+        dealEscrow.extRescueBonus(dealId, dest);
+    }
+
+    /**
+     * @notice Buying club withdraws unused add-on deposit after deal completion.
+     * @dev Balance check and mutation in DealEscrow.extWithdrawAddOn;
+     *      early-revert checks here save a cross-contract call on the happy path.
+     */
+    function withdrawAddOnDeposit(uint256 dealId, uint256 amount)
+        external whenNotPaused nonReentrant
+    {
+        IDealEscrow.DealView memory dv = dealEscrow.getDealView(dealId);
+        if (!dv.exists) revert DealNotFound();
+        if (dv.buyingClub != msg.sender) revert NotBuyingClub();
+        if (dv.state != IDealEscrow.DealState.COMPLETED) revert WrongDealState();
+        if (amount == 0) revert InvalidAmount();
+        uint256 available = dealEscrow.getAddOnDeposit(dealId, dv.paymentToken);
+        if (amount > available) revert InvalidAmount();
+        dealEscrow.extWithdrawAddOn(dealId, msg.sender, amount);
     }
 
     // ─── Internal ─────────────────────────────────────────────────────────────

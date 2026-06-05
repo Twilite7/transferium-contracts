@@ -214,6 +214,18 @@ contract TransferWindow is AccessControl, Pausable {
         if (w.windowType == WindowType.EMERGENCY   && newDuration > MAX_EMERGENCY_DURATION)
             revert ExtensionTooLong();
 
+        // I check that the extended close time doesn't overlap the next scheduled window
+        uint256 len = _windowIds.length;
+        for (uint256 i = 0; i < len; i++) {
+            Window storage other = _windows[_windowIds[i]];
+            if (!other.exists) continue;
+            if (other.id == windowId) continue;
+            if (other.closesAt <= block.timestamp) continue;
+            bool overlaps = newClosesAt + MIN_WINDOW_GAP > other.opensAt &&
+                            other.closesAt + MIN_WINDOW_GAP > w.opensAt;
+            if (overlaps) revert WindowOverlap();
+        }
+
         w.closesAt = newClosesAt;
 
         emit WindowExtended(windowId, newClosesAt);

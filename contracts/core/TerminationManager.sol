@@ -68,6 +68,7 @@ contract TerminationManager is ReentrancyGuard {
     event TerminationForced(uint256 indexed playerId, address indexed league);
     event TerminationRejected(uint256 indexed playerId, address indexed league);
     event TerminationCleared(uint256 indexed playerId);
+    event MutualTerminationWithdrawn(uint256 indexed playerId, address indexed club);
 
     // ─── Errors ───────────────────────────────────────────────────────────────
 
@@ -137,6 +138,33 @@ contract TerminationManager is ReentrancyGuard {
         });
 
         emit MutualTerminationProposed(playerId, msg.sender);
+    }
+
+    /**
+     * @notice Club withdraws its own mutual termination proposal.
+     * @dev Without this, a club that proposes mutual termination — even by mistake —
+     *      is permanently blocked from any further termination action because
+     *      ProposalAlreadyExists fires on every subsequent attempt. The only
+     *      existing escape (transfer the player) defeats the purpose of termination.
+     *      Only the proposing club (current NFT holder) may withdraw.
+     */
+    function withdrawMutualTermination(uint256 playerId)
+        external
+        whenRegistryNotPaused
+    {
+        IPlayerRegistry.TerminationProposal storage prop = _proposals[playerId];
+        if (prop.state != IPlayerRegistry.TerminationState.Proposed)
+            revert NoProposal(playerId);
+        if (prop.initiator != IPlayerRegistry.TerminationInitiator.Club)
+            revert NotMutualProposal(playerId);
+
+        address club = playerRegistry.currentClub(playerId);
+        if (msg.sender != club) revert NotPlayerClub(playerId, msg.sender, club);
+
+        // EFFECTS — clear before any external reads can observe stale state.
+        delete _proposals[playerId];
+
+        emit MutualTerminationWithdrawn(playerId, msg.sender);
     }
 
     /**

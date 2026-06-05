@@ -4,7 +4,6 @@ pragma solidity ^0.8.28;
 import "@openzeppelin/contracts-upgradeable/token/ERC721/ERC721Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -40,7 +39,6 @@ contract PlayerRegistry is
     ERC721Upgradeable,
     AccessControlUpgradeable,
     PausableUpgradeable,
-    ReentrancyGuard,
     UUPSUpgradeable
 {
     using SafeERC20 for IERC20;
@@ -90,6 +88,14 @@ contract PlayerRegistry is
 
     uint256 public  protocolFeesAccumulated;
 
+    // ─── Custom reentrancy guard ──────────────────────────────────────────────
+    // I inline the guard so the lock lives in proxy storage initialised via
+    // initialize(), not a constructor — correct for all UUPS upgrade paths.
+
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED     = 2;
+    uint256 private         _reentrancyStatus;
+
     // ─── Pause accounting ─────────────────────────────────────────────────────
 
     uint256 private _pausedAt;
@@ -133,6 +139,7 @@ contract PlayerRegistry is
 
     // ─── Errors ───────────────────────────────────────────────────────────────
 
+    error ReentrantCall();
     error ZeroAddress();
     error ZeroAmount();
     error EmptyString();
@@ -183,6 +190,13 @@ contract PlayerRegistry is
 
     // ─── Modifiers ────────────────────────────────────────────────────────────
 
+    modifier nonReentrant() {
+        if (_reentrancyStatus == _ENTERED) revert ReentrantCall();
+        _reentrancyStatus = _ENTERED;
+        _;
+        _reentrancyStatus = _NOT_ENTERED;
+    }
+
     modifier playerExists(uint256 playerId) {
         if (_players[playerId].id == 0) revert PlayerDoesNotExist(playerId);
         _;
@@ -221,6 +235,7 @@ contract PlayerRegistry is
         __ERC721_init("Transferium Player", "TRFP");
         __AccessControl_init();
         __Pausable_init();
+        _reentrancyStatus = _NOT_ENTERED;
 
         EURC             = IERC20(eurc_);
         registrationFee  = registrationFee_;
@@ -761,6 +776,10 @@ contract PlayerRegistry is
 
     function getClubRegistrar(address club) external view returns (address) {
         return _clubRegistrar[club];
+    }
+
+    function getClubName(address club) external view returns (string memory) {
+        return _clubNames[club];
     }
 
 
