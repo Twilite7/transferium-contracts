@@ -140,8 +140,16 @@ async function main() {
   const terminationMgrAddr = await terminationMgr.getAddress();
   console.log(`  TerminationManager: ${terminationMgrAddr}`);
 
-  // ── 15. Seed InstallmentEscrow into AddressRegistry ───────────────────────
-  console.log("\n[15] Seeding InstallmentEscrow");
+  // ── 15. CompetingBidManager (plain) ─────────────────────────────────────────
+  console.log("\n[15] CompetingBidManager");
+  const competingBidMgr = await (await ethers.getContractFactory("CompetingBidManager", deployer))
+    .deploy(dealEscrowAddr, admin);
+  await competingBidMgr.waitForDeployment();
+  const competingBidMgrAddr = await competingBidMgr.getAddress();
+  console.log(`  CompetingBidManager: ${competingBidMgrAddr}`);
+
+  // ── 16. Seed InstallmentEscrow into AddressRegistry ───────────────────────
+  console.log("\n[16] Seeding InstallmentEscrow");
   await (await addressRegistry.seed(INSTALLMENT_ESCROW_KEY, installmentEscrowAddr)).wait();
   console.log("  InstallmentEscrow seeded");
 
@@ -174,6 +182,10 @@ async function main() {
   await (await de.grantRole(TRANSFER_ESCROW_ROLE, transferEscrowAddr)).wait();
   await (await de.grantRole(TRANSFER_ESCROW_ROLE, installmentEscrowAddr)).wait();
   console.log("  TRANSFER_ESCROW_ROLE → TransferEscrow, InstallmentEscrow");
+  // COMPETING_BID_MANAGER_ROLE on DealEscrow → CompetingBidManager
+  const COMPETING_BID_MANAGER_ROLE = await de.COMPETING_BID_MANAGER_ROLE();
+  await (await de.grantRole(COMPETING_BID_MANAGER_ROLE, competingBidMgrAddr)).wait();
+  console.log("  COMPETING_BID_MANAGER_ROLE → CompetingBidManager");
 
   // CLUB_ROLE on TransferEscrow + LoanEscrow is granted per-club via Admin panel.
   // TransferWindow uses its own internal role — no cross-contract grant needed.
@@ -182,8 +194,8 @@ async function main() {
   await (await pr.setTerminationManager(terminationMgrAddr)).wait();
   console.log("  TerminationManager set on PlayerRegistry");
 
-  // ── 17. Approve tokens on escrow contracts ─────────────────────────────────
-  console.log("\n[17] Approving tokens");
+  // ── 18. Approve tokens on escrow contracts ─────────────────────────────────
+  console.log("\n[18] Approving tokens");
   for (const [name, addr] of [
     ["TransferEscrow",     transferEscrowAddr],
     ["DealEscrow",         dealEscrowAddr],
@@ -198,7 +210,7 @@ async function main() {
     console.log(`  EURC + USDC → ${name}`);
   }
 
-  // ── 18. Write addresses ────────────────────────────────────────────────────
+  // ── 19. Write addresses ────────────────────────────────────────────────────
   const addresses = {
     chainId:             "5042002",
     deployer:            admin,
@@ -216,6 +228,7 @@ async function main() {
     InstallmentEscrow:   installmentEscrowAddr,
     VerificationManager: verificationMgrAddr,
     TerminationManager:  terminationMgrAddr,
+    CompetingBidManager: competingBidMgrAddr,
     eurcAddress:         EURC,
     usdcAddress:         USDC,
   };
@@ -239,6 +252,7 @@ async function main() {
   console.log(`  AddressRegistry:     '${addressRegistryAddr}',`);
   console.log(`  VerificationManager: '${verificationMgrAddr}',`);
   console.log(`  TerminationManager:  '${terminationMgrAddr}',`);
+  console.log(`  CompetingBidManager: '${competingBidMgrAddr}',`);
 }
 
 main().catch(console.error);
