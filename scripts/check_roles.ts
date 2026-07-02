@@ -4,29 +4,27 @@ async function main() {
   const { ethers } = await network.connect();
   const [deployer] = await ethers.getSigners();
 
-  const registry = new ethers.Contract(
-    "0x4EB83Ae9092b154fB87C5c17632b3aa181AD3201",
-    [
-      "function CLUB_ROLE() view returns (bytes32)",
-      "function REGISTRAR_ROLE() view returns (bytes32)",
-      "function hasRole(bytes32,address) view returns (bool)",
-    ],
-    deployer
-  );
+  const PLAYER_REGISTRY = "0xFA8dCb6f0DB181DD9400888a1e0874Ebba94D7bA";
+  const NEW_VMGR        = "0x0ad1c42A82502157C05C68c2673dCaab00Df5EeC";
 
-  const CLUB_ROLE      = await registry.CLUB_ROLE();
-  const REGISTRAR_ROLE = await registry.REGISTRAR_ROLE();
+  const registry = new ethers.Contract(PLAYER_REGISTRY, [
+    "function hasRole(bytes32, address) view returns (bool)",
+  ], ethers.provider);
 
-  const deployer_addr = deployer.address;
-  const club_wallet   = "0xF6EE621FcFceE360Bf3BbA8707144a58B0028F85";
+  const roles = {
+    DEFAULT_ADMIN: "0x0000000000000000000000000000000000000000000000000000000000000000",
+    ADMIN_ROLE:    ethers.id("ADMIN_ROLE"),
+    VERIFICATION:  ethers.id("VERIFICATION_ROLE"),
+  };
 
-  console.log("--- Deployer ---");
-  console.log("CLUB_ROLE:      ", await registry.hasRole(CLUB_ROLE,      deployer_addr));
-  console.log("REGISTRAR_ROLE: ", await registry.hasRole(REGISTRAR_ROLE, deployer_addr));
-
-  console.log("--- Club wallet ---");
-  console.log("CLUB_ROLE:      ", await registry.hasRole(CLUB_ROLE,      club_wallet));
-  console.log("REGISTRAR_ROLE: ", await registry.hasRole(REGISTRAR_ROLE, club_wallet));
+  for (const [name, role] of Object.entries(roles)) {
+    const has = await registry.hasRole(role, deployer.address);
+    console.log(`${name}: deployer=${has}`);
+    if (name === "VERIFICATION") {
+      const vmgrHas = await registry.hasRole(role, NEW_VMGR);
+      console.log(`${name}: new_vmgr=${vmgrHas}`);
+    }
+  }
 }
 
-main().catch(console.error);
+main().catch(e => { console.error(e); process.exit(1); });

@@ -133,6 +133,12 @@ contract PlayerRegistry is
 
     mapping(uint256 => WalletUpdateRequest) private _walletUpdateRequests;
 
+    // ─── Wallet uniqueness ────────────────────────────────────────────────────
+    // I track which player a wallet is assigned to so duplicate wallet
+    // assignments across different players are rejected at the contract level.
+    // 0 means unassigned (valid since player IDs start at 1).
+    mapping(address => uint256) private _walletToPlayer;
+
     // ─── Storage gap ──────────────────────────────────────────────────────────
 
     uint256[50] private __gap;
@@ -185,6 +191,7 @@ contract PlayerRegistry is
     error NoWalletUpdatePending(uint256 playerId);
     error WalletUpdateNotReady(uint256 playerId, uint256 adjustedExecutable, uint256 now_);
     error WalletUpdateAlreadySet(uint256 playerId, address wallet);
+    error WalletAlreadyAssigned(address wallet, uint256 assignedTo);
 
     error DirectTransferNotAllowed();
 
@@ -225,6 +232,7 @@ contract PlayerRegistry is
         address eurc_,
         uint64  registrationFee_,
         uint64  listingFee_,
+        uint64  baseVerificationFee_,
         address treasury_
     ) external initializer {
         if (eurc_     == address(0)) revert ZeroAddress();
@@ -238,8 +246,9 @@ contract PlayerRegistry is
         _reentrancyStatus = _NOT_ENTERED;
 
         EURC             = IERC20(eurc_);
-        registrationFee  = registrationFee_;
-        listingFee       = listingFee_;
+        registrationFee      = registrationFee_;
+        listingFee           = listingFee_;
+        baseVerificationFee  = baseVerificationFee_;
         protocolTreasury = treasury_;
 
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
@@ -549,7 +558,15 @@ contract PlayerRegistry is
     {
         if (wallet == address(0))                      revert ZeroAddress();
         if (_players[playerId].playerWallet == wallet) revert WalletUpdateAlreadySet(playerId, wallet);
-        if (verificationActive[playerId])             revert VerificationAlreadyActive(playerId);
+        if (verificationActive[playerId])              revert VerificationAlreadyActive(playerId);
+        // I reject wallets already assigned to a different player
+        uint256 currentOwner = _walletToPlayer[wallet];
+        if (currentOwner != 0 && currentOwner != playerId)
+            revert WalletAlreadyAssigned(wallet, currentOwner);
+        // I clear the reverse mapping for the old wallet if one existed
+        address oldWallet = _players[playerId].playerWallet;
+        if (oldWallet != address(0)) delete _walletToPlayer[oldWallet];
+        _walletToPlayer[wallet] = playerId;
         _players[playerId].playerWallet = wallet;
         emit PlayerWalletSet(playerId, wallet);
     }
@@ -628,6 +645,10 @@ contract PlayerRegistry is
         if (newWallet == address(0))                      revert ZeroAddress();
         if (newWallet == _players[playerId].playerWallet) revert WalletUpdateAlreadySet(playerId, newWallet);
         if (_walletUpdateRequests[playerId].active)       revert WalletUpdateAlreadyPending(playerId);
+        // I reject wallets already assigned to a different player
+        uint256 currentOwner = _walletToPlayer[newWallet];
+        if (currentOwner != 0 && currentOwner != playerId)
+            revert WalletAlreadyAssigned(newWallet, currentOwner);
 
         _walletUpdateRequests[playerId] = WalletUpdateRequest({
             newWallet:     newWallet,
@@ -652,6 +673,9 @@ contract PlayerRegistry is
         address oldWallet = _players[playerId].playerWallet;
         address newWallet = req.newWallet;
         delete _walletUpdateRequests[playerId];
+        // I update the reverse mapping atomically with the wallet change
+        if (oldWallet != address(0)) delete _walletToPlayer[oldWallet];
+        _walletToPlayer[newWallet] = playerId;
         _players[playerId].playerWallet = newWallet;
 
         emit WalletUpdateExecuted(playerId, oldWallet, newWallet);
@@ -746,6 +770,8 @@ contract PlayerRegistry is
     function resetWallet(uint256 playerId, address actor)
         external onlyRole(VERIFICATION_ROLE) playerExists(playerId)
     {
+        address _oldWallet = _players[playerId].playerWallet;
+        if (_oldWallet != address(0)) delete _walletToPlayer[_oldWallet];
         _players[playerId].playerWallet = address(0);
         if (_walletUpdateRequests[playerId].active) {
             delete _walletUpdateRequests[playerId];
@@ -790,12 +816,11 @@ contract PlayerRegistry is
     function getRegistrarClaimable(address registrar) external view returns (uint256) {
         return _registrarClaimable[registrar];
     }
-
-    function getWalletUpdateRequest(uint256 playerId)
-        external view returns (WalletUpdateRequest memory)
-    {
-        return _walletUpdateRequests[playerId];
+    /// @notice Returns the player ID assigned to a wallet address, or 0 if unassigned.
+    function getPlayerByWallet(address wallet) external view returns (uint256) {
+        return _walletToPlayer[wallet];
     }
+
 
 
 

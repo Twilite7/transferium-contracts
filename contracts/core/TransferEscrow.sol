@@ -509,24 +509,22 @@ contract TransferEscrow is
 
         // I build params struct to avoid stack-too-deep on initializeDeal
         TransferTypes.DealInitParams memory params = TransferTypes.DealInitParams({
-            offerId:                   offerId,
-            playerId:                  offer.playerId,
-            sellingClub:               offer.sellingClub,
-            buyingClub:                buyingClub,
-            paymentToken:              offer.paymentToken,
-            transferFee:               bid.transferFee,
-            sellOnBps:                 bid.sellOnBps,
-            sellOnRecipient:           bid.sellOnRecipient,
-            sellerAgentBps:            bid.sellerAgentBps,
-            sellerAgent:               bid.sellerAgent,
-            buyerAgentBps:             bid.buyerAgentBps,
-            buyerAgent:                bid.buyerAgent,
-            signingBonusMonths:     bid.signingBonusMonths,
-            signingBonusAmount:     signingBonusAmount,
-            minimumHijackIncrementBps: offer.minimumHijackIncrementBps,
-            consentWindowDuration:     consentWindow,
-            installmentAmounts:        bid.installmentAmounts,
-            installmentDueDates:       bid.installmentDueDates
+            offerId:            offerId,
+            playerId:           offer.playerId,
+            sellingClub:        offer.sellingClub,
+            buyingClub:         buyingClub,
+            paymentToken:       offer.paymentToken,
+            transferFee:        bid.transferFee,
+            sellOnBps:          bid.sellOnBps,
+            sellOnRecipient:    bid.sellOnRecipient,
+            sellerAgentBps:     bid.sellerAgentBps,
+            sellerAgent:        bid.sellerAgent,
+            buyerAgentBps:      bid.buyerAgentBps,
+            buyerAgent:         bid.buyerAgent,
+            signingBonusMonths: bid.signingBonusMonths,
+            signingBonusAmount: signingBonusAmount,
+            installmentAmounts: bid.installmentAmounts,
+            installmentDueDates: bid.installmentDueDates
         });
 
         // I get add-ons from offer storage to pass to DealEscrow
@@ -599,6 +597,14 @@ contract TransferEscrow is
         Bid storage existing = _bids[offerId][msg.sender];
         if (existing.status == BidStatus.NEGOTIATING ||
             existing.status == BidStatus.PENDING) revert AlreadyHasActiveBid();
+        // I capture this before any writes — existing and newBid point to the
+        // same storage slot. A re-bid after withdrawal has submittedAt already set
+        // but status == NONE/WITHDRAWN, so checking submittedAt is wrong.
+        // A bidder needs to be re-added to _bidders if their previous bid was
+        // withdrawn (they were removed from active tracking but the struct persists).
+        bool isNewBidder = existing.status == BidStatus.NONE ||
+                           existing.status == BidStatus.WITHDRAWN ||
+                           existing.status == BidStatus.REJECTED;
 
         if (transferFee == 0 || transferFee > MAX_PRICE)     revert InvalidAmount();
         if (sellOnBps > MAX_SELL_ON_BPS)                      revert InvalidBps();
@@ -651,7 +657,7 @@ contract TransferEscrow is
             newBid.installmentDueDates.push(installmentDueDates[i]);
         }
 
-        if (existing.submittedAt == 0) _bidders[offerId].push(msg.sender);
+        if (isNewBidder) _bidders[offerId].push(msg.sender);
         _bidCount[offerId]++;
         if (status == BidStatus.NEGOTIATING) offer.activeNegotiations++;
 
@@ -786,48 +792,7 @@ contract TransferEscrow is
      *      then delegates storage update to DealEscrow via TRANSFER_ESCROW_ROLE.
      *      Kept in TransferEscrow to stay within DealEscrow's 24KB size limit.
      */
-    function submitHijackBid(
-        uint256 dealId,
-        uint256 transferFee,
-        uint256 buyerAgentBps,
-        address buyerAgent,
-        uint256 signingBonusMonths
-    )
-        external
-        whenNotPaused
-        nonReentrant
-        onlyRole(CLUB_ROLE)
-        notBanned
-    {
-        // I pull deal data via interface to check state
-        IDealEscrow.DealView memory dv = dealEscrow.getDealView(dealId);
-        if (!dv.exists)                              revert DealNotFound();
-        if (dv.state != IDealEscrow.DealState.HIJACK_WINDOW) revert HijackWindowClosed();
-        if (block.timestamp > dv.stateDeadline)     revert HijackWindowClosed();
-        if (msg.sender == dv.sellingClub)            revert CannotBidOnOwnPlayer();
-        if (msg.sender == dv.buyingClub)             revert CannotHijackOwnDeal();
 
-        uint256 minimumFee = dv.transferFee +
-            (dv.transferFee * dv.minimumHijackIncrementBps) / BPS_DENOMINATOR;
-        if (transferFee < minimumFee) revert BidNotHighEnough(minimumFee, transferFee);
-
-        if (buyerAgentBps > MAX_AGENT_BPS)                 revert InvalidBps();
-        if (buyerAgentBps > 0 && buyerAgent == address(0)) revert InvalidAddress();
-        // I cap months — same guard as submitBid; an uncapped value produces an
-        // unfundable signingBonusAmount that permanently stalls the deal in
-        // FUNDING_PENDING until expiry (DoS without loss of funds).
-        if (signingBonusMonths > MAX_SIGNING_BONUS_MONTHS) revert InvalidAmount();
-
-        // I send funds directly to DealEscrow — it holds all hijack funds.
-        // Previous hijacker is refunded internally via DealEscrow._claimable.
-        // This avoids cross-contract fund forwarding complexity.
-        IERC20(dv.paymentToken).safeTransferFrom(msg.sender, address(dealEscrow), transferFee);
-
-        // I record the bid in DealEscrow storage after funds arrive
-        dealEscrow.receiveHijackBid(
-            dealId, msg.sender, transferFee, buyerAgentBps, buyerAgent, signingBonusMonths
-        );
-    }
 
     // ─── Renegotiation / Dispute Resolution ─────────────────────────────────
 
@@ -858,16 +823,10 @@ contract TransferEscrow is
         if (!dv.exists) revert DealNotFound();
         uint8 MEDICAL_DISPUTE = 8;
         if (uint8(dv.state) != MEDICAL_DISPUTE) revert WrongDealState();
-        if (op == 0) {
-            dealEscrow.extCancel(dealId, uint8(TransferTypes.CancelReason.LEAGUE_DISPUTE_CANCELLED));
-        } else if (op == 1) {
-            dealEscrow.extAdvanceToHijack(dealId, 0);
-        } else if (op == 2) {
-            if (newFee == 0) revert InvalidAmount();
-            dealEscrow.extAdvanceToHijack(dealId, newFee);
-        } else {
-            revert InvalidAmount();
-        }
+        // I only support cancel from MEDICAL_DISPUTE now.
+        // Competing bids are handled by CompetingBidManager — no hijack advance needed.
+        if (op != 0) revert InvalidAmount();
+        dealEscrow.extCancel(dealId, uint8(TransferTypes.CancelReason.LEAGUE_DISPUTE_CANCELLED));
     }
 
     // ─── Expiry Processing ────────────────────────────────────────────────────
@@ -892,39 +851,28 @@ contract TransferEscrow is
         if (stateDeadline == 0)                revert WrongDealState();
         if (block.timestamp <= stateDeadline)  revert WrongDealState();
 
-        // I map uint8 state to the enum values we care about
-        // Values match TransferTypes.DealState order exactly
-        uint8 AWAITING_PLAYER_CONSENT    = 5;
-        uint8 AWAITING_TRANSFER_MEDICAL  = 6;
-        uint8 MEDICAL_RENEGOTIATION      = 7;
-        uint8 MEDICAL_DISPUTE            = 8;
-        uint8 HIJACK_WINDOW              = 9;
-        uint8 AWAITING_HIJACK_CONSENT    = 10;
-        uint8 AWAITING_HIJACK_MEDICAL    = 11;
-        uint8 FUNDING_PENDING            = 13;
-        uint8 FUNDED                     = 14;
-        uint8 DISPUTE_WINDOW             = 15;
+        // I map uint8 state to new enum values — updated after hijack removal.
+        // AWAITING_THIRD_PARTY_MEDICAL (9) expiry is handled by CompetingBidManager,
+        // not here — processExpiry reverts for that state.
+        // New flow: consent→FUNDING_PENDING→(fund)→AWAITING_MEDICAL→(medical pass)→COMPLETED
+        // AWAITING_THIRD_PARTY_MEDICAL (9) expiry handled by CompetingBidManager.
+        uint8 AWAITING_PLAYER_CONSENT      = 5;
+        uint8 AWAITING_MEDICAL             = 6;
+        uint8 MEDICAL_RENEGOTIATION        = 7;
+        uint8 MEDICAL_DISPUTE              = 8;
+        uint8 FUNDING_PENDING              = 11;
 
-        if (state == AWAITING_PLAYER_CONSENT || state == AWAITING_HIJACK_CONSENT) {
+        if (state == AWAITING_PLAYER_CONSENT) {
             dealEscrow.extCancel(dealId, uint8(TransferTypes.CancelReason.CONSENT_WINDOW_EXPIRED));
-        } else if (state == AWAITING_TRANSFER_MEDICAL) {
+        } else if (state == FUNDING_PENDING) {
+            // Funding window expired — Club B never funded after player consented
+            dealEscrow.extCancel(dealId, uint8(TransferTypes.CancelReason.FUNDING_WINDOW_EXPIRED));
+        } else if (state == AWAITING_MEDICAL) {
             dealEscrow.extCancel(dealId, uint8(TransferTypes.CancelReason.MEDICAL_WINDOW_EXPIRED));
-        } else if (state == AWAITING_HIJACK_MEDICAL) {
-            dealEscrow.extCancel(dealId, uint8(TransferTypes.CancelReason.HIJACK_MEDICAL_STALL));
         } else if (state == MEDICAL_RENEGOTIATION) {
             dealEscrow.extCancel(dealId, uint8(TransferTypes.CancelReason.RENEGO_NO_RESOLUTION));
         } else if (state == MEDICAL_DISPUTE) {
             dealEscrow.extCancel(dealId, uint8(TransferTypes.CancelReason.LEAGUE_DEADLINE_EXPIRED));
-        } else if (state == HIJACK_WINDOW) {
-            dealEscrow.extAdvanceToFunding(dealId);
-        } else if (state == FUNDED) {
-            // Dispute window expired with no dispute raised — settle automatically
-            dealEscrow.extSettle(dealId);
-        } else if (state == DISPUTE_WINDOW) {
-            // League never resolved the dispute before deadline — auto-settle
-            dealEscrow.extSettle(dealId);
-        } else if (state == FUNDING_PENDING) {
-            dealEscrow.extCancel(dealId, uint8(TransferTypes.CancelReason.FUNDING_WINDOW_EXPIRED));
         } else {
             revert WrongDealState();
         }

@@ -2,21 +2,27 @@ import { network } from "hardhat";
 import * as fs from "fs";
 import * as path from "path";
 
-const EURC = "0x89B50855Aa3bE2F677cD6303Cec809B5F319D72a";
+const EURC = "0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a";
 const USDC = "0x3600000000000000000000000000000000000000";
 
-async function deployProxy(ethers: any, deployer: any, contractName: string, initArgs: any[]) {
-  const Factory  = await ethers.getContractFactory(contractName, deployer);
+async function deployProxy(
+  ethers: any,
+  deployer: any,
+  contractName: string,
+  initArgs: any[],
+  libraries: Record<string, string> = {}
+): Promise<string> {
+  const Factory  = await ethers.getContractFactory(contractName, { signer: deployer, libraries });
   const impl     = await Factory.deploy();
   await impl.waitForDeployment();
 
-  const Proxy    = await ethers.getContractFactory("TransferiumProxy", deployer);
-  const initData = Factory.interface.encodeFunctionData("initialize", initArgs);
-  const proxy    = await Proxy.deploy(await impl.getAddress(), initData);
+  const ProxyFact = await ethers.getContractFactory("TransferiumProxy", deployer);
+  const initData  = Factory.interface.encodeFunctionData("initialize", initArgs);
+  const proxy     = await ProxyFact.deploy(await impl.getAddress(), initData);
   await proxy.waitForDeployment();
 
   const addr = await proxy.getAddress();
-  console.log(`  ${contractName}: ${addr}`);
+  console.log(`  ${contractName}: ${addr}  (impl: ${await impl.getAddress()})`);
   return addr;
 }
 
@@ -28,28 +34,27 @@ async function main() {
   console.log("Deployer:", admin);
   console.log("─".repeat(60));
 
-  // ── 1. AddressRegistry ─────────────────────────────────────────────────────
+  // ── 1. AddressRegistry (plain — not upgradeable) ───────────────────────────
   console.log("\n[1] AddressRegistry");
-  const RegistryFactory = await ethers.getContractFactory("AddressRegistry", deployer);
-  const addressRegistry = await RegistryFactory.deploy(admin);
+  const addressRegistry = await (await ethers.getContractFactory("AddressRegistry", deployer))
+    .deploy(admin);
   await addressRegistry.waitForDeployment();
   const addressRegistryAddr = await addressRegistry.getAddress();
   console.log(`  AddressRegistry: ${addressRegistryAddr}`);
 
-  // ── 2. PlayerRegistry ──────────────────────────────────────────────────────
+  // ── 2. PlayerRegistry (UUPS proxy) ────────────────────────────────────────
   console.log("\n[2] PlayerRegistry");
-  const PRFactory      = await ethers.getContractFactory("PlayerRegistry", deployer);
-  const REG_FEE        = 500_000n;
+  const REG_FEE        = 500_000n;   // 0.5 EURC (6 decimals)
   const LIST_FEE       = 0n;
-  const playerRegistry = await PRFactory.deploy(REG_FEE, LIST_FEE);
-  await playerRegistry.waitForDeployment();
-  const playerRegistryAddr = await playerRegistry.getAddress();
-  console.log(`  PlayerRegistry: ${playerRegistryAddr}`);
+  const BASE_VERIF_FEE = 2_000_000n; // 2 EURC — registrars may charge up to 120% (2.4 EURC max)
+  const playerRegistryAddr = await deployProxy(ethers, deployer, "PlayerRegistry", [
+    EURC, REG_FEE, LIST_FEE, BASE_VERIF_FEE, admin,
+  ]);
 
-  // ── 3. TransferWindow ──────────────────────────────────────────────────────
+  // ── 3. TransferWindow (plain) ──────────────────────────────────────────────
   console.log("\n[3] TransferWindow");
-  const TWFactory      = await ethers.getContractFactory("TransferWindow", deployer);
-  const transferWindow = await TWFactory.deploy();
+  const transferWindow = await (await ethers.getContractFactory("TransferWindow", deployer))
+    .deploy();
   await transferWindow.waitForDeployment();
   const transferWindowAddr = await transferWindow.getAddress();
   console.log(`  TransferWindow: ${transferWindowAddr}`);
@@ -57,10 +62,10 @@ async function main() {
   // ── 4. Seed AddressRegistry ────────────────────────────────────────────────
   console.log("\n[4] Seeding AddressRegistry");
   const TRANSFER_WINDOW_KEY    = ethers.keccak256(ethers.toUtf8Bytes("TRANSFER_WINDOW"));
-  const INSTALLMENT_ESCROW_KEY = ethers.keccak256(ethers.toUtf8Bytes("INSTALLMENT_ESCROW"));
   const FEE_RECIPIENT_KEY      = ethers.keccak256(ethers.toUtf8Bytes("FEE_RECIPIENT"));
   const EURC_TOKEN_KEY         = ethers.keccak256(ethers.toUtf8Bytes("EURC_TOKEN"));
   const USDC_TOKEN_KEY         = ethers.keccak256(ethers.toUtf8Bytes("USDC_TOKEN"));
+  const INSTALLMENT_ESCROW_KEY = ethers.keccak256(ethers.toUtf8Bytes("INSTALLMENT_ESCROW"));
 
   await (await addressRegistry.seed(TRANSFER_WINDOW_KEY, transferWindowAddr)).wait();
   await (await addressRegistry.seed(FEE_RECIPIENT_KEY,   admin)).wait();
@@ -68,93 +73,85 @@ async function main() {
   await (await addressRegistry.seed(USDC_TOKEN_KEY,      USDC)).wait();
   console.log("  TransferWindow, FeeRecipient, EURC, USDC seeded");
 
-  // ── 5. FeeLib ──────────────────────────────────────────────────────────────
+  // ── 5. FeeLib (external library) ──────────────────────────────────────────
   console.log("\n[5] FeeLib");
-  const FeeLibFactory = await ethers.getContractFactory("FeeLib", deployer);
-  const feeLib        = await FeeLibFactory.deploy();
+  const feeLib     = await (await ethers.getContractFactory("FeeLib", deployer)).deploy();
   await feeLib.waitForDeployment();
-  const feeLibAddr    = await feeLib.getAddress();
+  const feeLibAddr = await feeLib.getAddress();
   console.log(`  FeeLib: ${feeLibAddr}`);
 
-  // ── 6. Escrow contracts ────────────────────────────────────────────────────
-  console.log("\n[6] Escrow contracts");
+  // ── 6. DealEscrow (needs FeeLib linked, UUPS proxy) ───────────────────────
+  console.log("\n[6] DealEscrow");
+  const dealEscrowAddr = await deployProxy(
+    ethers, deployer, "DealEscrow",
+    [playerRegistryAddr, addressRegistryAddr, admin, admin],
+    { FeeLib: feeLibAddr }
+  );
 
-  // DealEscrow (needs FeeLib linked)
-  const DealEscrowFact = await ethers.getContractFactory("DealEscrow", {
-    signer: deployer, libraries: { FeeLib: feeLibAddr },
-  });
-  const dealImpl = await DealEscrowFact.deploy();
-  await dealImpl.waitForDeployment();
-  const dProxy = await (await ethers.getContractFactory("TransferiumProxy", deployer))
-    .deploy(
-      await dealImpl.getAddress(),
-      DealEscrowFact.interface.encodeFunctionData("initialize", [
-        playerRegistryAddr, addressRegistryAddr, admin, admin,
-      ])
-    );
-  await dProxy.waitForDeployment();
-  const dealEscrowAddr = await dProxy.getAddress();
-  console.log(`  DealEscrow: ${dealEscrowAddr}`);
-
+  // ── 7. TransferEscrow (UUPS proxy) ────────────────────────────────────────
+  console.log("\n[7] TransferEscrow");
   const transferEscrowAddr = await deployProxy(ethers, deployer, "TransferEscrow", [
     playerRegistryAddr, addressRegistryAddr, dealEscrowAddr, admin, admin,
   ]);
 
+  // ── 8. ReleaseEscrow (UUPS proxy) ─────────────────────────────────────────
+  console.log("\n[8] ReleaseEscrow");
   const releaseEscrowAddr = await deployProxy(ethers, deployer, "ReleaseEscrow", [
     playerRegistryAddr, addressRegistryAddr, transferEscrowAddr, admin, admin,
   ]);
 
+  // ── 9. SwapEscrow (UUPS proxy) ────────────────────────────────────────────
+  console.log("\n[9] SwapEscrow");
   const swapEscrowAddr = await deployProxy(ethers, deployer, "SwapEscrow", [
     playerRegistryAddr, addressRegistryAddr, transferEscrowAddr, admin, admin,
   ]);
 
+  // ── 10. FreeTransferEscrow (UUPS proxy) ───────────────────────────────────
+  console.log("\n[10] FreeTransferEscrow");
   const freeTransferEscrowAddr = await deployProxy(ethers, deployer, "FreeTransferEscrow", [
     playerRegistryAddr, addressRegistryAddr, transferEscrowAddr, admin, admin,
   ]);
 
-  // ── 7. Non-upgradeable escrows ─────────────────────────────────────────────
-  console.log("\n[7] Non-upgradeable escrows");
+  // ── 11. LoanEscrow (UUPS proxy) ───────────────────────────────────────────
+  console.log("\n[11] LoanEscrow");
+  const loanEscrowAddr = await deployProxy(ethers, deployer, "LoanEscrow", [
+    playerRegistryAddr, addressRegistryAddr, admin, admin,
+  ]);
 
-  const LoanFactory  = await ethers.getContractFactory("LoanEscrow", deployer);
-  const loanEscrow   = await LoanFactory.deploy(playerRegistryAddr, addressRegistryAddr);
-  await loanEscrow.waitForDeployment();
-  const loanEscrowAddr = await loanEscrow.getAddress();
-  console.log(`  LoanEscrow: ${loanEscrowAddr}`);
+  // ── 12. InstallmentEscrow (UUPS proxy) ────────────────────────────────────
+  console.log("\n[12] InstallmentEscrow");
+  const installmentEscrowAddr = await deployProxy(ethers, deployer, "InstallmentEscrow", [
+    dealEscrowAddr, admin, admin,
+  ]);
 
-  const InstFactory       = await ethers.getContractFactory("InstallmentEscrow", deployer);
-  const installmentEscrow = await InstFactory.deploy(dealEscrowAddr, admin, 50n);
-  await installmentEscrow.waitForDeployment();
-  const installmentEscrowAddr = await installmentEscrow.getAddress();
-  console.log(`  InstallmentEscrow: ${installmentEscrowAddr}`);
-
-  // ── 8. VerificationManager + TerminationManager ────────────────────────────
-  console.log("\n[8] VerificationManager + TerminationManager");
-
-  const VMFactory         = await ethers.getContractFactory("VerificationManager", deployer);
-  const verificationMgr   = await VMFactory.deploy(playerRegistryAddr, admin);
+  // ── 13. VerificationManager (plain) ───────────────────────────────────────
+  console.log("\n[13] VerificationManager");
+  const verificationMgr = await (await ethers.getContractFactory("VerificationManager", deployer))
+    .deploy(playerRegistryAddr, admin);
   await verificationMgr.waitForDeployment();
   const verificationMgrAddr = await verificationMgr.getAddress();
   console.log(`  VerificationManager: ${verificationMgrAddr}`);
 
-  const TMFactory        = await ethers.getContractFactory("TerminationManager", deployer);
-  const terminationMgr   = await TMFactory.deploy(playerRegistryAddr);
+  // ── 14. TerminationManager (plain) ────────────────────────────────────────
+  console.log("\n[14] TerminationManager");
+  const terminationMgr = await (await ethers.getContractFactory("TerminationManager", deployer))
+    .deploy(playerRegistryAddr);
   await terminationMgr.waitForDeployment();
   const terminationMgrAddr = await terminationMgr.getAddress();
   console.log(`  TerminationManager: ${terminationMgrAddr}`);
 
-  // ── 9. Seed InstallmentEscrow into AddressRegistry ────────────────────────
-  console.log("\n[9] Seeding InstallmentEscrow");
+  // ── 15. Seed InstallmentEscrow into AddressRegistry ───────────────────────
+  console.log("\n[15] Seeding InstallmentEscrow");
   await (await addressRegistry.seed(INSTALLMENT_ESCROW_KEY, installmentEscrowAddr)).wait();
   console.log("  InstallmentEscrow seeded");
 
-  // ── 10. Grant roles ────────────────────────────────────────────────────────
-  console.log("\n[10] Granting roles");
+  // ── 16. Grant roles ────────────────────────────────────────────────────────
+  console.log("\n[16] Granting roles");
+  const pr = await ethers.getContractAt("PlayerRegistry", playerRegistryAddr, deployer);
 
-  const pr               = await ethers.getContractAt("PlayerRegistry", playerRegistryAddr, deployer);
   const ESCROW_ROLE       = await pr.ESCROW_ROLE();
   const VERIFICATION_ROLE = await pr.VERIFICATION_ROLE();
 
-  // ESCROW_ROLE on PlayerRegistry → all escrow contracts + TerminationManager
   for (const [name, addr] of [
     ["TransferEscrow",     transferEscrowAddr],
     ["DealEscrow",         dealEscrowAddr],
@@ -163,28 +160,30 @@ async function main() {
     ["SwapEscrow",         swapEscrowAddr],
     ["FreeTransferEscrow", freeTransferEscrowAddr],
     ["TerminationManager", terminationMgrAddr],
-  ]) {
+  ] as const) {
     await (await pr.grantRole(ESCROW_ROLE, addr)).wait();
     console.log(`  ESCROW_ROLE → ${name}`);
   }
 
-  // VERIFICATION_ROLE on PlayerRegistry → VerificationManager
   await (await pr.grantRole(VERIFICATION_ROLE, verificationMgrAddr)).wait();
   console.log(`  VERIFICATION_ROLE → VerificationManager`);
 
   // TRANSFER_ESCROW_ROLE on DealEscrow → TransferEscrow + InstallmentEscrow
-  const de                   = await ethers.getContractAt("DealEscrow", dealEscrowAddr, deployer);
+  const de = await ethers.getContractAt("DealEscrow", dealEscrowAddr, deployer);
   const TRANSFER_ESCROW_ROLE = await de.TRANSFER_ESCROW_ROLE();
   await (await de.grantRole(TRANSFER_ESCROW_ROLE, transferEscrowAddr)).wait();
   await (await de.grantRole(TRANSFER_ESCROW_ROLE, installmentEscrowAddr)).wait();
   console.log("  TRANSFER_ESCROW_ROLE → TransferEscrow, InstallmentEscrow");
 
+  // CLUB_ROLE on TransferEscrow + LoanEscrow is granted per-club via Admin panel.
+  // TransferWindow uses its own internal role — no cross-contract grant needed.
+
   // Wire TerminationManager into PlayerRegistry
   await (await pr.setTerminationManager(terminationMgrAddr)).wait();
   console.log("  TerminationManager set on PlayerRegistry");
 
-  // ── 11. Approve tokens on all escrow contracts ─────────────────────────────
-  console.log("\n[11] Approving tokens");
+  // ── 17. Approve tokens on escrow contracts ─────────────────────────────────
+  console.log("\n[17] Approving tokens");
   for (const [name, addr] of [
     ["TransferEscrow",     transferEscrowAddr],
     ["DealEscrow",         dealEscrowAddr],
@@ -192,14 +191,14 @@ async function main() {
     ["ReleaseEscrow",      releaseEscrowAddr],
     ["SwapEscrow",         swapEscrowAddr],
     ["FreeTransferEscrow", freeTransferEscrowAddr],
-  ]) {
+  ] as const) {
     const c = await ethers.getContractAt(name, addr, deployer);
-    await (await c.approveToken(EURC)).wait();
-    await (await c.approveToken(USDC)).wait();
-    console.log(`  EURC + USDC approved on ${name}`);
+    try { await (await c.approveToken(EURC)).wait(); } catch {}
+    try { await (await c.approveToken(USDC)).wait(); } catch {}
+    console.log(`  EURC + USDC → ${name}`);
   }
 
-  // ── 12. Write addresses.json ───────────────────────────────────────────────
+  // ── 18. Write addresses ────────────────────────────────────────────────────
   const addresses = {
     chainId:             "5042002",
     deployer:            admin,
@@ -226,8 +225,20 @@ async function main() {
   fs.writeFileSync(outPath, JSON.stringify(addresses, null, 2));
 
   console.log("\n" + "─".repeat(60));
-  console.log("Deployment complete. addresses.json updated.");
-  console.log(JSON.stringify(addresses, null, 2));
+  console.log("✅ Deployment complete");
+  console.log("\n=== Paste into frontend contracts.ts ===");
+  console.log(`  PlayerRegistry:      '${playerRegistryAddr}',`);
+  console.log(`  TransferWindow:      '${transferWindowAddr}',`);
+  console.log(`  TransferEscrow:      '${transferEscrowAddr}',`);
+  console.log(`  DealEscrow:          '${dealEscrowAddr}',`);
+  console.log(`  LoanEscrow:          '${loanEscrowAddr}',`);
+  console.log(`  ReleaseEscrow:       '${releaseEscrowAddr}',`);
+  console.log(`  SwapEscrow:          '${swapEscrowAddr}',`);
+  console.log(`  FreeTransferEscrow:  '${freeTransferEscrowAddr}',`);
+  console.log(`  InstallmentEscrow:   '${installmentEscrowAddr}',`);
+  console.log(`  AddressRegistry:     '${addressRegistryAddr}',`);
+  console.log(`  VerificationManager: '${verificationMgrAddr}',`);
+  console.log(`  TerminationManager:  '${terminationMgrAddr}',`);
 }
 
 main().catch(console.error);

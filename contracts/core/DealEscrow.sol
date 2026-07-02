@@ -39,7 +39,8 @@ contract DealEscrow is
 
     bytes32 public constant ADMIN_ROLE           = keccak256("ADMIN_ROLE");
     bytes32 public constant LEAGUE_ROLE          = keccak256("LEAGUE_ROLE");
-    bytes32 public constant TRANSFER_ESCROW_ROLE = keccak256("TRANSFER_ESCROW_ROLE");
+    bytes32 public constant TRANSFER_ESCROW_ROLE      = keccak256("TRANSFER_ESCROW_ROLE");
+    bytes32 public constant COMPETING_BID_MANAGER_ROLE = keccak256("COMPETING_BID_MANAGER_ROLE");
 
     uint256 internal constant MAX_PRICE                = 500_000_000 ether;
     uint256 internal constant BPS_DENOMINATOR          = 10_000;
@@ -63,38 +64,26 @@ contract DealEscrow is
         uint256  signingBonusAmount;
         bool     signingBonusClaimed;
         uint256  signingBonusExpiry;
-        uint256  minimumHijackIncrementBps;
         TransferTypes.DealState state;
         uint256  stateDeadline;
         bytes32  medicalHash;
         bool     frozen;
         uint256  frozenAt;
-        uint256  hijackDeposit;
-        address  hijackDepositClub;
+        address  originalBuyer;      // Club B — preserved when Club C takes over
         address  mutualCancelProposer;
         uint256  mutualCancelDeadline;
     }
 
-    struct HijackBid {
-        address buyingClub;
-        uint256 transferFee;
-        uint256 buyerAgentBps;
-        address buyerAgent;
-        uint256 signingBonusMonths;
-        uint256 depositedAt;
-        bool    exists;
-    }
 
     uint256 private _dealIdCounter;
 
     IPlayerRegistry public playerRegistry;
     IAddressRegistry public addressRegistry;
     mapping(uint8 => uint256) public timers;
-    // 0=consent 1=medical 2=hijack 3=dispute 4=renego 5=funding 6=mutualCancel
+    // 0=consent 1=medical 2=unused(was hijack) 3=dispute 4=renego 5=funding 6=mutualCancel
 
     mapping(uint256 => Deal)                                private _deals;
     mapping(uint256 => TransferTypes.AddOn[])               private _dealAddOns;
-    mapping(uint256 => HijackBid)                           private _hijackBids;
     mapping(uint256 => uint256)                             private _playerDeal;
     mapping(address => mapping(address => uint256))         private _claimable;
     mapping(uint256 => mapping(address => uint256))         private _addOnDeposits;
@@ -116,9 +105,8 @@ contract DealEscrow is
     event MedicalRenegotiationResolved(uint256 indexed dealId, uint256 newFee);
     event MedicalDisputeEscalated(uint256 indexed dealId, address indexed escalatedBy);
     event MedicalDisputeResolved(uint256 indexed dealId);
-    event HijackBidSubmitted(uint256 indexed dealId, address indexed hijackClub, uint256 transferFee);
-    event HijackBidAccepted(uint256 indexed dealId, address indexed hijackClub);
-    event HijackBidRejected(uint256 indexed dealId, address indexed hijackClub);
+    event CompetingBidActivated(uint256 indexed dealId, address indexed thirdParty, uint256 fee);
+    event ThirdPartyMedicalCompleted(uint256 indexed dealId, address indexed thirdParty);
     event MutualCancelProposed(uint256 indexed dealId, address indexed proposer);
     event MutualCancelConfirmed(uint256 indexed dealId);
     event FundingReceived(uint256 indexed dealId, address indexed buyingClub, uint256 amount);
@@ -153,7 +141,6 @@ contract DealEscrow is
     error FundingWindowExpired();
     error DisputeWindowExpired();
     error MedicalAlreadySubmitted();
-    error HijackWindowClosed();
     error NothingToClaim();
     error NoSigningBonus();
     error SigningBonusAlreadyClaimed();
@@ -291,16 +278,14 @@ contract DealEscrow is
             signingBonusAmount:        p.signingBonusAmount,
             signingBonusClaimed:       false,
             signingBonusExpiry:        0,
-            minimumHijackIncrementBps: p.minimumHijackIncrementBps,
-            state:                     TransferTypes.DealState.AWAITING_PLAYER_CONSENT,
-            stateDeadline:             block.timestamp + p.consentWindowDuration,
-            medicalHash:               bytes32(0),
-            frozen:                    false,
-            frozenAt:                  0,
-            hijackDeposit:             0,
-            hijackDepositClub:         address(0),
-            mutualCancelProposer:      address(0),
-            mutualCancelDeadline:      0
+            state:                TransferTypes.DealState.AWAITING_PLAYER_CONSENT,
+            stateDeadline:        block.timestamp + timers[0],
+            medicalHash:          bytes32(0),
+            frozen:               false,
+            frozenAt:             0,
+            originalBuyer:        address(0),
+            mutualCancelProposer: address(0),
+            mutualCancelDeadline: 0
         });
 
         // I store the installment schedule
@@ -321,41 +306,7 @@ contract DealEscrow is
         emit PlayerConsentRequested(dealId, p.playerId, p.buyingClub);
     }
 
-    function receiveHijackBid(
-        uint256 dealId,
-        address buyingClub,
-        uint256 transferFee,
-        uint256 buyerAgentBps,
-        address buyerAgent,
-        uint256 signingBonusMonths
-    )
-        external
-        onlyRole(TRANSFER_ESCROW_ROLE)
-        dealExists(dealId)
-    {
-        Deal storage deal = _deals[dealId];
-        // I re-check state here because TransferEscrow already pulled funds — if state
-        // changed between getDealView and this call, revert before touching storage
-        if (deal.state != TransferTypes.DealState.HIJACK_WINDOW) revert WrongDealState();
-        if (block.timestamp > deal.stateDeadline)                revert WrongDealState();
 
-        HijackBid storage existing = _hijackBids[dealId];
-        if (existing.exists) {
-            _claimable[existing.buyingClub][deal.paymentToken] += existing.transferFee;
-        }
-
-        _hijackBids[dealId] = HijackBid({
-            buyingClub:            buyingClub,
-            transferFee:           transferFee,
-            buyerAgentBps:         buyerAgentBps,
-            buyerAgent:            buyerAgent,
-            signingBonusMonths: signingBonusMonths,
-            depositedAt:           block.timestamp,
-            exists:                true
-        });
-
-        emit HijackBidSubmitted(dealId, buyingClub, transferFee);
-    }
 
     // ─── League ───────────────────────────────────────────────────────────────
 
@@ -393,7 +344,8 @@ contract DealEscrow is
     {
         Deal storage deal = _deals[dealId];
         if (deal.state != TransferTypes.DealState.FUNDED &&
-            deal.state != TransferTypes.DealState.DISPUTE_WINDOW) revert WrongDealState();
+            deal.state != TransferTypes.DealState.DISPUTE_WINDOW &&
+            deal.state != TransferTypes.DealState.AWAITING_MEDICAL) revert WrongDealState();
         _settleDeal(dealId);
     }
 
@@ -433,50 +385,9 @@ contract DealEscrow is
 
     // ─── Selling Club ─────────────────────────────────────────────────────────
 
-    function acceptHijackBid(uint256 dealId)
-        external whenNotPaused dealExists(dealId) notFrozen(dealId)
-    {
-        Deal storage deal = _deals[dealId];
-        if (deal.sellingClub != msg.sender)                       revert NotSellingClub();
-        if (deal.state != TransferTypes.DealState.HIJACK_WINDOW) revert WrongDealState();
-        HijackBid storage hijack = _hijackBids[dealId];
-        if (!hijack.exists) revert WrongDealState();
 
-        IPlayerRegistry.Player memory player = playerRegistry.getPlayer(deal.playerId);
-        uint256 newSigningBonus = 0;
-        if (hijack.signingBonusMonths > 0 && player.weeklySalary > 0) {
-            newSigningBonus = player.weeklySalary * 4 * hijack.signingBonusMonths;
-        }
 
-        deal.buyingClub          = hijack.buyingClub;
-        deal.transferFee         = hijack.transferFee;
-        deal.buyerAgentBps       = hijack.buyerAgentBps;
-        deal.buyerAgent          = hijack.buyerAgent;
-        deal.signingBonusAmount  = newSigningBonus;
-        deal.signingBonusClaimed = false;
-        deal.state               = TransferTypes.DealState.AWAITING_HIJACK_CONSENT;
-        deal.stateDeadline       = block.timestamp + timers[0];
-        deal.medicalHash         = bytes32(0);
-        deal.hijackDeposit       = hijack.transferFee;
-        deal.hijackDepositClub   = hijack.buyingClub;
-        hijack.exists            = false;
 
-        emit HijackBidAccepted(dealId, deal.buyingClub);
-        emit PlayerConsentRequested(dealId, deal.playerId, deal.buyingClub);
-    }
-
-    function rejectHijackBid(uint256 dealId)
-        external whenNotPaused dealExists(dealId) notFrozen(dealId)
-    {
-        Deal storage deal = _deals[dealId];
-        if (deal.sellingClub != msg.sender)                       revert NotSellingClub();
-        if (deal.state != TransferTypes.DealState.HIJACK_WINDOW) revert WrongDealState();
-        HijackBid storage hijack = _hijackBids[dealId];
-        if (!hijack.exists) revert WrongDealState();
-        _claimable[hijack.buyingClub][deal.paymentToken] += hijack.transferFee;
-        hijack.exists = false;
-        emit HijackBidRejected(dealId, hijack.buyingClub);
-    }
 
     function acceptMedicalRenegotiation(uint256 dealId, uint256 newFee)
         external whenNotPaused dealExists(dealId) notFrozen(dealId)
@@ -490,8 +401,9 @@ contract DealEscrow is
             _claimable[deal.buyingClub][deal.paymentToken] += deal.transferFee - newFee;
         }
         deal.transferFee   = newFee;
-        deal.state         = TransferTypes.DealState.HIJACK_WINDOW;
-        deal.stateDeadline = block.timestamp + timers[2];
+        deal.medicalHash   = bytes32(0);
+        deal.state         = TransferTypes.DealState.AWAITING_MEDICAL;
+        deal.stateDeadline = block.timestamp + timers[1];
         emit MedicalRenegotiationResolved(dealId, newFee);
     }
 
@@ -533,20 +445,15 @@ contract DealEscrow is
         // I only require installment #0 + salary guarantee at funding — real-world practice
         uint256 firstInstallment = _installments[dealId][0].amount;
         uint256 totalRequired    = firstInstallment + deal.signingBonusAmount;
-        uint256 alreadyHeld      = 0;
-        if (deal.hijackDepositClub == msg.sender && deal.hijackDeposit > 0) {
-            alreadyHeld            = deal.hijackDeposit > firstInstallment ? firstInstallment : deal.hijackDeposit;
-            deal.hijackDeposit    -= alreadyHeld;
-            if (deal.hijackDeposit == 0) deal.hijackDepositClub = address(0);
-        }
-        if (totalRequired > alreadyHeld) {
-            IERC20(deal.paymentToken).safeTransferFrom(
-                msg.sender, address(this), totalRequired - alreadyHeld
-            );
-        }
+        // I pull the full first installment + signing bonus from the buyer.
+        // Club B counter-deposit credit is handled by CompetingBidManager
+        // via extCreditCounterDeposit before fundDeal is called.
+        IERC20(deal.paymentToken).safeTransferFrom(
+            msg.sender, address(this), totalRequired
+        );
         _installments[dealId][0].paid = true;
-        deal.state         = TransferTypes.DealState.FUNDED;
-        deal.stateDeadline = block.timestamp + timers[3];
+        deal.state         = TransferTypes.DealState.AWAITING_MEDICAL;
+        deal.stateDeadline = block.timestamp + timers[1];
         emit FundingReceived(dealId, msg.sender, totalRequired);
     }
 
@@ -623,17 +530,14 @@ contract DealEscrow is
         external whenNotPaused dealExists(dealId) notFrozen(dealId)
     {
         Deal storage deal = _deals[dealId];
-        bool isStandard = deal.state == TransferTypes.DealState.AWAITING_PLAYER_CONSENT;
-        bool isHijack   = deal.state == TransferTypes.DealState.AWAITING_HIJACK_CONSENT;
-        if (!isStandard && !isHijack)             revert WrongDealState();
+        if (deal.state != TransferTypes.DealState.AWAITING_PLAYER_CONSENT) revert WrongDealState();
         if (block.timestamp > deal.stateDeadline) revert ConsentWindowExpired();
         IPlayerRegistry.Player memory player = playerRegistry.getPlayer(deal.playerId);
         if (player.playerWallet == address(0)) revert PlayerWalletNotSet();
         if (player.playerWallet != msg.sender) revert NotPlayerWallet();
-        deal.state         = isHijack
-            ? TransferTypes.DealState.AWAITING_HIJACK_MEDICAL
-            : TransferTypes.DealState.AWAITING_TRANSFER_MEDICAL;
-        deal.stateDeadline = block.timestamp + timers[1];
+        // I move to FUNDING_PENDING — competing bids now open until Club B funds.
+        deal.state         = TransferTypes.DealState.FUNDING_PENDING;
+        deal.stateDeadline = block.timestamp + timers[5];
         deal.medicalHash   = bytes32(0);
         emit PlayerConsented(dealId, deal.playerId);
     }
@@ -642,18 +546,12 @@ contract DealEscrow is
         external whenNotPaused dealExists(dealId) notFrozen(dealId)
     {
         Deal storage deal = _deals[dealId];
-        bool isHijack = deal.state == TransferTypes.DealState.AWAITING_HIJACK_CONSENT;
-        if (deal.state != TransferTypes.DealState.AWAITING_PLAYER_CONSENT && !isHijack)
+        if (deal.state != TransferTypes.DealState.AWAITING_PLAYER_CONSENT)
             revert WrongDealState();
         IPlayerRegistry.Player memory player = playerRegistry.getPlayer(deal.playerId);
         if (player.playerWallet == address(0)) revert PlayerWalletNotSet();
         if (player.playerWallet != msg.sender) revert NotPlayerWallet();
         emit PlayerDeclined(dealId, deal.playerId);
-        if (isHijack && deal.hijackDeposit > 0) {
-            _claimable[deal.hijackDepositClub][deal.paymentToken] += deal.hijackDeposit;
-            deal.hijackDeposit     = 0;
-            deal.hijackDepositClub = address(0);
-        }
         _cancelDeal(dealId, TransferTypes.CancelReason.PLAYER_DECLINED);
     }
 
@@ -665,9 +563,7 @@ contract DealEscrow is
         external whenNotPaused dealExists(dealId) notFrozen(dealId)
     {
         Deal storage deal = _deals[dealId];
-        bool isStandard = deal.state == TransferTypes.DealState.AWAITING_TRANSFER_MEDICAL;
-        bool isHijack   = deal.state == TransferTypes.DealState.AWAITING_HIJACK_MEDICAL;
-        if (!isStandard && !isHijack)             revert WrongDealState();
+        if (deal.state != TransferTypes.DealState.AWAITING_MEDICAL) revert WrongDealState();
         if (deal.buyingClub != msg.sender)         revert NotBuyingClub();
         if (block.timestamp > deal.stateDeadline) revert MedicalWindowExpired();
         if (deal.medicalHash != bytes32(0))        revert MedicalAlreadySubmitted();
@@ -677,21 +573,14 @@ contract DealEscrow is
         emit MedicalSubmitted(dealId, outcome);
 
         if (outcome == TransferTypes.MedicalOutcome.PASSED) {
-            if (isHijack) {
-                deal.state         = TransferTypes.DealState.FUNDING_PENDING;
-                deal.stateDeadline = block.timestamp + timers[5];
-            } else {
-                deal.state         = TransferTypes.DealState.HIJACK_WINDOW;
-                deal.stateDeadline = block.timestamp + timers[2];
-            }
+            // I settle immediately on medical pass — no post-medical window.
+            // CompetingBidManager enforces that no accepted competing bid
+            // is unresolved before submitMedical can be called.
+            _settleDeal(dealId);
         } else if (outcome == TransferTypes.MedicalOutcome.FAILED) {
-            if (isHijack && deal.hijackDeposit > 0) {
-                uint256 penalty = (deal.hijackDeposit * HIJACK_FAIL_PENALTY_BPS) / BPS_DENOMINATOR;
-                _claimable[deal.buyingClub][deal.paymentToken]  += deal.hijackDeposit - penalty;
-                _claimable[deal.sellingClub][deal.paymentToken] += penalty;
-                deal.hijackDeposit     = 0;
-                deal.hijackDepositClub = address(0);
-            }
+            // I cancel the deal on failed medical.
+            // CompetingBidManager will handle activating a competing bid
+            // if one exists — it calls extActivateThirdParty after this.
             _cancelDeal(dealId, TransferTypes.CancelReason.MEDICAL_FAILED);
         } else {
             deal.state         = TransferTypes.DealState.MEDICAL_RENEGOTIATION;
@@ -717,6 +606,115 @@ contract DealEscrow is
     }
 
 
+    // ─── CompetingBidManager Callbacks ────────────────────────────────────────
+
+    /// @notice Credits an amount to a recipient's claimable balance.
+    /// @dev    COMPETING_BID_MANAGER_ROLE only. Used to distribute competing
+    ///         deposits: return to Club C, compensation to Club B, counter-deposit
+    ///         return to Club B. Tokens must already be in this contract.
+    function extCreditClaimable(
+        address recipient,
+        address token,
+        uint256 amount
+    )
+        external
+        onlyRole(COMPETING_BID_MANAGER_ROLE)
+    {
+        if (recipient == address(0)) revert InvalidAddress();
+        if (amount == 0)             revert InvalidAmount();
+        _claimable[recipient][token] += amount;
+    }
+
+    // ─── CompetingBidManager Callbacks ────────────────────────────────────────
+
+    /// @notice Activates a third-party deal — switches buying club to Club C.
+    /// @dev    COMPETING_BID_MANAGER_ROLE only. Called after Club A confirms switch.
+    ///         Stores original buyer (Club B) for compensation tracking.
+    ///         Resets medical hash, updates state to AWAITING_THIRD_PARTY_MEDICAL.
+    function extActivateThirdParty(
+        uint256 dealId,
+        address thirdParty,
+        uint256 newFee,
+        uint256 buyerAgentBps,
+        address buyerAgent,
+        uint256 signingBonusMonths
+    )
+        external
+        onlyRole(COMPETING_BID_MANAGER_ROLE)
+        dealExists(dealId)
+        nonReentrant
+    {
+        Deal storage deal = _deals[dealId];
+        // I accept activation from AWAITING_MEDICAL (failed medical path)
+        // or CANCELLED (medical failed, CompetingBidManager activates Club C).
+        // The deal must not be frozen or completed.
+        if (deal.state != TransferTypes.DealState.AWAITING_MEDICAL &&
+            deal.state != TransferTypes.DealState.CANCELLED) revert WrongDealState();
+        if (deal.frozen) revert DealIsFrozen();
+        if (thirdParty == address(0))   revert InvalidAddress();
+        if (newFee == 0)                revert InvalidAmount();
+
+        // I preserve the original buyer for compensation tracking.
+        // If originalBuyer is already set (re-activation) keep the first one.
+        if (deal.originalBuyer == address(0)) {
+            deal.originalBuyer = deal.buyingClub;
+        }
+
+        IPlayerRegistry.Player memory player = playerRegistry.getPlayer(deal.playerId);
+        uint256 newSigningBonus = 0;
+        if (signingBonusMonths > 0 && player.weeklySalary > 0) {
+            newSigningBonus = player.weeklySalary * 4 * signingBonusMonths;
+        }
+
+        deal.buyingClub         = thirdParty;
+        deal.transferFee        = newFee;
+        deal.buyerAgentBps      = buyerAgentBps;
+        deal.buyerAgent         = buyerAgent;
+        deal.signingBonusAmount = newSigningBonus;
+        deal.signingBonusClaimed = false;
+        deal.medicalHash        = bytes32(0);
+        deal.state              = TransferTypes.DealState.FUNDING_PENDING;
+        deal.stateDeadline      = block.timestamp + timers[5];
+        // I re-register the player deal mapping since _cancelDeal cleared it.
+        _playerDeal[deal.playerId] = dealId;
+
+        emit CompetingBidActivated(dealId, thirdParty, newFee);
+        emit PlayerConsentRequested(dealId, deal.playerId, thirdParty);
+    }
+
+    /// @notice Settles a third-party deal after Club C's medical passes.
+    /// @dev    COMPETING_BID_MANAGER_ROLE only. State must be AWAITING_THIRD_PARTY_MEDICAL.
+    function extSettleThirdParty(uint256 dealId)
+        external
+        onlyRole(COMPETING_BID_MANAGER_ROLE)
+        dealExists(dealId)
+        nonReentrant
+    {
+        Deal storage deal = _deals[dealId];
+        if (deal.state != TransferTypes.DealState.AWAITING_THIRD_PARTY_MEDICAL) revert WrongDealState();
+        if (deal.frozen) revert DealIsFrozen();
+        emit ThirdPartyMedicalCompleted(dealId, deal.buyingClub);
+        _settleDeal(dealId);
+    }
+
+    /// @notice Credits Club B's counter-deposit toward their installment.
+    /// @dev    COMPETING_BID_MANAGER_ROLE only. Called before Club B calls fundDeal.
+    ///         Tokens must already be in DealEscrow before calling.
+    function extCreditCounterDeposit(uint256 dealId, uint256 amount)
+        external
+        onlyRole(COMPETING_BID_MANAGER_ROLE)
+        dealExists(dealId)
+    {
+        Deal storage deal = _deals[dealId];
+        if (deal.state != TransferTypes.DealState.FUNDING_PENDING) revert WrongDealState();
+        if (amount == 0) revert InvalidAmount();
+        // I reduce the first installment by the counter-deposit amount.
+        // fundDeal will then pull only the remainder from Club B.
+        uint256 first = _installments[dealId][0].amount;
+        if (amount > first) revert InvalidAmount();
+        _installments[dealId][0].amount = first - amount;
+    }
+
     // ─── External Callbacks (TRANSFER_ESCROW_ROLE only) ───────────────────────
     // processExpiry, expireMutualCancel, resolveDeadlock, walkAwayFromRenegotiation
     // live in TransferEscrow and call back here to mutate state.
@@ -735,22 +733,6 @@ contract DealEscrow is
         deal.stateDeadline = block.timestamp + timers[5];
     }
 
-    // op 1 = advance to hijack (original fee), op 2 = set newFee and advance to hijack
-    function extAdvanceToHijack(uint256 dealId, uint256 newFee)
-        external onlyRole(TRANSFER_ESCROW_ROLE) dealExists(dealId)
-    {
-        Deal storage deal = _deals[dealId];
-        if (newFee > 0) {
-            if (newFee > MAX_PRICE) revert InvalidAmount();
-            if (newFee < deal.transferFee) {
-                _claimable[deal.buyingClub][deal.paymentToken] += deal.transferFee - newFee;
-            }
-            deal.transferFee = newFee;
-        }
-        deal.state         = TransferTypes.DealState.HIJACK_WINDOW;
-        deal.stateDeadline = block.timestamp + timers[2];
-        emit MedicalDisputeResolved(dealId);
-    }
 
     function extWalkAwayPenalty(uint256 dealId)
         external onlyRole(TRANSFER_ESCROW_ROLE) dealExists(dealId)
@@ -848,22 +830,6 @@ contract DealEscrow is
             _claimable[deal.buyingClub][deal.paymentToken] +=
                 _installments[dealId][0].amount + deal.signingBonusAmount;
         }
-        HijackBid storage hijack = _hijackBids[dealId];
-        if (hijack.exists) {
-            _claimable[hijack.buyingClub][deal.paymentToken] += hijack.transferFee;
-            hijack.exists = false;
-        }
-        if (deal.hijackDeposit > 0 && deal.hijackDepositClub != address(0)) {
-            if (reason == TransferTypes.CancelReason.HIJACK_MEDICAL_STALL) {
-                uint256 p = (deal.hijackDeposit * HIJACK_STALL_PENALTY_BPS) / BPS_DENOMINATOR;
-                _claimable[deal.hijackDepositClub][deal.paymentToken] += deal.hijackDeposit - p;
-                _claimable[deal.sellingClub][deal.paymentToken] += p;
-            } else {
-                _claimable[deal.hijackDepositClub][deal.paymentToken] += deal.hijackDeposit;
-            }
-            deal.hijackDeposit = 0;
-            deal.hijackDepositClub = address(0);
-        }
         emit DealCancelled(dealId, reason);
     }
 
@@ -879,7 +845,6 @@ contract DealEscrow is
         v.buyingClub                = deal.buyingClub;
         v.paymentToken              = deal.paymentToken;
         v.transferFee               = deal.transferFee;
-        v.minimumHijackIncrementBps = deal.minimumHijackIncrementBps;
         v.state                     = IDealEscrow.DealState(uint8(deal.state));
         v.stateDeadline             = deal.stateDeadline;
     }

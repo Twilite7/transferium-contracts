@@ -2,12 +2,36 @@
 pragma solidity ^0.8.28;
 
 /**
- * @title TransferTypes
+ * @title  TransferTypes
  * @author Transferium Protocol
- * @notice Shared types used by both TransferEscrow and DealEscrow.
- *         Keeping them in one place prevents divergence between contracts.
+ * @notice Shared types used across TransferEscrow, DealEscrow and
+ *         CompetingBidManager. Centralising them prevents enum drift.
+ *
+ * DealState values (uint8):
+ *   0  NONE
+ *   1  OFFER_CREATED
+ *   2  BID_SUBMITTED
+ *   3  NEGOTIATING
+ *   4  BID_ACCEPTED
+ *   5  AWAITING_PLAYER_CONSENT
+ *   6  AWAITING_MEDICAL          ← merged medical + competing-bid window
+ *   7  MEDICAL_RENEGOTIATION
+ *   8  MEDICAL_DISPUTE
+ *   9  AWAITING_THIRD_PARTY_MEDICAL  ← Club C is now the buyer
+ *  10  MUTUAL_CANCEL_PROPOSED
+ *  11  FUNDING_PENDING
+ *  12  FUNDED
+ *  13  DISPUTE_WINDOW
+ *  14  COMPLETED
+ *  15  CANCELLED
+ *
+ * IMPORTANT: processExpiry in TransferEscrow uses hard-coded uint8 values
+ * that mirror this ordering exactly. Any future reordering requires a
+ * matching update there.
  */
 library TransferTypes {
+
+    // ─── Structs ──────────────────────────────────────────────────────────────
 
     struct Installment {
         uint256 amount;   // token units (6 decimals for EURC)
@@ -18,55 +42,57 @@ library TransferTypes {
     struct AddOn {
         string  description;
         uint256 amount;
-        bool    toPlayer;   // true = routes to player wallet, false = to selling club
+        bool    toPlayer;  // true → player wallet, false → selling club
         bool    triggered;
     }
 
+    // ─── Enums ────────────────────────────────────────────────────────────────
+
     enum DealState {
-        NONE,
-        OFFER_CREATED,
-        BID_SUBMITTED,
-        NEGOTIATING,
-        BID_ACCEPTED,
-        AWAITING_PLAYER_CONSENT,
-        AWAITING_TRANSFER_MEDICAL,
-        MEDICAL_RENEGOTIATION,
-        MEDICAL_DISPUTE,
-        HIJACK_WINDOW,
-        AWAITING_HIJACK_CONSENT,
-        AWAITING_HIJACK_MEDICAL,
-        MUTUAL_CANCEL_PROPOSED,
-        FUNDING_PENDING,
-        FUNDED,
-        DISPUTE_WINDOW,
-        COMPLETED,
-        CANCELLED
-        // FROZEN removed — freeze is a flag on Deal struct, not a state transition
+        NONE,                         // 0
+        OFFER_CREATED,                // 1
+        BID_SUBMITTED,                // 2
+        NEGOTIATING,                  // 3
+        BID_ACCEPTED,                 // 4
+        AWAITING_PLAYER_CONSENT,      // 5
+        AWAITING_MEDICAL,             // 6
+        MEDICAL_RENEGOTIATION,        // 7
+        MEDICAL_DISPUTE,              // 8
+        AWAITING_THIRD_PARTY_MEDICAL, // 9
+        MUTUAL_CANCEL_PROPOSED,       // 10
+        FUNDING_PENDING,              // 11
+        FUNDED,                       // 12
+        DISPUTE_WINDOW,               // 13
+        COMPLETED,                    // 14
+        CANCELLED                     // 15
     }
 
     enum MedicalOutcome { NONE, PASSED, FAILED, CONCERN }
 
     // I use an enum for cancel reasons — uint8 on-chain, no string bytecode cost.
-    // Frontend maps values to human-readable messages via parseError.ts.
     enum CancelReason {
-        NONE,
-        LEAGUE_DISPUTE_CANCELLED,
-        MEDICAL_RENEGO_REJECTED,
-        MUTUAL_CANCEL_AGREED,
-        PLAYER_DECLINED,
-        MEDICAL_FAILED,
-        RENEGO_WINDOW_EXPIRED,
-        BUYER_WALKED_AWAY,
-        CONSENT_WINDOW_EXPIRED,
-        MEDICAL_WINDOW_EXPIRED,
-        HIJACK_MEDICAL_STALL,
-        RENEGO_NO_RESOLUTION,
-        LEAGUE_DEADLINE_EXPIRED,
-        FUNDING_WINDOW_EXPIRED,
-        FORCE_CANCELLED
+        NONE,                        // 0
+        LEAGUE_DISPUTE_CANCELLED,    // 1
+        MEDICAL_RENEGO_REJECTED,     // 2
+        MUTUAL_CANCEL_AGREED,        // 3
+        PLAYER_DECLINED,             // 4
+        MEDICAL_FAILED,              // 5
+        RENEGO_WINDOW_EXPIRED,       // 6
+        BUYER_WALKED_AWAY,           // 7
+        CONSENT_WINDOW_EXPIRED,      // 8
+        MEDICAL_WINDOW_EXPIRED,      // 9
+        THIRD_PARTY_MEDICAL_FAILED,  // 10
+        RENEGO_NO_RESOLUTION,        // 11
+        LEAGUE_DEADLINE_EXPIRED,     // 12
+        FUNDING_WINDOW_EXPIRED,      // 13
+        FORCE_CANCELLED              // 14
     }
 
-    // I use a struct to pass deal init params — avoids stack-too-deep on initializeDeal.
+    // ─── Deal initialisation params ───────────────────────────────────────────
+
+    // I pass deal-init data as a struct to avoid stack-too-deep in initializeDeal.
+    // minimumHijackIncrementBps removed — competing bids handled by CompetingBidManager.
+    // consentWindowDuration removed — DealEscrow uses timers[0] directly.
     struct DealInitParams {
         uint256 offerId;
         uint256 playerId;
@@ -82,9 +108,7 @@ library TransferTypes {
         address buyerAgent;
         uint256 signingBonusMonths;
         uint256 signingBonusAmount;
-        uint256 minimumHijackIncrementBps;
-        uint256 consentWindowDuration;
-        // Installment payment schedule — lengths must match, sum must equal transferFee
+        // Installment schedule — lengths must match; sum must equal transferFee
         uint256[] installmentAmounts;
         uint256[] installmentDueDates;
     }

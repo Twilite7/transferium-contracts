@@ -24,6 +24,7 @@ async function deployAll() {
     await token.getAddress(),
     0n,
     0n,
+    2_000_000n, // baseVerificationFee: 2 EURC
     admin.address,
   ]);
   const registryProxy = await Proxy.deploy(await registryImpl.getAddress(), registryInit);
@@ -499,18 +500,10 @@ describe("Transferium Protocol v2", function () {
     const dealId  = await doAccept(ethers, escrow, dealEscrow, sellingClub, offerId, buyingClub, { ...extra, fee });
 
     // Player consents
+    // Player consents → FUNDING_PENDING (competing bids open until Club B funds)
     await dealEscrow.connect(playerWallet).consentToTransfer(dealId);
 
-    // Buying club submits medical — PASSED (1)
-    const medHash = ethers.keccak256(ethers.toUtf8Bytes("medical-ok"));
-    await dealEscrow.connect(buyingClub).submitMedical(dealId, 1, medHash);
-
-    // Advance past hijack window → processExpiry → FUNDING_PENDING
-    await ethers.provider.send("evm_increaseTime", [48 * 3600 + 1]);
-    await ethers.provider.send("evm_mine", []);
-    await escrow.processExpiry(dealId);
-
-    // Fund deal
+    // Fund deal → AWAITING_MEDICAL (competing bids now closed)
     const salaryMonths = extra.signingBonusMonths ?? 0;
     let salaryAmt = BigInt(0);
     if (salaryMonths > 0) {
@@ -521,6 +514,11 @@ describe("Transferium Protocol v2", function () {
     await token.connect(buyingClub).approve(await dealEscrow.getAddress(), totalFund);
     await dealEscrow.connect(buyingClub).fundDeal(dealId);
 
+    // Submit medical PASSED → settle immediately (funds already in escrow)
+    const medHash = ethers.keccak256(ethers.toUtf8Bytes("medical-ok"));
+    await dealEscrow.connect(buyingClub).submitMedical(dealId, 1, medHash);
+
+    return dealId;
     return dealId;
   }
 
@@ -576,10 +574,7 @@ describe("Transferium Protocol v2", function () {
         clubA, clubB, other, playerId, fee
       );
 
-      // Admin (LEAGUE_ROLE) force-completes after funding
-      await expect(dealEscrow.connect(admin).forceComplete(dealId))
-        .to.emit(dealEscrow, "DealCompleted");
-
+      // Deal already COMPLETED — medical PASSED settles immediately
       expect(await registry.ownerOf(playerId)).to.equal(clubB.address);
       expect(await registry.currentClub(playerId)).to.equal(clubB.address);
 
@@ -636,7 +631,6 @@ describe("Transferium Protocol v2", function () {
         { sellOnBps, sellOnRecipient: clubC.address }
       );
 
-      await dealEscrow.connect(admin).forceComplete(dealId);
 
       const sellOnAmt = fee * BigInt(sellOnBps) / BigInt(10000);
       expect(await dealEscrow.getClaimable(clubA.address, await token.getAddress()))
@@ -659,7 +653,6 @@ describe("Transferium Protocol v2", function () {
         { sellerAgentBps, sellerAgent: clubC.address, buyerAgentBps, buyerAgent: other.address }
       );
 
-      await dealEscrow.connect(admin).forceComplete(dealId);
 
       const sellerAgentAmt = fee * BigInt(sellerAgentBps) / BigInt(10000);
       const buyerAgentAmt  = fee * BigInt(buyerAgentBps)  / BigInt(10000);
@@ -686,7 +679,6 @@ describe("Transferium Protocol v2", function () {
         clubA, clubB, other, playerId, fee, { addOns }
       );
 
-      await dealEscrow.connect(admin).forceComplete(dealId);
 
       // Buying club deposits add-on funds and league triggers it
       await token.connect(clubB).approve(await dealEscrow.getAddress(), addOnAmt);
@@ -717,7 +709,6 @@ describe("Transferium Protocol v2", function () {
 
       // signingBonusAmount verified implicitly — claimSigningBonus below proves it was stored
 
-      await dealEscrow.connect(admin).forceComplete(dealId);
 
       // Player wallet claims salary guarantee
       await expect(dealEscrow.connect(other).claimSigningBonus(dealId))
@@ -738,7 +729,6 @@ describe("Transferium Protocol v2", function () {
         ethers, escrow, dealEscrow, token, registry, transferWindow,
         clubA, clubB, other, playerId, fee, { signingBonusMonths }
       );
-      await dealEscrow.connect(admin).forceComplete(dealId);
       await ethers.provider.send("evm_increaseTime", [91 * 24 * 3600]);
       await ethers.provider.send("evm_mine", []);
       await expect(escrow.connect(admin).rescueSigningBonus(dealId))
@@ -757,7 +747,6 @@ describe("Transferium Protocol v2", function () {
         ethers, escrow, dealEscrow, token, registry, transferWindow,
         clubA, clubB, other, playerId, fee, { signingBonusMonths: 1 }
       );
-      await dealEscrow.connect(admin).forceComplete(dealId);
       await expect(escrow.connect(admin).rescueSigningBonus(dealId))
         .to.be.revertedWithCustomError(dealEscrow, "SigningBonusNotExpired");
     });
@@ -773,7 +762,6 @@ describe("Transferium Protocol v2", function () {
         ethers, escrow, dealEscrow, token, registry, transferWindow,
         clubA, clubB, other, playerId, fee, { addOns }
       );
-      await dealEscrow.connect(admin).forceComplete(dealId);
       const tokenAddr = await token.getAddress();
       const overDeposit = addOnAmt * 2n;
       await token.connect(clubB).approve(await dealEscrow.getAddress(), overDeposit);
@@ -796,7 +784,6 @@ describe("Transferium Protocol v2", function () {
         ethers, escrow, dealEscrow, token, registry, transferWindow,
         clubA, clubB, other, playerId, fee, { addOns }
       );
-      await dealEscrow.connect(admin).forceComplete(dealId);
       await token.connect(clubB).approve(await dealEscrow.getAddress(), addOnAmt);
       await dealEscrow.connect(clubB).depositAddOnFunds(dealId, addOnAmt);
       await expect(escrow.connect(clubA).withdrawAddOnDeposit(dealId, addOnAmt))
@@ -2065,17 +2052,15 @@ describe("Transferium Protocol v2", function () {
         .map((l: any) => { try { return dealEscrow.interface.parseLog(l); } catch { return null; } })
         .find((e: any) => e?.name === "DealCreated").args.dealId;
 
+      // New flow: consent → FUNDING_PENDING → fund → AWAITING_MEDICAL → medical → COMPLETED
       await dealEscrow.connect(other).consentToTransfer(dealId);
-      const medHash = ethers.keccak256(ethers.toUtf8Bytes("med-" + salt));
-      await dealEscrow.connect(clubB).submitMedical(dealId, 1, medHash);
-
-      await ethers.provider.send("evm_increaseTime", [48 * 3600 + 1]);
-      await ethers.provider.send("evm_mine", []);
-      await escrow.processExpiry(dealId);
-
       await token.connect(clubB).approve(await dealEscrow.getAddress(), half);
       await dealEscrow.connect(clubB).fundDeal(dealId);
-      await dealEscrow.connect(admin).forceComplete(dealId);
+      const medHash = ethers.keccak256(ethers.toUtf8Bytes("med-" + salt));
+      await dealEscrow.connect(clubB).submitMedical(dealId, 1, medHash);
+      // Advance past installment due dates
+      await ethers.provider.send("evm_increaseTime", [7200 + 1]);
+      await ethers.provider.send("evm_mine", []);
 
       return { dealId, half, fee, date1 };
     }
@@ -2116,17 +2101,12 @@ describe("Transferium Protocol v2", function () {
         .map((l: any) => { try { return dealEscrow.interface.parseLog(l); } catch { return null; } })
         .find((e: any) => e?.name === "DealCreated").args.dealId;
 
+      // New flow: consent → FUNDING_PENDING → fund → AWAITING_MEDICAL → medical → COMPLETED
       await dealEscrow.connect(other).consentToTransfer(dealId);
-      const medHash = ethers.keccak256(ethers.toUtf8Bytes("med-" + salt));
-      await dealEscrow.connect(clubB).submitMedical(dealId, 1, medHash);
-
-      await ethers.provider.send("evm_increaseTime", [48 * 3600 + 1]);
-      await ethers.provider.send("evm_mine", []);
-      await escrow.processExpiry(dealId);
-
       await token.connect(clubB).approve(await dealEscrow.getAddress(), half);
       await dealEscrow.connect(clubB).fundDeal(dealId);
-      await dealEscrow.connect(admin).forceComplete(dealId);
+      const medHash = ethers.keccak256(ethers.toUtf8Bytes("med-" + salt));
+      await dealEscrow.connect(clubB).submitMedical(dealId, 1, medHash);
 
       return { dealId, half, fee };
     }
@@ -2338,7 +2318,7 @@ describe("Transferium Protocol v2", function () {
 
       await vm.connect(clubA).requestVerification(pid);
 
-      await expect(vm.connect(registrar).rejectVerification(pid))
+      await expect(vm.connect(registrar).rejectVerification(pid, "Medical documents could not be verified."))
         .to.emit(vm, "VerificationRejected");
 
       expect(await registry.verificationActive(pid)).to.equal(false);
@@ -2486,13 +2466,9 @@ describe("Transferium Protocol v2", function () {
         .find((e: any) => e?.name === "DealCreated").args.dealId;
 
       await dealEscrow.connect(wallet).consentToTransfer(dealId);
-      await dealEscrow.connect(clubB).submitMedical(dealId, 1, ethers.keccak256(ethers.toUtf8Bytes("med2")));
-      await ethers.provider.send("evm_increaseTime", [48 * 3600 + 1]);
-      await ethers.provider.send("evm_mine", []);
-      await escrow.processExpiry(dealId);
       await token.connect(clubB).approve(await dealEscrow.getAddress(), fee);
       await dealEscrow.connect(clubB).fundDeal(dealId);
-      await dealEscrow.connect(admin).forceComplete(dealId);
+      await dealEscrow.connect(clubB).submitMedical(dealId, 1, ethers.keccak256(ethers.toUtf8Bytes("med2")));
 
       // Proposal must be cleared
       expect((await terminationMgr.getProposal(pid)).state).to.equal(0n); // None

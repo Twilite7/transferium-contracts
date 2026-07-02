@@ -89,7 +89,7 @@ contract VerificationManager is ReentrancyGuard {
         uint256 deadline
     );
     event VerificationApproved(uint256 indexed playerId, address indexed registrar);
-    event VerificationRejected(uint256 indexed playerId, address indexed registrar);
+    event VerificationRejected(uint256 indexed playerId, address indexed registrar, string reason);
     event VerificationRefundClaimed(
         uint256 indexed playerId,
         address indexed club,
@@ -108,6 +108,7 @@ contract VerificationManager is ReentrancyGuard {
 
     error ZeroAddress();
     error NotAdmin();
+    error InvalidRejectionReason();
     error RegistryPaused();
     error PlayerAlreadyVerified(uint256 playerId);
     error VerificationAlreadyActive(uint256 playerId);
@@ -354,11 +355,13 @@ contract VerificationManager is ReentrancyGuard {
      *         distributed (registrar compensated for their work). The club
      *         may correct documents and submit a new request.
      */
-    function rejectVerification(uint256 playerId)
+    function rejectVerification(uint256 playerId, string calldata reason)
         external
         whenRegistryNotPaused
         nonReentrant
     {
+        if (bytes(reason).length == 0 || bytes(reason).length > 512)
+            revert InvalidRejectionReason();
         _assertAssignedRegistrar(playerId);
 
         IPlayerRegistry.VerificationRequest storage req = _verificationRequests[playerId];
@@ -376,7 +379,7 @@ contract VerificationManager is ReentrancyGuard {
         playerRegistry.setVerificationActive(playerId, false);
         _splitFee(playerId, fee, registrar);
 
-        emit VerificationRejected(playerId, registrar);
+        emit VerificationRejected(playerId, registrar, reason);
     }
 
     /**
