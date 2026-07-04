@@ -853,6 +853,36 @@ contract DealEscrow is
         v.stateDeadline             = deal.stateDeadline;
     }
 
+    function getDealFull(uint256 dealId) external view returns (
+        bool    exists,
+        uint256 playerId,
+        address sellingClub,
+        address buyingClub,
+        address paymentToken,
+        uint256 transferFee,
+        uint256 signingBonusAmount,
+        bool    signingBonusClaimed,
+        uint8   state,
+        uint256 stateDeadline,
+        address originalBuyer
+    ) {
+        Deal storage deal = _deals[dealId];
+        if (deal.playerId == 0) return (false, 0, address(0), address(0), address(0), 0, 0, false, 0, 0, address(0));
+        return (
+            true,
+            deal.playerId,
+            deal.sellingClub,
+            deal.buyingClub,
+            deal.paymentToken,
+            deal.transferFee,
+            deal.signingBonusAmount,
+            deal.signingBonusClaimed,
+            uint8(deal.state),
+            deal.stateDeadline,
+            deal.originalBuyer
+        );
+    }
+
     function getExpiryView(uint256 dealId) external view returns (
         bool    exists,
         bool    frozen,
