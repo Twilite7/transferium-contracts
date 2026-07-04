@@ -685,28 +685,15 @@ contract DealEscrow is
         deal.signingBonusAmount = newSigningBonus;
         deal.signingBonusClaimed = false;
         deal.medicalHash        = bytes32(0);
-        deal.state              = TransferTypes.DealState.FUNDING_PENDING;
-        deal.stateDeadline      = block.timestamp + timers[5];
+        // I move to AWAITING_MEDICAL — Club C has not had a medical yet.
+        // They must pass medical before funding.
+        deal.state              = TransferTypes.DealState.AWAITING_MEDICAL;
+        deal.stateDeadline      = block.timestamp + timers[1];
         // I re-register the player deal mapping since _cancelDeal cleared it.
         _playerDeal[deal.playerId] = dealId;
 
         emit CompetingBidActivated(dealId, thirdParty, newFee);
         emit PlayerConsentRequested(dealId, deal.playerId, thirdParty);
-    }
-
-    /// @notice Settles a third-party deal after Club C's medical passes.
-    /// @dev    COMPETING_BID_MANAGER_ROLE only. State must be AWAITING_THIRD_PARTY_MEDICAL.
-    function extSettleThirdParty(uint256 dealId)
-        external
-        onlyRole(COMPETING_BID_MANAGER_ROLE)
-        dealExists(dealId)
-        nonReentrant
-    {
-        Deal storage deal = _deals[dealId];
-        if (deal.state != TransferTypes.DealState.AWAITING_THIRD_PARTY_MEDICAL) revert WrongDealState();
-        if (deal.frozen) revert DealIsFrozen();
-        emit ThirdPartyMedicalCompleted(dealId, deal.buyingClub);
-        _settleDeal(dealId);
     }
 
     /// @notice Credits Club B's counter-deposit toward their installment.

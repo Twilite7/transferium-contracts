@@ -46,8 +46,8 @@ contract InstallmentEscrow is
     bytes32 public constant ADMIN_ROLE  = keccak256("ADMIN_ROLE");
     bytes32 public constant LEAGUE_ROLE = keccak256("LEAGUE_ROLE");
 
-    // COMPLETED is ordinal 14 in DealState enum (after hijack states removed)
-    uint8 constant DEAL_COMPLETED = 14;
+    // COMPLETED is ordinal 13 in DealState enum (AWAITING_THIRD_PARTY_MEDICAL removed)
+    uint8 constant DEAL_COMPLETED = 13;
 
     // ─── State ────────────────────────────────────────────────────────────────
     IDealEscrow public dealEscrow;

@@ -57,8 +57,9 @@ contract CompetingBidManager is ReentrancyGuard {
     uint256 private constant MAX_DEPOSIT_BPS = 3_000; // 30% hard cap
     uint256 private constant MAX_AGENT_BPS   =   300; // 3% agent fee cap
     // DealState values (must mirror TransferTypes.DealState exactly)
-    uint8   private constant STATE_FUNDING_PENDING   = 11; // competing bids active here
-    uint8   private constant STATE_CANCELLED         = 15;
+    uint8   private constant STATE_AWAITING_MEDICAL  = 6;  // competing bids active
+    uint8   private constant STATE_FUNDING_PENDING   = 10; // competing bids still active
+    uint8   private constant STATE_CANCELLED         = 14;
 
     // ─── Storage ──────────────────────────────────────────────────────────────
 
@@ -182,7 +183,8 @@ contract CompetingBidManager is ReentrancyGuard {
     ) external nonReentrant {
         IDealEscrow.DealView memory dv = dealEscrow.getDealView(dealId);
         if (!dv.exists)                          revert DealNotFound();
-        if (uint8(dv.state) != STATE_FUNDING_PENDING) revert WrongDealState();
+        if (uint8(dv.state) != STATE_AWAITING_MEDICAL &&
+            uint8(dv.state) != STATE_FUNDING_PENDING) revert WrongDealState();
         if (msg.sender == dv.sellingClub)        revert CannotBidOnOwnDeal();
         if (msg.sender == dv.buyingClub)         revert CannotBidOnOwnDeal();
         if (fee == 0)                             revert InvalidAmount();
@@ -237,7 +239,8 @@ contract CompetingBidManager is ReentrancyGuard {
     function upCompetingBid(uint256 dealId, uint256 newFee) external nonReentrant {
         IDealEscrow.DealView memory dv = dealEscrow.getDealView(dealId);
         if (!dv.exists)                                revert DealNotFound();
-        if (uint8(dv.state) != STATE_FUNDING_PENDING) revert WrongDealState();
+        if (uint8(dv.state) != STATE_AWAITING_MEDICAL &&
+            uint8(dv.state) != STATE_FUNDING_PENDING) revert WrongDealState();
 
         CompetingBid storage bid = _bids[dealId];
         if (bid.competingClub == address(0))    revert NoBidExists();
@@ -265,7 +268,8 @@ contract CompetingBidManager is ReentrancyGuard {
     function acceptCompetingBid(uint256 dealId) external {
         IDealEscrow.DealView memory dv = dealEscrow.getDealView(dealId);
         if (!dv.exists)                                revert DealNotFound();
-        if (uint8(dv.state) != STATE_FUNDING_PENDING) revert WrongDealState();
+        if (uint8(dv.state) != STATE_AWAITING_MEDICAL &&
+            uint8(dv.state) != STATE_FUNDING_PENDING) revert WrongDealState();
         if (msg.sender != dv.sellingClub)              revert NotSellingClub();
 
         CompetingBid storage bid = _bids[dealId];
@@ -285,7 +289,8 @@ contract CompetingBidManager is ReentrancyGuard {
     function ignoreCompetingBid(uint256 dealId) external nonReentrant {
         IDealEscrow.DealView memory dv = dealEscrow.getDealView(dealId);
         if (!dv.exists)                                revert DealNotFound();
-        if (uint8(dv.state) != STATE_FUNDING_PENDING) revert WrongDealState();
+        if (uint8(dv.state) != STATE_AWAITING_MEDICAL &&
+            uint8(dv.state) != STATE_FUNDING_PENDING) revert WrongDealState();
         if (msg.sender != dv.sellingClub)              revert NotSellingClub();
 
         CompetingBid storage bid = _bids[dealId];
@@ -314,7 +319,8 @@ contract CompetingBidManager is ReentrancyGuard {
     function confirmSwitch(uint256 dealId) external nonReentrant {
         IDealEscrow.DealView memory dv = dealEscrow.getDealView(dealId);
         if (!dv.exists)                                revert DealNotFound();
-        if (uint8(dv.state) != STATE_FUNDING_PENDING) revert WrongDealState();
+        if (uint8(dv.state) != STATE_AWAITING_MEDICAL &&
+            uint8(dv.state) != STATE_FUNDING_PENDING) revert WrongDealState();
         if (msg.sender != dv.sellingClub)              revert NotSellingClub();
 
         CompetingBid storage bid = _bids[dealId];
@@ -362,7 +368,8 @@ contract CompetingBidManager is ReentrancyGuard {
     function confirmOriginal(uint256 dealId) external nonReentrant {
         IDealEscrow.DealView memory dv = dealEscrow.getDealView(dealId);
         if (!dv.exists)                                revert DealNotFound();
-        if (uint8(dv.state) != STATE_FUNDING_PENDING) revert WrongDealState();
+        if (uint8(dv.state) != STATE_AWAITING_MEDICAL &&
+            uint8(dv.state) != STATE_FUNDING_PENDING) revert WrongDealState();
         if (msg.sender != dv.sellingClub)              revert NotSellingClub();
 
         CompetingBid storage bid = _bids[dealId];
@@ -398,7 +405,8 @@ contract CompetingBidManager is ReentrancyGuard {
     function matchCompetingBid(uint256 dealId) external nonReentrant {
         IDealEscrow.DealView memory dv = dealEscrow.getDealView(dealId);
         if (!dv.exists)                                revert DealNotFound();
-        if (uint8(dv.state) != STATE_FUNDING_PENDING) revert WrongDealState();
+        if (uint8(dv.state) != STATE_AWAITING_MEDICAL &&
+            uint8(dv.state) != STATE_FUNDING_PENDING) revert WrongDealState();
 
         CompetingBid storage bid = _bids[dealId];
         if (bid.competingClub == address(0))          revert NoBidExists();
@@ -432,7 +440,9 @@ contract CompetingBidManager is ReentrancyGuard {
         if (!exists)  revert DealNotFound();
         if (frozen)   revert WrongDealState();
         // Deal must be cancelled (medical failed) or still in AWAITING_MEDICAL
-        if (state != STATE_CANCELLED && state != STATE_FUNDING_PENDING) revert WrongDealState();
+        if (state != STATE_CANCELLED &&
+            state != STATE_AWAITING_MEDICAL &&
+            state != STATE_FUNDING_PENDING) revert WrongDealState();
 
         CompetingBid storage bid = _bids[dealId];
         if (bid.competingClub == address(0)) revert NoBidExists();
@@ -477,7 +487,8 @@ contract CompetingBidManager is ReentrancyGuard {
     function processMatchingExpiry(uint256 dealId) external nonReentrant {
         IDealEscrow.DealView memory dv = dealEscrow.getDealView(dealId);
         if (!dv.exists)                                revert DealNotFound();
-        if (uint8(dv.state) != STATE_FUNDING_PENDING) revert WrongDealState();
+        if (uint8(dv.state) != STATE_AWAITING_MEDICAL &&
+            uint8(dv.state) != STATE_FUNDING_PENDING) revert WrongDealState();
 
         CompetingBid storage bid = _bids[dealId];
         if (bid.competingClub == address(0)) revert NoBidExists();

@@ -22,13 +22,12 @@ interface IDealEscrow {
         AWAITING_MEDICAL,             // 6
         MEDICAL_RENEGOTIATION,        // 7
         MEDICAL_DISPUTE,              // 8
-        AWAITING_THIRD_PARTY_MEDICAL, // 9
-        MUTUAL_CANCEL_PROPOSED,       // 10
-        FUNDING_PENDING,              // 11
-        FUNDED,                       // 12
-        DISPUTE_WINDOW,               // 13
-        COMPLETED,                    // 14
-        CANCELLED                     // 15
+        MUTUAL_CANCEL_PROPOSED,       // 9
+        FUNDING_PENDING,              // 10
+        FUNDED,                       // 11
+        DISPUTE_WINDOW,               // 12
+        COMPLETED,                    // 13
+        CANCELLED                     // 14
     }
 
     // Fields TransferEscrow needs for deal validation
@@ -88,12 +87,6 @@ interface IDealEscrow {
         address buyerAgent,
         uint256 signingBonusMonths
     ) external;
-
-    /**
-     * @notice Settle a deal after Club C's medical passes.
-     *         State must be AWAITING_THIRD_PARTY_MEDICAL.
-     */
-    function extSettleThirdParty(uint256 dealId) external;
 
     /**
      * @notice Credit Club B's counter-deposit toward their first installment.

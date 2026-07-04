@@ -860,7 +860,7 @@ contract TransferEscrow is
         uint8 AWAITING_MEDICAL             = 6;
         uint8 MEDICAL_RENEGOTIATION        = 7;
         uint8 MEDICAL_DISPUTE              = 8;
-        uint8 FUNDING_PENDING              = 11;
+        uint8 FUNDING_PENDING              = 10;
 
         if (state == AWAITING_PLAYER_CONSENT) {
             dealEscrow.extCancel(dealId, uint8(TransferTypes.CancelReason.CONSENT_WINDOW_EXPIRED));
