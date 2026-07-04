@@ -618,6 +618,11 @@ contract DealEscrow is
     }
 
 
+    function setCompetingBidManager(address mgr) external onlyRole(ADMIN_ROLE) {
+        if (mgr == address(0)) revert InvalidAddress();
+        competingBidManager = mgr;
+    }
+
     // ─── CompetingBidManager Callbacks ────────────────────────────────────────
 
     /// @notice Credits an amount to a recipient's claimable balance.
