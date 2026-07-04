@@ -17,6 +17,10 @@ import "../interfaces/IDealEscrow.sol";
 import "../libraries/FeeLib.sol";
 import "../types/TransferTypes.sol";
 
+interface ICompetingBidManager {
+    function hasActiveBid(uint256 dealId) external view returns (bool);
+}
+
 contract DealEscrow is
     ProtocolFeeBase,
     Initializable,
@@ -41,6 +45,8 @@ contract DealEscrow is
     bytes32 public constant LEAGUE_ROLE          = keccak256("LEAGUE_ROLE");
     bytes32 public constant TRANSFER_ESCROW_ROLE      = keccak256("TRANSFER_ESCROW_ROLE");
     bytes32 public constant COMPETING_BID_MANAGER_ROLE = keccak256("COMPETING_BID_MANAGER_ROLE");
+
+    address public competingBidManager;
 
     uint256 internal constant MAX_PRICE                = 500_000_000 ether;
     uint256 internal constant BPS_DENOMINATOR          = 10_000;
@@ -439,6 +445,12 @@ contract DealEscrow is
         Deal storage deal = _deals[dealId];
         if (deal.state != TransferTypes.DealState.FUNDING_PENDING) revert WrongDealState();
         if (deal.buyingClub != msg.sender)                          revert NotBuyingClub();
+        // I block funding if Club A has accepted a competing bid that is unresolved.
+        // Club B must match it first, then Club A must confirmOriginal before funding.
+        if (competingBidManager != address(0) &&
+            ICompetingBidManager(competingBidManager).hasActiveBid(dealId)) {
+            revert WrongDealState();
+        }
         if (block.timestamp > deal.stateDeadline)                   revert FundingWindowExpired();
         if (!ITransferWindow(addressRegistry.get(RegistryKeys.TRANSFER_WINDOW)).isWindowOpen())                         revert TransferWindowClosed();
 

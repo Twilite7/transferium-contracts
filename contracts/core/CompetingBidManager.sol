@@ -518,4 +518,12 @@ contract CompetingBidManager is ReentrancyGuard {
         CompetingBid storage bid = _bids[dealId];
         return bid.acceptedAt != 0 && block.timestamp <= bid.matchDeadline;
     }
+
+    /// @notice Returns true if there is an accepted, unresolved competing bid.
+    /// @dev    Called by DealEscrow.fundDeal to block Club B from funding
+    ///         while Club A has accepted a competing bid they havent resolved.
+    function hasActiveBid(uint256 dealId) external view returns (bool) {
+        CompetingBid storage bid = _bids[dealId];
+        return bid.competingClub != address(0) && bid.acceptedAt != 0;
+    }
 }

@@ -190,6 +190,10 @@ async function main() {
   // CLUB_ROLE on TransferEscrow + LoanEscrow is granted per-club via Admin panel.
   // TransferWindow uses its own internal role — no cross-contract grant needed.
 
+  // Wire CompetingBidManager into DealEscrow
+  await (await de.setCompetingBidManager(competingBidMgrAddr)).wait();
+  console.log("  CompetingBidManager set on DealEscrow");
+
   // Wire TerminationManager into PlayerRegistry
   await (await pr.setTerminationManager(terminationMgrAddr)).wait();
   console.log("  TerminationManager set on PlayerRegistry");
