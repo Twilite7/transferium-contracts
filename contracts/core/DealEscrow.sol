@@ -50,8 +50,6 @@ contract DealEscrow is
 
     uint256 internal constant MAX_PRICE                = 500_000_000 ether;
     uint256 internal constant BPS_DENOMINATOR          = 10_000;
-    uint256 internal constant HIJACK_FAIL_PENALTY_BPS  = 200;
-    uint256 internal constant HIJACK_STALL_PENALTY_BPS = 500;
     uint256 internal constant LEAGUE_DISPUTE_DEADLINE  = 7 days;
     uint256 internal constant MIN_TIMER = 10 seconds;
 

@@ -71,8 +71,6 @@ contract TransferEscrow is
     uint256 public constant MAX_TOTAL_BIDS_PER_OFFER = 20;
     uint256 public constant MIN_CONSENT_WINDOW       = 1 hours;
     uint256 public constant LEAGUE_DISPUTE_DEADLINE  = 7 days;
-    uint256 public constant HIJACK_FAIL_PENALTY_BPS  = 200;
-    uint256 public constant HIJACK_STALL_PENALTY_BPS    = 500;
     // I cap salary guarantee months — a value like 10000 would produce an
     // unfundable signingBonusAmount that locks the deal in FUNDING_PENDING permanently
     uint256 public constant MAX_SIGNING_BONUS_MONTHS = 24;
