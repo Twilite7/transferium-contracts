@@ -782,16 +782,6 @@ contract TransferEscrow is
         if (wasNegotiating) _activateNextPendingBid(offerId);
     }
 
-    // ─── Hijack Bid Submission ────────────────────────────────────────────────
-
-    /**
-     * @notice Submit a hijack bid on an agreed deal.
-     * @dev Validates bid, pulls full funding, refunds previous hijacker if any,
-     *      then delegates storage update to DealEscrow via TRANSFER_ESCROW_ROLE.
-     *      Kept in TransferEscrow to stay within DealEscrow's 24KB size limit.
-     */
-
-
     // ─── Renegotiation / Dispute Resolution ─────────────────────────────────
 
     /**
