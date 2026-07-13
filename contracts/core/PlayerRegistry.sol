@@ -138,6 +138,8 @@ contract PlayerRegistry is
     // assignments across different players are rejected at the contract level.
     // 0 means unassigned (valid since player IDs start at 1).
     mapping(address => uint256) private _walletToPlayer;
+    /// @dev Count of operational roles (CLUB/REGISTRAR/ADMIN/DEFAULT_ADMIN/LEAGUE) held by a wallet.
+    mapping(address => uint8) private _operationalRoleCount;
 
     // ─── Storage gap ──────────────────────────────────────────────────────────
 
@@ -192,6 +194,7 @@ contract PlayerRegistry is
     error WalletUpdateNotReady(uint256 playerId, uint256 adjustedExecutable, uint256 now_);
     error WalletUpdateAlreadySet(uint256 playerId, address wallet);
     error WalletAlreadyAssigned(address wallet, uint256 assignedTo);
+    error RoleConflict();
 
     error DirectTransferNotAllowed();
 
@@ -553,6 +556,27 @@ contract PlayerRegistry is
         emit LegalDocumentsSubmitted(playerId);
     }
 
+    /// @dev Roles that must never coexist with a player-wallet assignment.
+    function _isOperationalRole(bytes32 role) internal pure returns (bool) {
+        return role == CLUB_ROLE || role == REGISTRAR_ROLE ||
+               role == ADMIN_ROLE || role == DEFAULT_ADMIN_ROLE || role == LEAGUE_ROLE;
+    }
+
+    function _grantRole(bytes32 role, address account) internal override returns (bool granted) {
+        granted = super._grantRole(role, account);
+        if (granted && _isOperationalRole(role)) _operationalRoleCount[account]++;
+    }
+
+    function _revokeRole(bytes32 role, address account) internal override returns (bool revoked) {
+        revoked = super._revokeRole(role, account);
+        if (revoked && _isOperationalRole(role)) _operationalRoleCount[account]--;
+    }
+
+    /// @dev Revert if wallet holds any operational role — one wallet, one role.
+    function _checkNoRoleConflict(address wallet) internal view {
+        if (_operationalRoleCount[wallet] != 0) revert RoleConflict();
+    }
+
     function setPlayerWallet(uint256 playerId, address wallet)
         external onlyRole(CLUB_ROLE) onlyPlayerClub(playerId) whenNotPaused playerExists(playerId)
     {
@@ -563,6 +587,7 @@ contract PlayerRegistry is
         uint256 currentOwner = _walletToPlayer[wallet];
         if (currentOwner != 0 && currentOwner != playerId)
             revert WalletAlreadyAssigned(wallet, currentOwner);
+        _checkNoRoleConflict(wallet);
         // I clear the reverse mapping for the old wallet if one existed
         address oldWallet = _players[playerId].playerWallet;
         if (oldWallet != address(0)) delete _walletToPlayer[oldWallet];
@@ -649,6 +674,7 @@ contract PlayerRegistry is
         uint256 currentOwner = _walletToPlayer[newWallet];
         if (currentOwner != 0 && currentOwner != playerId)
             revert WalletAlreadyAssigned(newWallet, currentOwner);
+        _checkNoRoleConflict(newWallet);
 
         _walletUpdateRequests[playerId] = WalletUpdateRequest({
             newWallet:     newWallet,

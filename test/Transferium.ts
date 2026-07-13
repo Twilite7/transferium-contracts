@@ -326,7 +326,7 @@ describe("Transferium Protocol v2", function () {
       expect(player.playerWallet).to.equal(other.address);
 
       // Player initiates wallet update (timelocked)
-      const newWallet = clubB.address;
+      const newWallet = ethers.Wallet.createRandom().address; // fresh address, no roles held
       await expect(registry.connect(other).initiateWalletUpdate(playerId, newWallet))
         .to.emit(registry, "WalletUpdateInitiated");
 
@@ -340,6 +340,30 @@ describe("Transferium Protocol v2", function () {
       expect(player.playerWallet).to.equal(newWallet);
     });
 
+    it("reverts setPlayerWallet when target wallet holds an operational role", async function () {
+      const { ethers, registry, clubA, clubB } = await deployAll();
+      const now = await getChainTime(ethers);
+      const tx      = await registry.connect(clubA).registerPlayer("Test", "ST", "Brazilian", now + 365 * 24 * 3600, 0, ethers.id("player-role-conflict-1"));
+      const receipt = await tx.wait();
+      const event   = receipt.logs.map((log: any) => { try { return registry.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "PlayerRegistered");
+      const playerId = event.args.playerId;
+      // clubB already holds CLUB_ROLE — must be rejected as a player wallet
+      await expect(registry.connect(clubA).setPlayerWallet(playerId, clubB.address))
+        .to.be.revertedWithCustomError(registry, "RoleConflict");
+    });
+    it("reverts initiateWalletUpdate when target wallet holds an operational role", async function () {
+      const { ethers, registry, clubA, clubB, other } = await deployAll();
+      const now = await getChainTime(ethers);
+      const tx      = await registry.connect(clubA).registerPlayer("Test", "ST", "Brazilian", now + 365 * 24 * 3600, 0, ethers.id("player-role-conflict-2"));
+      const receipt = await tx.wait();
+      const event   = receipt.logs.map((log: any) => { try { return registry.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "PlayerRegistered");
+      const playerId = event.args.playerId;
+      await expect(registry.connect(clubA).setPlayerWallet(playerId, other.address))
+        .to.emit(registry, "PlayerWalletSet");
+      // clubB already holds CLUB_ROLE — must be rejected as an update target
+      await expect(registry.connect(other).initiateWalletUpdate(playerId, clubB.address))
+        .to.be.revertedWithCustomError(registry, "RoleConflict");
+    });
     it("reverts player wallet update from wrong address", async function () {
       const { ethers, registry, clubA, clubB, registrar, other } = await deployAll();
       const now = await getChainTime(ethers);
