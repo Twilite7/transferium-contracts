@@ -139,7 +139,6 @@ contract PlayerRegistry is
     // 0 means unassigned (valid since player IDs start at 1).
     mapping(address => uint256) private _walletToPlayer;
     /// @dev Count of operational roles (CLUB/REGISTRAR/ADMIN/DEFAULT_ADMIN/LEAGUE) held by a wallet.
-    mapping(address => uint8) private _operationalRoleCount;
 
     // ─── Storage gap ──────────────────────────────────────────────────────────
 
@@ -562,19 +561,21 @@ contract PlayerRegistry is
                role == ADMIN_ROLE || role == DEFAULT_ADMIN_ROLE || role == LEAGUE_ROLE;
     }
 
+    /// @dev Block granting an operational role to an address that is currently a player's
+    /// wallet — closes the reverse direction of the conflict (a role granted AFTER the
+    /// wallet assignment already existed, as opposed to before it).
     function _grantRole(bytes32 role, address account) internal override returns (bool granted) {
+        if (_isOperationalRole(role) && _walletToPlayer[account] != 0) revert RoleConflict();
         granted = super._grantRole(role, account);
-        if (granted && _isOperationalRole(role)) _operationalRoleCount[account]++;
     }
 
-    function _revokeRole(bytes32 role, address account) internal override returns (bool revoked) {
-        revoked = super._revokeRole(role, account);
-        if (revoked && _isOperationalRole(role)) _operationalRoleCount[account]--;
-    }
-
-    /// @dev Revert if wallet holds any operational role — one wallet, one role.
+    /// @dev Revert if wallet holds any operational role right now, checked directly via
+    /// hasRole() rather than a cached counter — correct regardless of when the role was
+    /// granted, including roles granted before this check existed.
     function _checkNoRoleConflict(address wallet) internal view {
-        if (_operationalRoleCount[wallet] != 0) revert RoleConflict();
+        if (hasRole(CLUB_ROLE, wallet) || hasRole(REGISTRAR_ROLE, wallet) ||
+            hasRole(ADMIN_ROLE, wallet) || hasRole(DEFAULT_ADMIN_ROLE, wallet) ||
+            hasRole(LEAGUE_ROLE, wallet)) revert RoleConflict();
     }
 
     function setPlayerWallet(uint256 playerId, address wallet)

@@ -364,6 +364,34 @@ describe("Transferium Protocol v2", function () {
       await expect(registry.connect(other).initiateWalletUpdate(playerId, clubB.address))
         .to.be.revertedWithCustomError(registry, "RoleConflict");
     });
+    it("reverts setPlayerWallet when target wallet was granted REGISTRAR_ROLE beforehand", async function () {
+      const { ethers, registry, admin, clubA, other } = await deployAll();
+      await registry.connect(admin).grantRegistrarRole(other.address);
+      const now = await getChainTime(ethers);
+      const tx      = await registry.connect(clubA).registerPlayer("Test", "ST", "Brazilian", now + 365 * 24 * 3600, 0, ethers.id("player-role-conflict-3"));
+      const receipt = await tx.wait();
+      const event   = receipt.logs.map((log: any) => { try { return registry.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "PlayerRegistered");
+      const playerId = event.args.playerId;
+      await expect(registry.connect(clubA).setPlayerWallet(playerId, other.address))
+        .to.be.revertedWithCustomError(registry, "RoleConflict");
+    });
+    it("reverts granting an operational role to an address already serving as a player wallet", async function () {
+      const { ethers, registry, admin, clubA, other } = await deployAll();
+      const now = await getChainTime(ethers);
+      const tx      = await registry.connect(clubA).registerPlayer("Test", "ST", "Brazilian", now + 365 * 24 * 3600, 0, ethers.id("player-role-conflict-4"));
+      const receipt = await tx.wait();
+      const event   = receipt.logs.map((log: any) => { try { return registry.interface.parseLog(log); } catch { return null; } }).find((e: any) => e?.name === "PlayerRegistered");
+      const playerId = event.args.playerId;
+      // Assign a clean wallet first — no conflict exists yet
+      await expect(registry.connect(clubA).setPlayerWallet(playerId, other.address))
+        .to.emit(registry, "PlayerWalletSet");
+      // This exact scenario happened live on Aug 25, 2026: a wallet was set as a player
+      // wallet while clean, then later granted REGISTRAR_ROLE — which the original fix
+      // (a _grantRole/_revokeRole counter) failed to catch because the counter was only
+      // ever checked in setPlayerWallet/initiateWalletUpdate, not in _grantRole itself.
+      await expect(registry.connect(admin).grantRegistrarRole(other.address))
+        .to.be.revertedWithCustomError(registry, "RoleConflict");
+    });
     it("reverts player wallet update from wrong address", async function () {
       const { ethers, registry, clubA, clubB, registrar, other } = await deployAll();
       const now = await getChainTime(ethers);
